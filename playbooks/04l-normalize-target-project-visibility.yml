@@ -1,0 +1,443 @@
+---
+- name: 04L | Normalize target project visibility for re-home metadata
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_project_visibility_normalize_apply: false
+    target_project_visibility_normalize_id: ""
+    target_project_visibility_normalize_container: "mariadb"
+    target_project_visibility_normalize_user: root
+    target_project_visibility_normalize_socket: "{{ target_db_backup_socket | default('/run/mysqld/mysqld.sock') }}"
+    target_project_visibility_normalize_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_project_visibility_normalize_no_log: true
+    target_project_visibility_normalize_fetch: true
+  tasks:
+    - name: Target project visibility | validate required inputs
+      ansible.builtin.assert:
+        that:
+          - manifest_file | length > 0
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_project_visibility_normalize_password_key | length > 0
+          - target_project_visibility_normalize_socket | length > 0
+          - target_project_visibility_project_id | default('') | length > 0
+          - target_project_visibility_user_id | default('') | length > 0
+        fail_msg: "Set target project/user UUIDs and Kolla DB password inputs before project visibility normalization."
+
+    - name: Target project visibility | load re-home manifest
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: target_project_visibility_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Target project visibility | build re-home instance list
+      ansible.builtin.set_fact:
+        target_project_visibility_instances: >-
+          {{
+            target_project_visibility_manifest.rehome_instances
+            | default(target_project_visibility_manifest.get('openstack', {}).get('rehome_instances', []), true)
+            | default(target_project_visibility_manifest.source.instances | default([]), true)
+          }}
+
+    - name: Target project visibility | build scoped resource lists
+      ansible.builtin.set_fact:
+        target_project_visibility_instance_uuids: >-
+          {{ target_project_visibility_instances | map(attribute='uuid') | list | unique }}
+        target_project_visibility_ports: >-
+          {{ target_project_visibility_instances | map(attribute='ports') | list | flatten }}
+        target_project_visibility_volumes: >-
+          {{ target_project_visibility_instances | map(attribute='volumes') | list | flatten }}
+
+    - name: Target project visibility | build dependent resource lists
+      ansible.builtin.set_fact:
+        target_project_visibility_port_ids: >-
+          {{ target_project_visibility_ports | map(attribute='id') | list | unique }}
+        target_project_visibility_network_ids: >-
+          {{ target_project_visibility_ports | map(attribute='network_id') | list | unique }}
+        target_project_visibility_subnet_ids: >-
+          {{
+            target_project_visibility_ports
+            | map(attribute='fixed_ips')
+            | list
+            | flatten
+            | map(attribute='subnet_id')
+            | list
+            | unique
+          }}
+        target_project_visibility_security_group_ids: >-
+          {{
+            (
+              target_project_visibility_ports
+              | map(attribute='security_group_ids')
+              | list
+              | flatten
+            )
+            | union(
+              target_project_visibility_ports
+              | map(attribute='security_groups')
+              | list
+              | flatten
+              | map(attribute='id')
+              | list
+            )
+            | unique
+          }}
+        target_project_visibility_security_group_rule_ids: >-
+          {{
+            target_project_visibility_ports
+            | map(attribute='security_groups')
+            | list
+            | flatten
+            | map(attribute='rules')
+            | list
+            | flatten
+            | map(attribute='id')
+            | list
+            | unique
+          }}
+        target_project_visibility_volume_ids: >-
+          {{
+            (
+              target_project_visibility_instances
+              | map(attribute='volume_ids')
+              | list
+              | flatten
+            )
+            | union(target_project_visibility_volumes | map(attribute='id') | list)
+            | unique
+          }}
+
+    - name: Target project visibility | derive source identity
+      ansible.builtin.set_fact:
+        target_project_visibility_source_project_id_effective: >-
+          {{
+            target_project_visibility_source_project_id | default('')
+            if target_project_visibility_source_project_id | default('') | length > 0
+            else (target_project_visibility_instances | first).project_id
+          }}
+        target_project_visibility_source_user_id_effective: >-
+          {{
+            target_project_visibility_source_user_id | default('')
+            if target_project_visibility_source_user_id | default('') | length > 0
+            else (target_project_visibility_instances | first).user_id
+          }}
+
+    - name: Target project visibility | validate scoped resources
+      ansible.builtin.assert:
+        that:
+          - target_project_visibility_instances | length > 0
+          - target_project_visibility_instance_uuids | length > 0
+          - target_project_visibility_source_project_id_effective | length > 0
+          - target_project_visibility_source_user_id_effective | length > 0
+          - target_project_visibility_source_project_id_effective != target_project_visibility_project_id
+        fail_msg: "Manifest must contain scoped source instance/project/user data, and target project must differ from source project."
+
+    - name: Target project visibility | freeze run id
+      ansible.builtin.set_fact:
+        target_project_visibility_normalize_id_effective: >-
+          {{
+            target_project_visibility_normalize_id
+            if target_project_visibility_normalize_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target project visibility | set run paths
+      ansible.builtin.set_fact:
+        target_project_visibility_remote_dir_effective: "{{ rehome_stage_dir }}/target-project-visibility-normalization/{{ target_project_visibility_normalize_id_effective }}"
+        target_project_visibility_remote_sql_effective: "{{ rehome_stage_dir }}/target-project-visibility-normalization/{{ target_project_visibility_normalize_id_effective }}/normalize-project-visibility.sql"
+        target_project_visibility_remote_report_effective: "{{ rehome_stage_dir }}/target-project-visibility-normalization/{{ target_project_visibility_normalize_id_effective }}/report.tsv"
+        target_project_visibility_local_run_dir_effective: "{{ local_artifact_dir }}/target-project-visibility-normalization/{{ target_project_visibility_normalize_id_effective }}"
+
+    - name: Target project visibility | create remote run directory
+      ansible.builtin.file:
+        path: "{{ target_project_visibility_remote_dir_effective }}"
+        state: directory
+        mode: "0700"
+
+    - name: Target project visibility | load target DB password
+      ansible.builtin.set_fact:
+        target_project_visibility_normalize_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_project_visibility_normalize_password_key]
+          }}
+      no_log: true
+
+    - name: Target project visibility | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_project_visibility_normalize_container }}"
+          - test
+          - "-S"
+          - "{{ target_project_visibility_normalize_socket }}"
+      changed_when: false
+
+    - name: Target project visibility | initialize report
+      ansible.builtin.copy:
+        dest: "{{ target_project_visibility_remote_report_effective }}"
+        mode: "0600"
+        content: |
+          phase	label	row_count
+
+    - name: Target project visibility | run scoped normalization SQL
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          mysql_bin="$({{ container_runtime_cli }} exec {{ target_project_visibility_normalize_container }} sh -lc 'command -v mariadb || command -v mysql')"
+          sql_file={{ target_project_visibility_remote_sql_effective | quote }}
+          cat > "$sql_file" <<'SQL'
+          SET @source_project_id = '{{ target_project_visibility_source_project_id_effective | string | replace("'", "''") }}';
+          SET @source_user_id = '{{ target_project_visibility_source_user_id_effective | string | replace("'", "''") }}';
+          SET @target_project_id = '{{ target_project_visibility_project_id | string | replace("'", "''") }}';
+          SET @target_user_id = '{{ target_project_visibility_user_id | string | replace("'", "''") }}';
+
+          SELECT 'before', 'nova_api.instance_mappings', COUNT(*)
+          FROM `nova_api`.`instance_mappings`
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `nova_api`.`instance_mappings`
+          SET `project_id` = @target_project_id
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'nova_api.instance_mappings', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'nova_api.instance_mappings', 0;
+          {% endif %}
+          SELECT 'after', 'nova_api.instance_mappings', COUNT(*)
+          FROM `nova_api`.`instance_mappings`
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+
+          SELECT 'before', 'nova_api.request_specs', COUNT(*)
+          FROM `nova_api`.`request_specs`
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`spec` LIKE CONCAT('%', @source_project_id, '%') OR `spec` LIKE CONCAT('%', @source_user_id, '%'));
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `nova_api`.`request_specs`
+          SET `spec` = REPLACE(REPLACE(`spec`, @source_project_id, @target_project_id), @source_user_id, @target_user_id)
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`spec` LIKE CONCAT('%', @source_project_id, '%') OR `spec` LIKE CONCAT('%', @source_user_id, '%'));
+          SELECT 'updated', 'nova_api.request_specs', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'nova_api.request_specs', 0;
+          {% endif %}
+          SELECT 'after', 'nova_api.request_specs', COUNT(*)
+          FROM `nova_api`.`request_specs`
+          WHERE `instance_uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`spec` LIKE CONCAT('%', @source_project_id, '%') OR `spec` LIKE CONCAT('%', @source_user_id, '%'));
+
+          SELECT 'before', 'nova.instances', COUNT(*)
+          FROM `nova`.`instances`
+          WHERE `uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `nova`.`instances`
+          SET
+            `project_id` = IF(`project_id` = @source_project_id, @target_project_id, `project_id`),
+            `user_id` = IF(`user_id` = @source_user_id, @target_user_id, `user_id`)
+          WHERE `uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+          SELECT 'updated', 'nova.instances', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'nova.instances', 0;
+          {% endif %}
+          SELECT 'after', 'nova.instances', COUNT(*)
+          FROM `nova`.`instances`
+          WHERE `uuid` IN ({% for value in target_project_visibility_instance_uuids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+
+          {% if target_project_visibility_network_ids | length > 0 %}
+          SELECT 'before', 'neutron.networks', COUNT(*)
+          FROM `neutron`.`networks`
+          WHERE `id` IN ({% for value in target_project_visibility_network_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `neutron`.`networks`
+          SET `project_id` = @target_project_id
+          WHERE `id` IN ({% for value in target_project_visibility_network_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'neutron.networks', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'neutron.networks', 0;
+          {% endif %}
+          SELECT 'after', 'neutron.networks', COUNT(*)
+          FROM `neutron`.`networks`
+          WHERE `id` IN ({% for value in target_project_visibility_network_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% endif %}
+
+          {% if target_project_visibility_subnet_ids | length > 0 %}
+          SELECT 'before', 'neutron.subnets', COUNT(*)
+          FROM `neutron`.`subnets`
+          WHERE `id` IN ({% for value in target_project_visibility_subnet_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `neutron`.`subnets`
+          SET `project_id` = @target_project_id
+          WHERE `id` IN ({% for value in target_project_visibility_subnet_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'neutron.subnets', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'neutron.subnets', 0;
+          {% endif %}
+          SELECT 'after', 'neutron.subnets', COUNT(*)
+          FROM `neutron`.`subnets`
+          WHERE `id` IN ({% for value in target_project_visibility_subnet_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% endif %}
+
+          {% if target_project_visibility_port_ids | length > 0 %}
+          SELECT 'before', 'neutron.ports', COUNT(*)
+          FROM `neutron`.`ports`
+          WHERE `id` IN ({% for value in target_project_visibility_port_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `neutron`.`ports`
+          SET `project_id` = @target_project_id
+          WHERE `id` IN ({% for value in target_project_visibility_port_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'neutron.ports', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'neutron.ports', 0;
+          {% endif %}
+          SELECT 'after', 'neutron.ports', COUNT(*)
+          FROM `neutron`.`ports`
+          WHERE `id` IN ({% for value in target_project_visibility_port_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% endif %}
+
+          {% if target_project_visibility_security_group_ids | length > 0 %}
+          SELECT 'before', 'neutron.securitygroups', COUNT(*)
+          FROM `neutron`.`securitygroups`
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `neutron`.`securitygroups`
+          SET `project_id` = @target_project_id
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'neutron.securitygroups', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'neutron.securitygroups', 0;
+          {% endif %}
+          SELECT 'after', 'neutron.securitygroups', COUNT(*)
+          FROM `neutron`.`securitygroups`
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% endif %}
+
+          {% if target_project_visibility_security_group_rule_ids | length > 0 %}
+          SELECT 'before', 'neutron.securitygrouprules', COUNT(*)
+          FROM `neutron`.`securitygrouprules`
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_rule_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `neutron`.`securitygrouprules`
+          SET `project_id` = @target_project_id
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_rule_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          SELECT 'updated', 'neutron.securitygrouprules', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'neutron.securitygrouprules', 0;
+          {% endif %}
+          SELECT 'after', 'neutron.securitygrouprules', COUNT(*)
+          FROM `neutron`.`securitygrouprules`
+          WHERE `id` IN ({% for value in target_project_visibility_security_group_rule_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND `project_id` = @source_project_id;
+          {% endif %}
+
+          {% if target_project_visibility_volume_ids | length > 0 %}
+          SELECT 'before', 'cinder.volumes', COUNT(*)
+          FROM `cinder`.`volumes`
+          WHERE `id` IN ({% for value in target_project_visibility_volume_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+          {% if target_project_visibility_normalize_apply | bool %}
+          UPDATE `cinder`.`volumes`
+          SET
+            `project_id` = IF(`project_id` = @source_project_id, @target_project_id, `project_id`),
+            `user_id` = IF(`user_id` = @source_user_id, @target_user_id, `user_id`)
+          WHERE `id` IN ({% for value in target_project_visibility_volume_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+          SELECT 'updated', 'cinder.volumes', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', 'cinder.volumes', 0;
+          {% endif %}
+          SELECT 'after', 'cinder.volumes', COUNT(*)
+          FROM `cinder`.`volumes`
+          WHERE `id` IN ({% for value in target_project_visibility_volume_ids %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+            AND (`project_id` = @source_project_id OR `user_id` = @source_user_id);
+          {% endif %}
+          SQL
+          {{ container_runtime_cli }} exec \
+            -e MYSQL_PWD="$TARGET_PROJECT_VISIBILITY_NORMALIZE_PASSWORD" \
+            -i {{ target_project_visibility_normalize_container }} \
+            "$mysql_bin" \
+            -u"{{ target_project_visibility_normalize_user }}" \
+            --socket={{ target_project_visibility_normalize_socket | quote }} \
+            --batch \
+            --raw \
+            --skip-column-names \
+            < "$sql_file" \
+            | tee -a {{ target_project_visibility_remote_report_effective | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_PROJECT_VISIBILITY_NORMALIZE_PASSWORD: "{{ target_project_visibility_normalize_password }}"
+      register: target_project_visibility_normalize_sql_result
+      changed_when:
+        - target_project_visibility_normalize_apply | bool
+        - >-
+          (target_project_visibility_normalize_sql_result.stdout_lines | default([])
+          | select('match', '^updated\t.*\t[1-9][0-9]*$') | list | length) > 0
+      no_log: "{{ target_project_visibility_normalize_no_log | bool }}"
+
+    - name: Target project visibility | write run manifest
+      ansible.builtin.copy:
+        dest: "{{ target_project_visibility_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-project-visibility-normalization/v1alpha1",
+            "normalization_id": "{{ target_project_visibility_normalize_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "apply": {{ target_project_visibility_normalize_apply | bool | to_json }},
+            "source_project_id": "{{ target_project_visibility_source_project_id_effective }}",
+            "target_project_id": "{{ target_project_visibility_project_id }}",
+            "instance_count": {{ target_project_visibility_instance_uuids | length }},
+            "port_count": {{ target_project_visibility_port_ids | length }},
+            "volume_count": {{ target_project_visibility_volume_ids | length }},
+            "remote_report": "{{ target_project_visibility_remote_report_effective }}",
+            "socket": "{{ target_project_visibility_normalize_socket }}"
+          }
+
+    - name: Target project visibility | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ target_project_visibility_local_run_dir_effective }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+      when: target_project_visibility_normalize_fetch | bool
+
+    - name: Target project visibility | fetch run artifacts
+      ansible.builtin.fetch:
+        src: "{{ target_project_visibility_remote_dir_effective }}/{{ item }}"
+        dest: "{{ target_project_visibility_local_run_dir_effective }}/{{ item }}"
+        flat: true
+      loop:
+        - report.tsv
+        - manifest.json
+      when: target_project_visibility_normalize_fetch | bool
+
+    - name: Target project visibility | show run artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Normalization id: {{ target_project_visibility_normalize_id_effective }}"
+          - "Apply: {{ target_project_visibility_normalize_apply | bool }}"
+          - "Remote report: {{ target_project_visibility_remote_report_effective }}"
+          - "Local run dir: {{ target_project_visibility_local_run_dir_effective }}"

@@ -1,0 +1,473 @@
+---
+- name: Target host container reconcile | prepare variables for {{ target_host_container_reconcile_container }}
+  ansible.builtin.set_fact:
+    target_host_container_reconcile_image: >-
+      {{
+        (
+          target_host_container_reconcile_nova_libvirt_image
+          if (
+            target_host_container_reconcile_container == 'nova_libvirt'
+            and target_host_container_reconcile_nova_libvirt_image | default('') | length > 0
+          )
+          else target_host_container_reconcile_images[target_host_container_reconcile_container]
+        )
+      }}
+    target_host_container_reconcile_backup_name: "{{ target_host_container_reconcile_container }}_rehome_backup_{{ target_host_container_reconcile_backup_suffix }}"
+    target_host_container_reconcile_container_report: "{{ target_host_container_reconcile_report_dir }}/{{ target_host_container_reconcile_container }}.json"
+    target_host_container_reconcile_config_dir: "{{ target_host_container_reconcile_config_dirs.get(target_host_container_reconcile_container, '') }}"
+    target_host_container_reconcile_config_backup_path: "{{ target_host_container_reconcile_config_backup_dir }}/{{ target_host_container_reconcile_container }}-{{ target_host_container_reconcile_backup_suffix }}"
+    target_host_container_reconcile_env_overrides_for_container: >-
+      {{
+        (target_host_container_reconcile_env_overrides | default({}))
+        .get(target_host_container_reconcile_container, {})
+      }}
+    target_host_container_reconcile_drop_mount_destinations_for_container: >-
+      {{
+        (target_host_container_reconcile_drop_mount_destinations | default({}))
+        .get(target_host_container_reconcile_container, [])
+      }}
+    target_host_container_reconcile_nova_libvirt_compat_report: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-compatibility.txt"
+    target_host_container_reconcile_nova_libvirt_current_machine_types_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-current-machine-types.txt"
+    target_host_container_reconcile_nova_libvirt_current_libvirt_version_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-current-libvirt-version.txt"
+    target_host_container_reconcile_nova_libvirt_current_qemu_version_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-current-qemu-version.txt"
+    target_host_container_reconcile_nova_libvirt_target_info_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-target-info.txt"
+    target_host_container_reconcile_nova_libvirt_missing_machine_types_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-missing-machine-types.txt"
+    target_host_container_reconcile_nova_libvirt_version_problems_file: "{{ target_host_container_reconcile_report_dir }}/nova_libvirt-version-problems.txt"
+
+- name: Target host container reconcile | process {{ target_host_container_reconcile_container }}
+  block:
+    - name: Target host container reconcile | inspect current container {{ target_host_container_reconcile_container }}
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - inspect
+          - "{{ target_host_container_reconcile_container }}"
+      register: target_host_container_reconcile_current_inspect
+      changed_when: false
+
+    - name: Target host container reconcile | pull target image for {{ target_host_container_reconcile_container }}
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - pull
+          - "{{ target_host_container_reconcile_image }}"
+      changed_when: true
+      when: target_host_container_reconcile_pull | bool
+
+    - name: Target host container reconcile | verify target image exists for {{ target_host_container_reconcile_container }}
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - image
+          - inspect
+          - "{{ target_host_container_reconcile_image }}"
+      changed_when: false
+
+    - name: Target host container reconcile | check staged target Kolla config for {{ target_host_container_reconcile_container }}
+      ansible.builtin.stat:
+        path: "{{ target_host_container_reconcile_config_stage_dir }}/{{ target_host_container_reconcile_config_dir }}/config.json"
+      register: target_host_container_reconcile_staged_config
+      when: target_host_container_reconcile_config_dir | length > 0
+
+    - name: Target host container reconcile | require staged target Kolla config for apply
+      ansible.builtin.assert:
+        that:
+          - target_host_container_reconcile_staged_config.stat.exists
+        fail_msg: >-
+          Missing staged target Kolla config for {{ target_host_container_reconcile_container }}:
+          {{ target_host_container_reconcile_config_stage_dir }}/{{ target_host_container_reconcile_config_dir }}/config.json.
+          Run 05b-stage-target-kolla-config.yml before applying this container.
+      when:
+        - target_host_container_reconcile_apply | bool
+        - target_host_container_reconcile_config_dir | length > 0
+
+    - name: Target host container reconcile | compare current and staged Kolla config for {{ target_host_container_reconcile_container }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        current={{ ('/etc/kolla/' + target_host_container_reconcile_config_dir) | quote }}
+        staged={{ (target_host_container_reconcile_config_stage_dir + '/' + target_host_container_reconcile_config_dir) | quote }}
+        diff -qr "$current" "$staged" >/dev/null
+      args:
+        executable: /bin/bash
+      register: target_host_container_reconcile_config_diff
+      changed_when: false
+      failed_when: target_host_container_reconcile_config_diff.rc not in [0, 1]
+      when:
+        - target_host_container_reconcile_config_dir | length > 0
+        - target_host_container_reconcile_staged_config.stat.exists | default(false)
+
+    - name: Target host container reconcile | backup current Kolla config for {{ target_host_container_reconcile_container }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        current={{ ('/etc/kolla/' + target_host_container_reconcile_config_dir) | quote }}
+        backup={{ target_host_container_reconcile_config_backup_path | quote }}
+        rm -rf "$backup"
+        mkdir -p "$(dirname "$backup")"
+        cp -a "$current" "$backup"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - target_host_container_reconcile_apply | bool
+        - target_host_container_reconcile_config_dir | length > 0
+        - target_host_container_reconcile_config_diff.rc | default(0) == 1
+
+    - name: Target host container reconcile | install staged target Kolla config for {{ target_host_container_reconcile_container }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        current={{ ('/etc/kolla/' + target_host_container_reconcile_config_dir) | quote }}
+        staged={{ (target_host_container_reconcile_config_stage_dir + '/' + target_host_container_reconcile_config_dir) | quote }}
+        tmp="${current}.rehome-new"
+        rm -rf "$tmp"
+        cp -a "$staged" "$tmp"
+        rm -rf "$current"
+        mv "$tmp" "$current"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - target_host_container_reconcile_apply | bool
+        - target_host_container_reconcile_config_dir | length > 0
+        - target_host_container_reconcile_config_diff.rc | default(0) == 1
+
+    - name: Nova libvirt compatibility | capture running domain machine types
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec nova_libvirt virsh list --name \
+          | awk 'NF' \
+          | while IFS= read -r domain; do
+              docker exec nova_libvirt virsh dumpxml "$domain" \
+                | sed -n "s/.*<type[^>]*machine='\([^']*\)'.*/\1/p"
+            done \
+          | sort -u > {{ target_host_container_reconcile_nova_libvirt_current_machine_types_file | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | capture current libvirt and QEMU versions
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec nova_libvirt virsh --version \
+          > {{ target_host_container_reconcile_nova_libvirt_current_libvirt_version_file | quote }}
+        docker exec nova_libvirt /bin/bash -lc '
+          set -euo pipefail
+          for p in {{ target_host_container_reconcile_nova_libvirt_qemu_paths | map('quote') | join(' ') }}; do
+            if [ -x "$p" ]; then
+              "$p" --version | head -n 1
+              exit 0
+            fi
+          done
+          echo "No supported QEMU binary found" >&2
+          exit 1
+        ' > {{ target_host_container_reconcile_nova_libvirt_current_qemu_version_file | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | inspect target image versions and machine types
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker run --rm --entrypoint /bin/bash {{ target_host_container_reconcile_image | quote }} -lc '
+          set -euo pipefail
+          echo "libvirt_version=$(virsh --version)"
+          qemu_bin=""
+          for p in {{ target_host_container_reconcile_nova_libvirt_qemu_paths | map('quote') | join(' ') }}; do
+            if [ -x "$p" ]; then
+              qemu_bin="$p"
+              break
+            fi
+          done
+          if [ -z "$qemu_bin" ]; then
+            echo "No supported QEMU binary found" >&2
+            exit 1
+          fi
+          echo "qemu_binary=$qemu_bin"
+          printf "qemu_version="
+          "$qemu_bin" --version | head -n 1
+          echo "--- machine help ---"
+          "$qemu_bin" -machine help
+        ' > {{ target_host_container_reconcile_nova_libvirt_target_info_file | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | evaluate target image machine type support
+      ansible.builtin.shell: |
+        set -euo pipefail
+        : > {{ target_host_container_reconcile_nova_libvirt_missing_machine_types_file | quote }}
+        while IFS= read -r machine; do
+          [ -n "$machine" ] || continue
+          if ! grep -F -- "$machine" {{ target_host_container_reconcile_nova_libvirt_target_info_file | quote }} >/dev/null; then
+            echo "$machine" >> {{ target_host_container_reconcile_nova_libvirt_missing_machine_types_file | quote }}
+          fi
+        done < {{ target_host_container_reconcile_nova_libvirt_current_machine_types_file | quote }}
+        cat {{ target_host_container_reconcile_nova_libvirt_missing_machine_types_file | quote }}
+      args:
+        executable: /bin/bash
+      register: target_host_container_reconcile_nova_libvirt_missing_machine_types
+      changed_when: false
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | evaluate target image version downgrade
+      ansible.builtin.shell: |
+        set -euo pipefail
+        : > {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+
+        extract_version() {
+          grep -Eo '[0-9]+([.][0-9]+){1,2}' "$1" | head -n 1 || true
+        }
+
+        version_lt() {
+          left="$1"
+          right="$2"
+          [ -n "$left" ] || return 0
+          [ -n "$right" ] || return 1
+          lowest="$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)"
+          [ "$lowest" = "$left" ] && [ "$left" != "$right" ]
+        }
+
+        current_libvirt="$(extract_version {{ target_host_container_reconcile_nova_libvirt_current_libvirt_version_file | quote }})"
+        target_libvirt="$(sed -n 's/^libvirt_version=//p' {{ target_host_container_reconcile_nova_libvirt_target_info_file | quote }} | grep -Eo '[0-9]+([.][0-9]+){1,2}' | head -n 1 || true)"
+        current_qemu="$(extract_version {{ target_host_container_reconcile_nova_libvirt_current_qemu_version_file | quote }})"
+        target_qemu="$(sed -n 's/^qemu_version=//p' {{ target_host_container_reconcile_nova_libvirt_target_info_file | quote }} | grep -Eo '[0-9]+([.][0-9]+){1,2}' | head -n 1 || true)"
+
+        if [ -z "$target_libvirt" ]; then
+          echo "target libvirt version could not be detected" >> {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+        elif version_lt "$target_libvirt" "$current_libvirt"; then
+          echo "target libvirt version $target_libvirt is older than current $current_libvirt" >> {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+        fi
+
+        if [ -z "$target_qemu" ]; then
+          echo "target QEMU version could not be detected" >> {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+        elif version_lt "$target_qemu" "$current_qemu"; then
+          echo "target QEMU version $target_qemu is older than current $current_qemu" >> {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+        fi
+
+        cat {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+      args:
+        executable: /bin/bash
+      register: target_host_container_reconcile_nova_libvirt_version_problems
+      changed_when: false
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | write compatibility report
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {
+          echo "target_image={{ target_host_container_reconcile_image }}"
+          echo
+          echo "[current running domain machine types]"
+          if [ -s {{ target_host_container_reconcile_nova_libvirt_current_machine_types_file | quote }} ]; then
+            cat {{ target_host_container_reconcile_nova_libvirt_current_machine_types_file | quote }}
+          else
+            echo "none"
+          fi
+          echo
+          echo "[current libvirt version]"
+          cat {{ target_host_container_reconcile_nova_libvirt_current_libvirt_version_file | quote }}
+          echo
+          echo "[current QEMU version]"
+          cat {{ target_host_container_reconcile_nova_libvirt_current_qemu_version_file | quote }}
+          echo
+          echo "[target image libvirt/QEMU and machine types]"
+          cat {{ target_host_container_reconcile_nova_libvirt_target_info_file | quote }}
+          echo
+          echo "[missing machine types]"
+          if [ -s {{ target_host_container_reconcile_nova_libvirt_missing_machine_types_file | quote }} ]; then
+            cat {{ target_host_container_reconcile_nova_libvirt_missing_machine_types_file | quote }}
+          else
+            echo "none"
+          fi
+          echo
+          echo "[version problems]"
+          if [ -s {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }} ]; then
+            cat {{ target_host_container_reconcile_nova_libvirt_version_problems_file | quote }}
+          else
+            echo "none"
+          fi
+        } > {{ target_host_container_reconcile_nova_libvirt_compat_report | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | append compatibility report summary
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {
+          echo
+          echo "--- nova_libvirt compatibility preflight"
+          cat {{ target_host_container_reconcile_nova_libvirt_compat_report | quote }}
+        } >> {{ target_host_container_reconcile_report | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: target_host_container_reconcile_container == 'nova_libvirt'
+
+    - name: Nova libvirt compatibility | fail if target image misses running domain machine types
+      ansible.builtin.fail:
+        msg: >-
+          Target nova_libvirt image {{ target_host_container_reconcile_image }} does not support
+          running domain machine types: {{
+            target_host_container_reconcile_nova_libvirt_missing_machine_types.stdout_lines | join(', ')
+          }}. This would risk breaking existing QEMU domains. See
+          {{ target_host_container_reconcile_nova_libvirt_compat_report }}.
+      when:
+        - target_host_container_reconcile_container == 'nova_libvirt'
+        - not target_host_container_reconcile_allow_unsupported_libvirt_machine_types | bool
+        - target_host_container_reconcile_nova_libvirt_missing_machine_types.stdout_lines | length > 0
+
+    - name: Nova libvirt compatibility | fail if target image downgrades libvirt or QEMU
+      ansible.builtin.fail:
+        msg: >-
+          Target nova_libvirt image {{ target_host_container_reconcile_image }} has older or
+          undetected libvirt/QEMU versions: {{
+            target_host_container_reconcile_nova_libvirt_version_problems.stdout_lines | join('; ')
+          }}. See {{ target_host_container_reconcile_nova_libvirt_compat_report }}.
+      when:
+        - target_host_container_reconcile_container == 'nova_libvirt'
+        - not target_host_container_reconcile_allow_libvirt_version_downgrade | bool
+        - target_host_container_reconcile_nova_libvirt_version_problems.stdout_lines | length > 0
+
+    - name: Target host container reconcile | write report for {{ target_host_container_reconcile_container }}
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ target_host_container_reconcile_script_remote }}"
+          - --action
+          - report
+          - --runtime
+          - "{{ container_runtime_cli }}"
+          - --container
+          - "{{ target_host_container_reconcile_container }}"
+          - --target-image
+          - "{{ target_host_container_reconcile_image }}"
+          - --backup-name
+          - "{{ target_host_container_reconcile_backup_name }}"
+          - --env-overrides-json
+          - "{{ target_host_container_reconcile_env_overrides_for_container | to_json }}"
+          - --drop-mount-destinations-json
+          - "{{ target_host_container_reconcile_drop_mount_destinations_for_container | to_json }}"
+          - --report
+          - "{{ target_host_container_reconcile_container_report }}"
+      register: target_host_container_reconcile_report_cmd
+      changed_when: false
+
+    - name: Target host container reconcile | append report summary for {{ target_host_container_reconcile_container }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {
+          echo
+          echo "--- {{ target_host_container_reconcile_container }}"
+          cat {{ target_host_container_reconcile_container_report | quote }}
+        } >> {{ target_host_container_reconcile_report | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Target host container reconcile | recreate {{ target_host_container_reconcile_container }} with target image if apply is enabled
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ target_host_container_reconcile_script_remote }}"
+          - --action
+          - apply
+          - --runtime
+          - "{{ container_runtime_cli }}"
+          - --container
+          - "{{ target_host_container_reconcile_container }}"
+          - --target-image
+          - "{{ target_host_container_reconcile_image }}"
+          - --backup-name
+          - "{{ target_host_container_reconcile_backup_name }}"
+          - --env-overrides-json
+          - "{{ target_host_container_reconcile_env_overrides_for_container | to_json }}"
+          - --drop-mount-destinations-json
+          - "{{ target_host_container_reconcile_drop_mount_destinations_for_container | to_json }}"
+          - --report
+          - "{{ target_host_container_reconcile_container_report }}"
+      register: target_host_container_reconcile_apply_cmd
+      changed_when: >-
+        '"changed": true' in target_host_container_reconcile_apply_cmd.stdout
+      when: target_host_container_reconcile_apply | bool
+
+    - name: Target host container reconcile | restart container after config-only change for {{ target_host_container_reconcile_container }}
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - restart
+          - "{{ target_host_container_reconcile_container }}"
+      changed_when: true
+      when:
+        - target_host_container_reconcile_apply | bool
+        - target_host_container_reconcile_config_dir | length > 0
+        - target_host_container_reconcile_config_diff.rc | default(0) == 1
+        - >-
+          target_host_container_reconcile_apply_cmd is defined
+          and '"changed": false' in target_host_container_reconcile_apply_cmd.stdout
+
+    - name: Target host container reconcile | verify VM runtime after {{ target_host_container_reconcile_container }}
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after target host container reconcile {{ target_host_container_reconcile_container }}"
+
+    - name: Target host container reconcile | verify {{ target_host_container_reconcile_container }} uses target image
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker inspect {{ target_host_container_reconcile_container | quote }} \
+          --format '{% raw %}{{.Config.Image}}{% endraw %}' \
+          | grep -Fx {{ target_host_container_reconcile_image | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: target_host_container_reconcile_apply | bool
+
+  rescue:
+    - name: Target host container reconcile | restore Kolla config after failure for {{ target_host_container_reconcile_container }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        current={{ ('/etc/kolla/' + target_host_container_reconcile_config_dir) | quote }}
+        backup={{ target_host_container_reconcile_config_backup_path | quote }}
+        if [ -d "$backup" ]; then
+          rm -rf "$current"
+          cp -a "$backup" "$current"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - target_host_container_reconcile_apply | bool
+        - target_host_container_reconcile_config_dir | length > 0
+
+    - name: Target host container reconcile | rollback {{ target_host_container_reconcile_container }} from backup
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ target_host_container_reconcile_script_remote }}"
+          - --action
+          - rollback
+          - --runtime
+          - "{{ container_runtime_cli }}"
+          - --container
+          - "{{ target_host_container_reconcile_container }}"
+          - --backup-name
+          - "{{ target_host_container_reconcile_backup_name }}"
+      when: target_host_container_reconcile_apply | bool
+
+    - name: Target host container reconcile | verify VM runtime after rollback of {{ target_host_container_reconcile_container }}
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after rollback target host container reconcile {{ target_host_container_reconcile_container }}"
+      when: target_host_container_reconcile_apply | bool
+
+    - name: Target host container reconcile | fail after rollback attempt for {{ target_host_container_reconcile_container }}
+      ansible.builtin.fail:
+        msg: >-
+          Target host container reconcile failed for {{ target_host_container_reconcile_container }}.
+          If apply was enabled, rollback was attempted from {{ target_host_container_reconcile_backup_name }}.
+          Original failure: {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('unknown')) }}

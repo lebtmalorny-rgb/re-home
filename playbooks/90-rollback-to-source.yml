@@ -1,0 +1,67 @@
+---
+- name: 90A | Stop target authority on compute host
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop target agents on compute
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      failed_when: false
+      loop: "{{ target_compute_units }}"
+
+    - name: Restore source configs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if [ -d {{ source_config_backup_dir }}/etc/nova ]; then rsync -a --delete {{ source_config_backup_dir }}/etc/nova/ /etc/nova/; fi
+        if [ -d {{ source_config_backup_dir }}/etc/neutron ]; then rsync -a --delete {{ source_config_backup_dir }}/etc/neutron/ /etc/neutron/; fi
+        if [ -d {{ source_config_backup_dir }}/etc/openvswitch ]; then rsync -a {{ source_config_backup_dir }}/etc/openvswitch/ /etc/openvswitch/; fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Start source agents on compute
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      failed_when: false
+      loop: "{{ source_compute_units }}"
+
+    - name: Verify domains remain running after rollback
+      ansible.builtin.shell: |
+        set -euo pipefail
+        virsh list --name | awk 'NF' | sort > {{ rehome_stage_dir }}/domains-after-rollback.txt
+        test -s {{ rehome_stage_dir }}/domains-after-rollback.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+- name: 90B | Re-enable source compute service
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Enable source compute service
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% if use_os_cloud %}export OS_CLOUD={{ source_os_cloud }}{% else %}source {{ openrc_file }}{% endif %}
+        openstack compute service set --enable {{ rehome_host }} nova-compute
+        openstack compute service list --host {{ rehome_host }} -f yaml
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+- name: 90C | Quarantine target metadata manually
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reminder for target DB restore/quarantine
+      ansible.builtin.debug:
+        msg: >-
+          Rollback restored compute authority to source. Now restore target DB backup
+          /var/backups/openstack-rehome/{{ rehome_id }}/target-preimport-full.sql
+          or run your reviewed cleanup SQL. Do not leave duplicated active instances
+          in target after rollback.

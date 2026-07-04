@@ -1,0 +1,279 @@
+---
+- name: 08A | Heal Placement allocations and validate target API in Kolla
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_validation_nova_manage_container: nova_api
+    target_validation_openstack_cli_container: "{{ openstack_cli_container | default('kolla_toolbox') }}"
+    target_validation_clouds_remote: "{{ rehome_stage_dir }}/validation-target-clouds.yaml"
+    target_validation_clouds_in_container: /tmp/rehome-validation-target-clouds.yaml
+    target_validation_artifact_dir: "/var/backups/openstack-rehome/{{ rehome_id | default(rehome_host | default(inventory_hostname)) }}"
+  tasks:
+    - name: Target validation | require Kolla inputs
+      ansible.builtin.assert:
+        that:
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - target_clouds_file_local | default('') | length > 0
+          - target_cloud_name | default('') | length > 0
+          - target_validation_openstack_cli_container | length > 0
+        fail_msg: "Set Kolla/Docker target validation inputs, target_clouds_file_local and target_cloud_name before running 08."
+
+    - name: Target validation | load manifest from Ansible runner
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: target_validation_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Target validation | build re-home instance list
+      ansible.builtin.set_fact:
+        target_validation_instances: >-
+          {{
+            target_validation_manifest.rehome_instances
+            | default(target_validation_manifest.get('openstack', {}).get('rehome_instances', []), true)
+            | default(target_validation_manifest.source.instances | default([]), true)
+          }}
+
+    - name: Target validation | validate manifest scope
+      ansible.builtin.assert:
+        that:
+          - target_validation_instances | length > 0
+          - target_validation_instances | map(attribute='uuid') | list | length > 0
+        fail_msg: "Manifest must contain at least one re-home instance with UUID."
+
+    - name: Target validation | ensure remote stage and artifact directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ rehome_stage_dir }}"
+        - "{{ target_validation_artifact_dir }}"
+
+    - name: Target validation | place target clouds.yaml on target control
+      ansible.builtin.copy:
+        src: "{{ target_clouds_file_local }}"
+        dest: "{{ target_validation_clouds_remote }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Target validation | place target clouds.yaml inside OpenStack CLI container
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker cp {{ target_validation_clouds_remote | quote }} {{ target_validation_openstack_cli_container | quote }}:{{ target_validation_clouds_in_container | quote }}
+        docker exec -u 0 {{ target_validation_openstack_cli_container | quote }} chmod 0644 {{ target_validation_clouds_in_container | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+
+    - name: Target validation | verify Nova instance mapping
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec nova_api nova-manage cell_v2 verify_instance --uuid {{ item.uuid | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: verify_instance_results
+      changed_when: false
+      failed_when: verify_instance_results.rc != 0
+
+    - name: Target validation | heal Placement allocation if needed
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec nova_api nova-manage placement heal_allocations --instance {{ item.uuid | quote }} --verbose
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: heal_allocations_results
+      changed_when: heal_allocations_results.rc == 1
+      failed_when: heal_allocations_results.rc not in [0, 1, 4]
+
+    - name: Target validation | audit Placement after heal
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec nova_api nova-manage placement audit --verbose
+      args:
+        executable: /bin/bash
+      register: placement_audit
+      changed_when: false
+      failed_when: placement_audit.rc != 0
+
+    - name: Target validation | show target servers by UUID
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+          {{ target_validation_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          server show {{ item.uuid | quote }} -f yaml
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: target_server_show
+      changed_when: false
+
+    - name: Target validation | show target project-scoped server list
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+          {{ target_validation_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          server list --long --name {{ item.name | default(item.uuid) | quote }} -f yaml
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: target_project_server_list
+      changed_when: false
+
+    - name: Target validation | show target all-projects server list
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+          {{ target_validation_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          server list --all-projects --long --name {{ item.name | default(item.uuid) | quote }} -f yaml
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: target_all_projects_server_list
+      changed_when: false
+
+    - name: Target validation | verify server project exists in target Keystone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        project_id="$(
+          docker exec \
+            -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+            {{ target_validation_openstack_cli_container | quote }} \
+            openstack --os-cloud {{ target_cloud_name | quote }} \
+            server show {{ item.uuid | quote }} -f value -c project_id
+        )"
+        test -n "$project_id"
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+          {{ target_validation_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          project show "$project_id" -f yaml
+      args:
+        executable: /bin/bash
+      loop: "{{ target_validation_instances }}"
+      register: target_project_show
+      changed_when: false
+
+    - name: Target validation | show target compute service
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ target_validation_clouds_in_container | quote }} \
+          {{ target_validation_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          compute service list --host {{ rehome_host | quote }} -f yaml
+      args:
+        executable: /bin/bash
+      register: target_compute_service
+      changed_when: false
+
+    - name: Target validation | save target validation output
+      ansible.builtin.copy:
+        content: |
+          verify_instance:
+          {{ verify_instance_results.results | to_nice_yaml(indent=2) | indent(2) }}
+          heal_allocations:
+          {{ heal_allocations_results.results | to_nice_yaml(indent=2) | indent(2) }}
+          placement_audit:
+          {{ placement_audit.stdout | indent(2) }}
+          server_show:
+          {{ target_server_show.results | to_nice_yaml(indent=2) | indent(2) }}
+          project_scoped_server_list:
+          {{ target_project_server_list.results | to_nice_yaml(indent=2) | indent(2) }}
+          all_projects_server_list:
+          {{ target_all_projects_server_list.results | to_nice_yaml(indent=2) | indent(2) }}
+          project_show:
+          {{ target_project_show.results | to_nice_yaml(indent=2) | indent(2) }}
+          compute_service:
+          {{ target_compute_service.stdout | indent(2) }}
+        dest: "{{ target_validation_artifact_dir }}/target-validation.yml"
+        mode: "0600"
+
+    - name: Target validation | remove target clouds.yaml from OpenStack CLI container
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec -u 0 {{ target_validation_openstack_cli_container | quote }} rm -f {{ target_validation_clouds_in_container | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+
+    - name: Target validation | remove target clouds.yaml from target control
+      ansible.builtin.file:
+        path: "{{ target_validation_clouds_remote }}"
+        state: absent
+      no_log: true
+
+- name: 08B | Validate compute-local VM runtime in Kolla
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Compute validation | run runtime guard check
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "08 heal-and-validate"
+
+    - name: Compute validation | compare current domains to cutover baseline
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF' | sort > {{ rehome_stage_dir }}/domains-validation.txt
+        if [ -f {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt ]; then
+          diff -u {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt {{ rehome_stage_dir }}/domains-validation.txt
+        elif [ -f {{ rehome_stage_dir }}/domains-before-cutover.txt ]; then
+          diff -u {{ rehome_stage_dir }}/domains-before-cutover.txt {{ rehome_stage_dir }}/domains-validation.txt
+        else
+          echo "No domain baseline found in {{ rehome_stage_dir }}" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Compute validation | optional guest-agent ping for domains with qemu-guest-agent
+      ansible.builtin.shell: |
+        set +e
+        while read -r domain; do
+          echo "--- ${domain}"
+          {{ runtime_guard_virsh_command }} qemu-agent-command "$domain" '{"execute":"guest-ping"}' --timeout 2 || true
+        done < {{ rehome_stage_dir }}/domains-validation.txt
+      args:
+        executable: /bin/bash
+      register: qga_ping
+      changed_when: false
+
+    - name: Compute validation | show target runtime container status
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker ps --filter name='neutron_openvswitch_agent' --filter name='nova_compute' \
+          --format '{% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}' | sort
+      args:
+        executable: /bin/bash
+      register: compute_target_container_status
+      changed_when: false
+
+    - name: Compute validation | save compute validation output
+      ansible.builtin.copy:
+        content: |
+          qga_ping:
+          {{ qga_ping.stdout | indent(2) }}
+          target_runtime_containers:
+          {{ compute_target_container_status.stdout | indent(2) }}
+        dest: "{{ rehome_stage_dir }}/compute-validation.yml"
+        mode: "0600"
+
+    - name: Compute validation | print target runtime container status
+      ansible.builtin.debug:
+        var: compute_target_container_status.stdout_lines

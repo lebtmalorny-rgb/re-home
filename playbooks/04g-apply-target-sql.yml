@@ -1,0 +1,255 @@
+---
+- name: 04G | Prepare reviewed target SQL import locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    target_db_import_apply: false
+    target_db_import_strip_hard_stop: false
+    target_db_import_skip_files:
+      - 10-keystone-projects-users-optional.sql
+    target_db_import_sql_source_dir: "{{ local_artifact_dir }}/target-db-import-sql-draft"
+    target_db_import_sql_apply_dir: "{{ local_artifact_dir }}/target-db-import-sql-apply"
+    target_db_import_guard_report_json: "{{ local_artifact_dir }}/target-preimport-guard-report.json"
+    target_db_import_backup_manifest_json: ""
+    target_db_import_backup_manifest_dir: "{{ local_artifact_dir }}/target-db-backup"
+  tasks:
+    - name: Target SQL import local | require explicit apply
+      ansible.builtin.assert:
+        that:
+          - target_db_import_apply | bool
+        fail_msg: "Set target_db_import_apply=true to apply target SQL."
+
+    - name: Target SQL import local | validate local guard and SQL artifacts
+      ansible.builtin.assert:
+        that:
+          - target_db_import_sql_source_dir is directory
+          - target_db_import_guard_report_json is file
+        fail_msg: "Run 04d and 04e before applying target SQL."
+
+    - name: Target SQL import local | load target pre-import guard report
+      ansible.builtin.set_fact:
+        target_db_import_guard_report: "{{ lookup('file', target_db_import_guard_report_json) | from_json }}"
+
+    - name: Target SQL import local | refuse import if target guard failed
+      ansible.builtin.assert:
+        that:
+          - target_db_import_guard_report.passed | bool
+          - target_db_import_guard_report.summary.conflicting_rows | int == 0
+          - target_db_import_guard_report.summary.query_failures | int == 0
+        fail_msg: "Target pre-import guard is not clean; rerun or inspect 04e report before import."
+
+    - name: Target SQL import local | find latest target DB backup manifest
+      ansible.builtin.find:
+        paths: "{{ target_db_import_backup_manifest_dir }}"
+        patterns: "*.manifest.json"
+      register: target_db_import_backup_manifests
+      when: target_db_import_backup_manifest_json | length == 0
+
+    - name: Target SQL import local | validate target DB backup manifest exists
+      ansible.builtin.assert:
+        that:
+          - >-
+            target_db_import_backup_manifest_json | length > 0
+            or target_db_import_backup_manifests.matched | default(0) | int > 0
+        fail_msg: "Run 04f-backup-target-db.yml before target SQL import."
+
+    - name: Target SQL import local | select target DB backup manifest
+      ansible.builtin.set_fact:
+        target_db_import_backup_manifest_effective: >-
+          {{
+            target_db_import_backup_manifest_json
+            if target_db_import_backup_manifest_json | length > 0
+            else (target_db_import_backup_manifests.files | sort(attribute='mtime', reverse=true) | first).path
+          }}
+
+    - name: Target SQL import local | prepare SQL apply directory
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 {{ (playbook_dir + '/../scripts/prepare_target_sql_import.py') | quote }} \
+          --source-dir {{ target_db_import_sql_source_dir | quote }} \
+          --out-dir {{ target_db_import_sql_apply_dir | quote }} \
+          {% if target_db_import_strip_hard_stop | bool %}--strip-hard-stop{% endif %} \
+          {% for skip_file in target_db_import_skip_files %}--skip-file {{ skip_file | quote }} {% endfor %} \
+          {% for replacement in target_db_import_literal_replacements | default([]) %}--replace-literal {{ (replacement.old + '=' + replacement.new) | quote }} {% endfor %} \
+          {% for replacement in target_db_import_column_replacements | default([]) %}--replace-column {{ (replacement.table + '.' + replacement.column + '=' + replacement.value) | quote }} {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Target SQL import local | load prepared SQL manifest
+      ansible.builtin.set_fact:
+        target_db_import_sql_manifest: "{{ lookup('file', target_db_import_sql_apply_dir + '/manifest.json') | from_json }}"
+
+    - name: Target SQL import local | show prepared SQL summary
+      ansible.builtin.debug:
+        msg:
+          - "Prepared SQL dir: {{ target_db_import_sql_apply_dir }}"
+          - "Backup manifest: {{ target_db_import_backup_manifest_effective }}"
+          - "Prepared files: {{ target_db_import_sql_manifest.summary.files_prepared }}"
+          - "Skipped files: {{ target_db_import_sql_manifest.summary.files_skipped }}"
+          - "Insert statements: {{ target_db_import_sql_manifest.summary.insert_statements }}"
+          - "Literal replacements: {{ target_db_import_sql_manifest.summary.literal_replacements }}"
+          - "Column replacements: {{ target_db_import_sql_manifest.summary.column_replacements }}"
+
+- name: 04G | Apply reviewed target SQL import on target DB
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_db_import_apply: false
+    target_db_import_id: ""
+    target_db_import_container: "mariadb"
+    target_db_import_user: root
+    target_db_import_socket: "{{ target_db_backup_socket | default('/run/mysqld/mysqld.sock') }}"
+    target_db_import_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_db_import_sql_apply_dir: "{{ local_artifact_dir }}/target-db-import-sql-apply"
+    target_db_import_fetch_dir: "{{ local_artifact_dir }}/target-db-import-run"
+    target_db_import_no_log: true
+  tasks:
+    - name: Target SQL import | require explicit apply
+      ansible.builtin.assert:
+        that:
+          - target_db_import_apply | bool
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_db_import_password_key | length > 0
+        fail_msg: "Set target_db_import_apply=true and Kolla passwords file before target SQL import."
+
+    - name: Target SQL import | freeze import id
+      ansible.builtin.set_fact:
+        target_db_import_id_effective: >-
+          {{
+            target_db_import_id
+            if target_db_import_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target SQL import | set import paths
+      ansible.builtin.set_fact:
+        target_db_import_remote_dir_effective: "{{ rehome_stage_dir }}/target-db-import/{{ target_db_import_id_effective }}"
+        target_db_import_remote_sql_dir_effective: "{{ rehome_stage_dir }}/target-db-import/{{ target_db_import_id_effective }}/sql"
+        target_db_import_local_run_dir_effective: "{{ target_db_import_fetch_dir }}/{{ target_db_import_id_effective }}"
+
+    - name: Target SQL import | validate local prepared manifest exists
+      ansible.builtin.stat:
+        path: "{{ target_db_import_sql_apply_dir }}/manifest.json"
+      register: target_db_import_prepared_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Target SQL import | assert local prepared manifest exists
+      ansible.builtin.assert:
+        that:
+          - target_db_import_prepared_manifest.stat.exists
+        fail_msg: "Prepared SQL manifest is missing; local preparation did not run."
+
+    - name: Target SQL import | create remote import directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ target_db_import_remote_dir_effective }}"
+        - "{{ target_db_import_remote_sql_dir_effective }}"
+
+    - name: Target SQL import | copy prepared SQL files to target control
+      ansible.builtin.copy:
+        src: "{{ target_db_import_sql_apply_dir }}/"
+        dest: "{{ target_db_import_remote_sql_dir_effective }}/"
+        mode: "0600"
+
+    - name: Target SQL import | load target DB password
+      ansible.builtin.set_fact:
+        target_db_import_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_db_import_password_key]
+          }}
+      no_log: true
+
+    - name: Target SQL import | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_db_import_container }}"
+          - test
+          - "-S"
+          - "{{ target_db_import_socket }}"
+      changed_when: false
+
+    - name: Target SQL import | apply prepared SQL in one transaction
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mysql_bin="$({{ container_runtime_cli }} exec {{ target_db_import_container }} sh -lc 'command -v mariadb || command -v mysql')"
+        combined_sql={{ (target_db_import_remote_dir_effective + '/combined-target-import.sql') | quote }}
+        import_log={{ (target_db_import_remote_dir_effective + '/import.log') | quote }}
+        import_stderr={{ (target_db_import_remote_dir_effective + '/import.stderr') | quote }}
+        : > "$import_log"
+        : > "$import_stderr"
+        {
+          echo "START TRANSACTION;"
+          for f in {{ target_db_import_remote_sql_dir_effective | quote }}/*.sql; do
+            test -f "$f"
+            echo "-- BEGIN FILE $(basename "$f")"
+            cat "$f"
+            echo "-- END FILE $(basename "$f")"
+          done
+          echo "COMMIT;"
+        } > "$combined_sql"
+        {{ container_runtime_cli }} exec \
+          -e MYSQL_PWD="$TARGET_DB_IMPORT_PASSWORD" \
+          -i {{ target_db_import_container }} \
+          "$mysql_bin" \
+          -u"{{ target_db_import_user }}" \
+          --socket={{ target_db_import_socket | quote }} \
+          --batch \
+          < "$combined_sql" \
+          > "$import_log" \
+          2> "$import_stderr"
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_DB_IMPORT_PASSWORD: "{{ target_db_import_password }}"
+      changed_when: true
+      no_log: "{{ target_db_import_no_log | bool }}"
+
+    - name: Target SQL import | write import run manifest
+      ansible.builtin.copy:
+        dest: "{{ target_db_import_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-sql-import-run/v1alpha1",
+            "import_id": "{{ target_db_import_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "backup_manifest": "{{ hostvars['localhost'].target_db_import_backup_manifest_effective }}",
+            "remote_sql_dir": "{{ target_db_import_remote_sql_dir_effective }}",
+            "socket": "{{ target_db_import_socket }}"
+          }
+
+    - name: Target SQL import | ensure local import run artifact directory exists
+      ansible.builtin.file:
+        path: "{{ target_db_import_local_run_dir_effective }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Target SQL import | fetch import run artifacts
+      ansible.builtin.fetch:
+        src: "{{ target_db_import_remote_dir_effective }}/{{ item }}"
+        dest: "{{ target_db_import_local_run_dir_effective }}/{{ item }}"
+        flat: true
+      loop:
+        - import.log
+        - import.stderr
+        - manifest.json
+
+    - name: Target SQL import | show import run artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Import id: {{ target_db_import_id_effective }}"
+          - "Remote import dir: {{ target_db_import_remote_dir_effective }}"
+          - "Local import run dir: {{ target_db_import_local_run_dir_effective }}"

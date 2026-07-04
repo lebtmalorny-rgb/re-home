@@ -1,0 +1,19 @@
+# Runtime/generated output
+.ansible/
+artifacts/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local OS/editor files
+.DS_Store
+*.swp
+
+# Secrets and operator-local files
+passwords.yml
+clouds.yaml
+admin-openrc.sh
+*.openrc
+*.sql.gz
+*.dump

@@ -1,0 +1,27 @@
+---
+- name: Target DB rows | load DB password for {{ target_db_row_service.label }}
+  ansible.builtin.set_fact:
+    target_db_rows_mysql_password: >-
+      {{
+        (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_db_row_service.password_key]
+      }}
+  no_log: true
+
+- name: Target DB rows | execute read-only query for {{ target_db_row_service.label }}
+  ansible.builtin.shell: |
+    set +e
+    {{ schema_compat_mysql_query_command }} \
+      < {{ target_preimport_guard_remote_dir }}/queries/{{ target_db_row_service.sql_file }} \
+      > {{ target_preimport_guard_remote_dir }}/rows/{{ target_db_row_service.label }}.tsv \
+      2> {{ target_preimport_guard_remote_dir }}/rows/{{ target_db_row_service.label }}.stderr
+    rc=$?
+    printf '%s\n' "$rc" > {{ target_preimport_guard_remote_dir }}/rows/{{ target_db_row_service.label }}.rc
+    exit 0
+  args:
+    executable: /bin/bash
+  environment:
+    SCHEMA_COMPAT_DB_PASSWORD: "{{ target_db_rows_mysql_password }}"
+    SCHEMA_COMPAT_DB_USER: "{{ target_db_row_service.user }}"
+    SCHEMA_COMPAT_DB_HOST: "{{ schema_compat_mysql_host }}"
+  changed_when: false
+  no_log: "{{ schema_compat_mysql_query_no_log | bool }}"

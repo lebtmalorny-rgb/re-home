@@ -1,0 +1,123 @@
+---
+- name: 12 | Reconcile re-home host containers to target image tags
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    target_host_container_reconcile_apply: false
+    target_host_container_reconcile_pull: true
+    target_host_container_reconcile_include_libvirt: false
+    target_host_container_reconcile_include_ovs: false
+    target_host_container_reconcile_nova_libvirt_image: ""
+    target_host_container_reconcile_nova_libvirt_qemu_paths:
+      - /usr/libexec/qemu-kvm
+      - /usr/bin/qemu-system-x86_64
+    target_host_container_reconcile_allow_unsupported_libvirt_machine_types: false
+    target_host_container_reconcile_allow_libvirt_version_downgrade: false
+    target_host_container_reconcile_remote_dir: "{{ rehome_stage_dir }}/target-host-container-reconcile"
+    target_host_container_reconcile_report: "{{ target_host_container_reconcile_remote_dir }}/report.txt"
+    target_host_container_reconcile_report_dir: "{{ target_host_container_reconcile_remote_dir }}/containers"
+    target_host_container_reconcile_config_stage_dir: "{{ target_config_stage_dir | default(rehome_stage_dir + '/target-config-stage') }}/kolla"
+    target_host_container_reconcile_config_backup_dir: "{{ target_host_container_reconcile_remote_dir }}/kolla-config-backup"
+    target_host_container_reconcile_config_dirs:
+      cron: cron
+      kolla_toolbox: kolla-toolbox
+      nova_ssh: nova-ssh
+    target_host_container_reconcile_script_remote: "{{ target_host_container_reconcile_remote_dir }}/recreate_docker_container_with_image.py"
+    target_host_container_reconcile_script_local: "../scripts/recreate_docker_container_with_image.py"
+    target_host_container_reconcile_backup_suffix: "{{ lookup('pipe', 'date -u +%Y%m%d%H%M%S') }}"
+    target_host_container_reconcile_selected_containers: >-
+      {{
+        (target_host_container_reconcile_default_containers | default([]))
+        + (
+          (target_host_container_reconcile_include_libvirt | bool)
+          | ternary(target_host_container_reconcile_libvirt_containers | default([]), [])
+        )
+        + (
+          (target_host_container_reconcile_include_ovs | bool)
+          | ternary(target_host_container_reconcile_ovs_containers | default([]), [])
+        )
+      }}
+  tasks:
+    - name: Target host container reconcile | validate Kolla/Docker inputs
+      ansible.builtin.assert:
+        that:
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - target_host_container_reconcile_images is defined
+          - target_host_container_reconcile_images | length > 0
+          - target_host_container_reconcile_selected_containers | length > 0
+          - missing_target_images | length == 0
+          - libvirt_without_flag | length == 0
+          - ovs_without_flag | length == 0
+        fail_msg: >-
+          Define target_host_container_reconcile_images for selected containers.
+          Libvirt and OVS containers require their explicit include flags.
+      vars:
+        missing_target_images: >-
+          {{
+            target_host_container_reconcile_selected_containers
+            | difference(target_host_container_reconcile_images.keys() | list)
+          }}
+        ovs_without_flag: >-
+          {{
+            (
+              target_host_container_reconcile_include_ovs | bool
+            )
+            | ternary([], target_host_container_reconcile_selected_containers
+              | intersect(target_host_container_reconcile_ovs_containers | default([]))
+              | list)
+          }}
+        libvirt_without_flag: >-
+          {{
+            (
+              target_host_container_reconcile_include_libvirt | bool
+            )
+            | ternary([], target_host_container_reconcile_selected_containers
+              | intersect(target_host_container_reconcile_libvirt_containers | default([]))
+              | list)
+          }}
+
+    - name: Target host container reconcile | ensure remote directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ target_host_container_reconcile_remote_dir }}"
+        - "{{ target_host_container_reconcile_report_dir }}"
+        - "{{ target_host_container_reconcile_config_backup_dir }}"
+
+    - name: Target host container reconcile | install helper script
+      ansible.builtin.copy:
+        src: "{{ target_host_container_reconcile_script_local }}"
+        dest: "{{ target_host_container_reconcile_script_remote }}"
+        mode: "0750"
+
+    - name: Target host container reconcile | write report header
+      ansible.builtin.copy:
+        dest: "{{ target_host_container_reconcile_report }}"
+        mode: "0640"
+        content: |
+          target_host_container_reconcile_apply={{ target_host_container_reconcile_apply | bool }}
+          target_host_container_reconcile_include_libvirt={{ target_host_container_reconcile_include_libvirt | bool }}
+          target_host_container_reconcile_include_ovs={{ target_host_container_reconcile_include_ovs | bool }}
+          rehome_host={{ rehome_host }}
+          selected_containers={{ target_host_container_reconcile_selected_containers | join(',') }}
+
+    - name: Target host container reconcile | create VM runtime baseline
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: baseline
+        runtime_guard_label: "before target host container reconcile"
+
+    - name: Target host container reconcile | report or apply container image reconciliation
+      ansible.builtin.include_tasks: tasks/reconcile-target-host-container.yml
+      loop: "{{ target_host_container_reconcile_selected_containers }}"
+      loop_control:
+        loop_var: target_host_container_reconcile_container
+
+    - name: Target host container reconcile | show report path
+      ansible.builtin.debug:
+        msg: "Target host container reconcile report: {{ target_host_container_reconcile_report }}"

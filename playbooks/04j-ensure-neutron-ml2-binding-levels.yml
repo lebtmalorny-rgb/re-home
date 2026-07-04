@@ -1,0 +1,257 @@
+---
+- name: 04J | Ensure target Neutron ML2 binding levels for re-home ports
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_neutron_ml2_binding_levels_apply: false
+    target_neutron_ml2_binding_levels_id: ""
+    target_neutron_ml2_binding_levels_container: "mariadb"
+    target_neutron_ml2_binding_levels_user: root
+    target_neutron_ml2_binding_levels_socket: "{{ target_db_backup_socket | default('/run/mysqld/mysqld.sock') }}"
+    target_neutron_ml2_binding_levels_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_neutron_ml2_binding_levels_driver: openvswitch
+    target_neutron_ml2_binding_levels_level: 0
+    target_neutron_ml2_binding_levels_no_log: true
+    target_neutron_ml2_binding_levels_fetch: true
+  tasks:
+    - name: Target Neutron ML2 binding levels | validate required inputs
+      ansible.builtin.assert:
+        that:
+          - network_backend == 'ovs'
+          - manifest_file | length > 0
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_neutron_ml2_binding_levels_password_key | length > 0
+          - target_neutron_ml2_binding_levels_socket | length > 0
+          - target_neutron_ml2_binding_levels_driver == 'openvswitch'
+        fail_msg: "Set OVS re-home manifest and Kolla DB password inputs before ensuring ML2 binding levels."
+
+    - name: Target Neutron ML2 binding levels | load re-home manifest
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: target_neutron_ml2_binding_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Target Neutron ML2 binding levels | build port list
+      ansible.builtin.set_fact:
+        target_neutron_ml2_binding_ports: >-
+          {{
+            target_neutron_ml2_binding_manifest.rehome_instances
+            | default(target_neutron_ml2_binding_manifest.get('openstack', {}).get('rehome_instances', []), true)
+            | default(target_neutron_ml2_binding_manifest.source.instances | default([]), true)
+            | map(attribute='ports')
+            | list
+            | flatten
+          }}
+
+    - name: Target Neutron ML2 binding levels | validate manifest ports
+      ansible.builtin.assert:
+        that:
+          - target_neutron_ml2_binding_ports | length > 0
+          - item.id is defined
+          - item.network_id is defined
+          - item.network is defined
+          - item.network.provider_network_type is defined
+          - item.network.provider_physical_network is defined
+          - item.network.provider_segmentation_id is defined
+        fail_msg: "Manifest ports must include id, network_id and provider network metadata."
+      loop: "{{ target_neutron_ml2_binding_ports }}"
+
+    - name: Target Neutron ML2 binding levels | freeze run id
+      ansible.builtin.set_fact:
+        target_neutron_ml2_binding_levels_id_effective: >-
+          {{
+            target_neutron_ml2_binding_levels_id
+            if target_neutron_ml2_binding_levels_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target Neutron ML2 binding levels | set run paths
+      ansible.builtin.set_fact:
+        target_neutron_ml2_binding_levels_remote_dir_effective: "{{ rehome_stage_dir }}/target-neutron-ml2-binding-levels/{{ target_neutron_ml2_binding_levels_id_effective }}"
+        target_neutron_ml2_binding_levels_remote_sql_effective: "{{ rehome_stage_dir }}/target-neutron-ml2-binding-levels/{{ target_neutron_ml2_binding_levels_id_effective }}/ensure-binding-levels.sql"
+        target_neutron_ml2_binding_levels_remote_report_effective: "{{ rehome_stage_dir }}/target-neutron-ml2-binding-levels/{{ target_neutron_ml2_binding_levels_id_effective }}/report.tsv"
+        target_neutron_ml2_binding_levels_local_run_dir_effective: "{{ local_artifact_dir }}/target-neutron-ml2-binding-levels/{{ target_neutron_ml2_binding_levels_id_effective }}"
+
+    - name: Target Neutron ML2 binding levels | create remote run directory
+      ansible.builtin.file:
+        path: "{{ target_neutron_ml2_binding_levels_remote_dir_effective }}"
+        state: directory
+        mode: "0700"
+
+    - name: Target Neutron ML2 binding levels | load target DB password
+      ansible.builtin.set_fact:
+        target_neutron_ml2_binding_levels_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_neutron_ml2_binding_levels_password_key]
+          }}
+      no_log: true
+
+    - name: Target Neutron ML2 binding levels | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_neutron_ml2_binding_levels_container }}"
+          - test
+          - "-S"
+          - "{{ target_neutron_ml2_binding_levels_socket }}"
+      changed_when: false
+
+    - name: Target Neutron ML2 binding levels | initialize report
+      ansible.builtin.copy:
+        dest: "{{ target_neutron_ml2_binding_levels_remote_report_effective }}"
+        mode: "0600"
+        content: |
+          phase	port_id	row_count	value
+
+    - name: Target Neutron ML2 binding levels | ensure binding level rows
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          mysql_bin="$({{ container_runtime_cli }} exec {{ target_neutron_ml2_binding_levels_container }} sh -lc 'command -v mariadb || command -v mysql')"
+          sql_file={{ target_neutron_ml2_binding_levels_remote_sql_effective | quote }}
+          cat > "$sql_file" <<'SQL'
+          SET @port_id = '{{ item.id | string | replace("'", "''") }}';
+          SET @host = '{{ rehome_host | string | replace("'", "''") }}';
+          SET @level = {{ target_neutron_ml2_binding_levels_level | int }};
+          SET @driver = '{{ target_neutron_ml2_binding_levels_driver | string | replace("'", "''") }}';
+          SET @segment_count = (
+            SELECT COUNT(*)
+            FROM `neutron`.`networksegments`
+            WHERE `network_id` = '{{ item.network_id | string | replace("'", "''") }}'
+              AND `network_type` = '{{ item.network.provider_network_type | string | replace("'", "''") }}'
+          {% if item.network.provider_physical_network is none %}
+              AND `physical_network` IS NULL
+          {% else %}
+              AND `physical_network` = '{{ item.network.provider_physical_network | string | replace("'", "''") }}'
+          {% endif %}
+          {% if item.network.provider_segmentation_id is none %}
+              AND `segmentation_id` IS NULL
+          {% else %}
+              AND `segmentation_id` = {{ item.network.provider_segmentation_id | int }}
+          {% endif %}
+          );
+          SET @segment_id = (
+            SELECT `id`
+            FROM `neutron`.`networksegments`
+            WHERE `network_id` = '{{ item.network_id | string | replace("'", "''") }}'
+              AND `network_type` = '{{ item.network.provider_network_type | string | replace("'", "''") }}'
+          {% if item.network.provider_physical_network is none %}
+              AND `physical_network` IS NULL
+          {% else %}
+              AND `physical_network` = '{{ item.network.provider_physical_network | string | replace("'", "''") }}'
+          {% endif %}
+          {% if item.network.provider_segmentation_id is none %}
+              AND `segmentation_id` IS NULL
+          {% else %}
+              AND `segmentation_id` = {{ item.network.provider_segmentation_id | int }}
+          {% endif %}
+            LIMIT 1
+          );
+          SELECT 'segment_count', @port_id, @segment_count, COALESCE(@segment_id, '');
+          SELECT 'before', @port_id, COUNT(*), ''
+          FROM `neutron`.`ml2_port_binding_levels`
+          WHERE `port_id` = @port_id
+            AND `host` = @host
+            AND `level` = @level
+            AND `driver` = @driver;
+          {% if target_neutron_ml2_binding_levels_apply | bool %}
+          INSERT INTO `neutron`.`ml2_port_binding_levels`
+            (`port_id`, `host`, `level`, `driver`, `segment_id`)
+          SELECT @port_id, @host, @level, @driver, @segment_id
+          WHERE @segment_count = 1
+            AND EXISTS (
+              SELECT 1
+              FROM `neutron`.`ml2_port_bindings`
+              WHERE `port_id` = @port_id
+                AND `host` = @host
+                AND `vif_type` = 'ovs'
+                AND `status` = 'ACTIVE'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM `neutron`.`ml2_port_binding_levels`
+              WHERE `port_id` = @port_id
+                AND `host` = @host
+                AND `level` = @level
+            );
+          SELECT 'inserted', @port_id, ROW_COUNT(), COALESCE(@segment_id, '');
+          {% else %}
+          SELECT 'dry_run', @port_id, 0, COALESCE(@segment_id, '');
+          {% endif %}
+          SELECT 'after', @port_id, COUNT(*), COALESCE(@segment_id, '')
+          FROM `neutron`.`ml2_port_binding_levels`
+          WHERE `port_id` = @port_id
+            AND `host` = @host
+            AND `level` = @level
+            AND `driver` = @driver;
+          SQL
+          {{ container_runtime_cli }} exec \
+            -e MYSQL_PWD="$TARGET_NEUTRON_ML2_BINDING_LEVELS_PASSWORD" \
+            -i {{ target_neutron_ml2_binding_levels_container }} \
+            "$mysql_bin" \
+            -u"{{ target_neutron_ml2_binding_levels_user }}" \
+            --socket={{ target_neutron_ml2_binding_levels_socket | quote }} \
+            --batch \
+            --raw \
+            --skip-column-names \
+            < "$sql_file" \
+            | tee -a {{ target_neutron_ml2_binding_levels_remote_report_effective | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_NEUTRON_ML2_BINDING_LEVELS_PASSWORD: "{{ target_neutron_ml2_binding_levels_password }}"
+      loop: "{{ target_neutron_ml2_binding_ports }}"
+      register: target_neutron_ml2_binding_levels_sql_result
+      changed_when:
+        - target_neutron_ml2_binding_levels_apply | bool
+        - >-
+          (target_neutron_ml2_binding_levels_sql_result.stdout_lines | default([])
+          | select('match', '^inserted\t.*\t[1-9][0-9]*\t.*$') | list | length) > 0
+      no_log: "{{ target_neutron_ml2_binding_levels_no_log | bool }}"
+
+    - name: Target Neutron ML2 binding levels | write run manifest
+      ansible.builtin.copy:
+        dest: "{{ target_neutron_ml2_binding_levels_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-neutron-ml2-binding-levels/v1alpha1",
+            "normalization_id": "{{ target_neutron_ml2_binding_levels_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "apply": {{ target_neutron_ml2_binding_levels_apply | bool | to_json }},
+            "port_count": {{ target_neutron_ml2_binding_ports | length }},
+            "remote_report": "{{ target_neutron_ml2_binding_levels_remote_report_effective }}",
+            "socket": "{{ target_neutron_ml2_binding_levels_socket }}"
+          }
+
+    - name: Target Neutron ML2 binding levels | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ target_neutron_ml2_binding_levels_local_run_dir_effective }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+      when: target_neutron_ml2_binding_levels_fetch | bool
+
+    - name: Target Neutron ML2 binding levels | fetch run artifacts
+      ansible.builtin.fetch:
+        src: "{{ target_neutron_ml2_binding_levels_remote_dir_effective }}/{{ item }}"
+        dest: "{{ target_neutron_ml2_binding_levels_local_run_dir_effective }}/{{ item }}"
+        flat: true
+      loop:
+        - report.tsv
+        - manifest.json
+      when: target_neutron_ml2_binding_levels_fetch | bool
+
+    - name: Target Neutron ML2 binding levels | show run artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Normalization id: {{ target_neutron_ml2_binding_levels_id_effective }}"
+          - "Apply: {{ target_neutron_ml2_binding_levels_apply | bool }}"
+          - "Remote report: {{ target_neutron_ml2_binding_levels_remote_report_effective }}"
+          - "Local run dir: {{ target_neutron_ml2_binding_levels_local_run_dir_effective }}"

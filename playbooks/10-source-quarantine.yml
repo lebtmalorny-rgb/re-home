@@ -1,0 +1,292 @@
+---
+- name: 10A | Verify target has accepted the re-home before source quarantine
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    source_quarantine_apply: false
+    source_quarantine_require_target_enable_artifact: true
+    source_quarantine_target_enable_artifact_dir: "/var/backups/openstack-rehome/{{ rehome_id | default(rehome_host | default(inventory_hostname)) }}"
+  tasks:
+    - name: Source quarantine preflight | require explicit apply
+      ansible.builtin.assert:
+        that:
+          - source_quarantine_apply | bool
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+        fail_msg: "Set source_quarantine_apply=true only after target validation and target compute enable."
+
+    - name: Source quarantine preflight | check target enable artifact
+      ansible.builtin.stat:
+        path: "{{ source_quarantine_target_enable_artifact_dir }}/target-enable-compute-service.yml"
+      register: source_quarantine_target_enable_artifact
+
+    - name: Source quarantine preflight | require target enable artifact
+      ansible.builtin.assert:
+        that:
+          - source_quarantine_target_enable_artifact.stat.exists
+        fail_msg: >-
+          Missing {{ source_quarantine_target_enable_artifact_dir }}/target-enable-compute-service.yml.
+          Run 09-enable-target-service.yml successfully before source quarantine.
+      when: source_quarantine_require_target_enable_artifact | bool
+
+- name: 10B | Quarantine source API records without deleting metadata
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    source_quarantine_apply: false
+    source_quarantine_force_down_compute_service: true
+    source_quarantine_openstack_cli_container: "{{ openstack_cli_container | default('kolla_toolbox') }}"
+    source_quarantine_clouds_remote: "{{ rehome_stage_dir }}/source-quarantine-clouds.yaml"
+    source_quarantine_clouds_in_container: /tmp/rehome-source-quarantine-clouds.yaml
+    source_quarantine_artifact_dir: "/var/backups/openstack-rehome/{{ rehome_id | default(rehome_host | default(inventory_hostname)) }}/source-quarantine"
+    source_quarantine_disable_reason: "rehome quarantine: host accepted by target control plane"
+    source_quarantine_lock_reason: "rehome quarantine: VM accepted by target control plane"
+  tasks:
+    - name: Source quarantine | require source Kolla inputs
+      ansible.builtin.assert:
+        that:
+          - source_quarantine_apply | bool
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - source_clouds_file_local | default('') | length > 0
+          - source_cloud_name | default('') | length > 0
+          - source_quarantine_openstack_cli_container | length > 0
+        fail_msg: "Set source_quarantine_apply=true and source cloud inputs before source quarantine."
+
+    - name: Source quarantine | load re-home manifest from Ansible runner
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: source_quarantine_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Source quarantine | build source instance list
+      ansible.builtin.set_fact:
+        source_quarantine_instances: >-
+          {{
+            source_quarantine_manifest.rehome_instances
+            | default(source_quarantine_manifest.get('openstack', {}).get('rehome_instances', []), true)
+            | default(source_quarantine_manifest.source.instances | default([]), true)
+          }}
+
+    - name: Source quarantine | validate manifest scope
+      ansible.builtin.assert:
+        that:
+          - source_quarantine_instances | length > 0
+          - source_quarantine_instances | map(attribute='uuid') | list | length > 0
+        fail_msg: "Manifest must contain at least one re-home instance with UUID."
+
+    - name: Source quarantine | ensure remote stage and artifact directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ rehome_stage_dir }}"
+        - "{{ source_quarantine_artifact_dir }}"
+
+    - name: Source quarantine | place source clouds.yaml on source control
+      ansible.builtin.copy:
+        src: "{{ source_clouds_file_local }}"
+        dest: "{{ source_quarantine_clouds_remote }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Source quarantine | apply source API quarantine through Kolla toolbox
+      block:
+        - name: Source quarantine | place source clouds.yaml inside OpenStack CLI container
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker cp {{ source_quarantine_clouds_remote | quote }} {{ source_quarantine_openstack_cli_container | quote }}:{{ source_quarantine_clouds_in_container | quote }}
+            docker exec -u 0 {{ source_quarantine_openstack_cli_container | quote }} chmod 0644 {{ source_quarantine_clouds_in_container | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+          no_log: true
+
+        - name: Source quarantine | show source compute service before quarantine
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+              {{ source_quarantine_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ source_cloud_name | quote }} \
+              compute service list --host {{ rehome_host | quote }} --service nova-compute -f yaml
+          args:
+            executable: /bin/bash
+          register: source_quarantine_compute_service_before
+          changed_when: false
+
+        - name: Source quarantine | show source server records before quarantine
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+              {{ source_quarantine_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ source_cloud_name | quote }} \
+              server show {{ item.uuid | quote }} -f yaml
+          args:
+            executable: /bin/bash
+          loop: "{{ source_quarantine_instances }}"
+          register: source_quarantine_servers_before
+          changed_when: false
+
+        - name: Source quarantine | disable and optionally force-down source compute service
+          ansible.builtin.shell: |
+            set -euo pipefail
+            status="$(
+              docker exec \
+                -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                {{ source_quarantine_openstack_cli_container | quote }} \
+                openstack --os-cloud {{ source_cloud_name | quote }} \
+                compute service list --host {{ rehome_host | quote }} --service nova-compute -f value -c Status \
+                | awk 'NF { print $1; exit }'
+            )"
+            state="$(
+              docker exec \
+                -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                {{ source_quarantine_openstack_cli_container | quote }} \
+                openstack --os-cloud {{ source_cloud_name | quote }} \
+                compute service list --host {{ rehome_host | quote }} --service nova-compute -f value -c State \
+                | awk 'NF { print $1; exit }'
+            )"
+            if [ "$status" != "disabled" ]; then
+              docker exec \
+                -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                {{ source_quarantine_openstack_cli_container | quote }} \
+                openstack --os-cloud {{ source_cloud_name | quote }} \
+                compute service set --disable --disable-reason {{ source_quarantine_disable_reason | quote }} \
+                {{ rehome_host | quote }} nova-compute
+              echo "changed:disable"
+            else
+              echo "already_disabled"
+            fi
+            if {{ source_quarantine_force_down_compute_service | bool | lower }} && [ "$state" != "down" ]; then
+              docker exec \
+                -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                {{ source_quarantine_openstack_cli_container | quote }} \
+                openstack --os-cloud {{ source_cloud_name | quote }} --os-compute-api-version 2.11 \
+                compute service set --down {{ rehome_host | quote }} nova-compute
+              echo "changed:down"
+            else
+              echo "already_down_or_not_requested"
+            fi
+          args:
+            executable: /bin/bash
+          register: source_quarantine_compute_service_change
+          changed_when: "'changed:' in source_quarantine_compute_service_change.stdout"
+
+        - name: Source quarantine | lock source-side server records
+          ansible.builtin.shell: |
+            set -euo pipefail
+            locked="$(
+              docker exec \
+                -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                {{ source_quarantine_openstack_cli_container | quote }} \
+                openstack --os-cloud {{ source_cloud_name | quote }} \
+                server show {{ item.uuid | quote }} -f value -c locked 2>/dev/null || true
+            )"
+            case "$locked" in
+              True|true)
+                echo "already_locked"
+                ;;
+              *)
+                docker exec \
+                  -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+                  {{ source_quarantine_openstack_cli_container | quote }} \
+                  openstack --os-cloud {{ source_cloud_name | quote }} --os-compute-api-version 2.73 \
+                  server lock --reason {{ source_quarantine_lock_reason | quote }} {{ item.uuid | quote }}
+                echo "changed:lock"
+                ;;
+            esac
+          args:
+            executable: /bin/bash
+          loop: "{{ source_quarantine_instances }}"
+          register: source_quarantine_server_lock
+          changed_when: "'changed:lock' in source_quarantine_server_lock.stdout"
+
+        - name: Source quarantine | show source compute service after quarantine
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+              {{ source_quarantine_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ source_cloud_name | quote }} \
+              compute service list --host {{ rehome_host | quote }} --service nova-compute -f yaml
+          args:
+            executable: /bin/bash
+          register: source_quarantine_compute_service_after
+          changed_when: false
+
+        - name: Source quarantine | show source server records after quarantine
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ source_quarantine_clouds_in_container | quote }} \
+              {{ source_quarantine_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ source_cloud_name | quote }} \
+              server show {{ item.uuid | quote }} -f yaml
+          args:
+            executable: /bin/bash
+          loop: "{{ source_quarantine_instances }}"
+          register: source_quarantine_servers_after
+          changed_when: false
+
+        - name: Source quarantine | save source quarantine report
+          ansible.builtin.copy:
+            content: |
+              compute_service_before:
+              {{ source_quarantine_compute_service_before.stdout | indent(2) }}
+              compute_service_change:
+              {{ source_quarantine_compute_service_change.stdout | indent(2) }}
+              compute_service_after:
+              {{ source_quarantine_compute_service_after.stdout | indent(2) }}
+              servers_before:
+              {{ source_quarantine_servers_before.results | to_nice_yaml(indent=2) | indent(2) }}
+              server_lock:
+              {{ source_quarantine_server_lock.results | to_nice_yaml(indent=2) | indent(2) }}
+              servers_after:
+              {{ source_quarantine_servers_after.results | to_nice_yaml(indent=2) | indent(2) }}
+            dest: "{{ source_quarantine_artifact_dir }}/source-quarantine.yml"
+            mode: "0600"
+      always:
+        - name: Source quarantine | remove source clouds.yaml from OpenStack CLI container
+          ansible.builtin.shell: |
+            set +e
+            docker exec -u 0 {{ source_quarantine_openstack_cli_container | quote }} rm -f {{ source_quarantine_clouds_in_container | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: false
+          no_log: true
+
+        - name: Source quarantine | remove source clouds.yaml from source control
+          ansible.builtin.file:
+            path: "{{ source_quarantine_clouds_remote }}"
+            state: absent
+          no_log: true
+
+    - name: Source quarantine | print source compute service after quarantine
+      ansible.builtin.debug:
+        var: source_quarantine_compute_service_after.stdout_lines
+
+- name: 10C | Validate VM runtime after source API quarantine
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Source quarantine runtime | run runtime guard check
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "10 source quarantine"
+
+    - name: Source quarantine runtime | compare current domains to cutover baseline
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF' | sort > {{ rehome_stage_dir }}/domains-after-source-quarantine.txt
+        diff -u {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt {{ rehome_stage_dir }}/domains-after-source-quarantine.txt
+      args:
+        executable: /bin/bash
+      changed_when: false

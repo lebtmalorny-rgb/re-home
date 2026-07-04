@@ -1,0 +1,1 @@
+-- reviewed host-scoped SQL placeholder: 40-nova-api-instance-mappings-request-specs.sql

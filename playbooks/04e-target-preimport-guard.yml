@@ -1,0 +1,141 @@
+---
+- name: 04E | Collect target DB rows for pre-import conflict guard
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_preimport_guard_plan_json_local: "{{ local_artifact_dir }}/target-db-import-plan.json"
+    target_preimport_guard_remote_dir: "{{ rehome_stage_dir }}/target-preimport-guard"
+    target_preimport_guard_archive_remote: "{{ rehome_stage_dir }}/target-preimport-guard.tar.gz"
+    target_preimport_guard_archive_local: "{{ local_artifact_dir }}/target-preimport-guard.tar.gz"
+    target_preimport_guard_local_dir: "{{ local_artifact_dir }}/target-preimport-guard"
+    target_preimport_guard_nova_cell_db_name: "{{ source_db_rows_nova_cell_db_name }}"
+  tasks:
+    - name: Target pre-import guard | validate inputs
+      ansible.builtin.assert:
+        that:
+          - target_preimport_guard_plan_json_local is file
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - source_db_row_service_queries | length > 0
+        fail_msg: >-
+          Run 04b first and set source_db_row_service_queries plus target
+          schema_compat_kolla_passwords_file_local before target pre-import guard.
+
+    - name: Target pre-import guard | reset remote directory
+      ansible.builtin.file:
+        path: "{{ target_preimport_guard_remote_dir }}"
+        state: absent
+
+    - name: Target pre-import guard | create remote query and row directories
+      ansible.builtin.file:
+        path: "{{ target_preimport_guard_remote_dir }}/{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - queries
+        - rows
+
+    - name: Target pre-import guard | copy DB import plan to target control
+      ansible.builtin.copy:
+        src: "{{ target_preimport_guard_plan_json_local }}"
+        dest: "{{ target_preimport_guard_remote_dir }}/target-db-import-plan.json"
+        mode: "0600"
+
+    - name: Target pre-import guard | copy query builder to target control
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/collect_source_db_rows.py"
+        dest: "{{ target_preimport_guard_remote_dir }}/collect_source_db_rows.py"
+        mode: "0750"
+
+    - name: Target pre-import guard | generate read-only target conflict queries
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ target_preimport_guard_remote_dir }}/collect_source_db_rows.py"
+          - --db-import-plan-json
+          - "{{ target_preimport_guard_remote_dir }}/target-db-import-plan.json"
+          - --out-dir
+          - "{{ target_preimport_guard_remote_dir }}"
+          - --nova-cell-db-name
+          - "{{ target_preimport_guard_nova_cell_db_name }}"
+      changed_when: true
+
+    - name: Target pre-import guard | execute service queries on target
+      ansible.builtin.include_tasks: tasks/collect-target-db-row-service.yml
+      loop: "{{ source_db_row_service_queries }}"
+      loop_control:
+        loop_var: target_db_row_service
+
+    - name: Target pre-import guard | archive target row artifacts
+      ansible.builtin.archive:
+        path: "{{ target_preimport_guard_remote_dir }}"
+        dest: "{{ target_preimport_guard_archive_remote }}"
+        format: gz
+
+    - name: Target pre-import guard | fetch target row archive
+      ansible.builtin.fetch:
+        src: "{{ target_preimport_guard_archive_remote }}"
+        dest: "{{ target_preimport_guard_archive_local }}"
+        flat: true
+
+- name: 04E | Analyze target DB pre-import guard locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    target_preimport_guard_archive_local: "{{ local_artifact_dir }}/target-preimport-guard.tar.gz"
+    target_preimport_guard_local_dir: "{{ local_artifact_dir }}/target-preimport-guard"
+    target_preimport_guard_report_json: "{{ local_artifact_dir }}/target-preimport-guard-report.json"
+    target_preimport_guard_report_yaml: "{{ local_artifact_dir }}/target-preimport-guard-report.yml"
+    target_preimport_guard_report_md: "{{ local_artifact_dir }}/target-preimport-guard-report.md"
+    target_preimport_guard_fail_on_conflict: true
+  tasks:
+    - name: Target pre-import guard local | reset unpack directory
+      ansible.builtin.file:
+        path: "{{ target_preimport_guard_local_dir }}"
+        state: absent
+
+    - name: Target pre-import guard local | recreate unpack directory
+      ansible.builtin.file:
+        path: "{{ target_preimport_guard_local_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target pre-import guard local | unpack target row archive
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ target_preimport_guard_archive_local }}"
+          - -C
+          - "{{ target_preimport_guard_local_dir }}"
+          - --strip-components
+          - "1"
+      changed_when: true
+
+    - name: Target pre-import guard local | build conflict report
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              'python3',
+              playbook_dir + '/../scripts/check_target_preimport_guard.py',
+              '--target-db-rows-dir',
+              target_preimport_guard_local_dir,
+              '--out-json',
+              target_preimport_guard_report_json,
+              '--out-yaml',
+              target_preimport_guard_report_yaml,
+              '--out-md',
+              target_preimport_guard_report_md
+            ]
+            + (target_preimport_guard_fail_on_conflict | bool | ternary(['--fail-on-conflict'], []))
+          }}
+      changed_when: false
+
+    - name: Target pre-import guard local | show report paths
+      ansible.builtin.debug:
+        msg:
+          - "Report JSON: {{ target_preimport_guard_report_json }}"
+          - "Report YAML: {{ target_preimport_guard_report_yaml }}"
+          - "Report Markdown: {{ target_preimport_guard_report_md }}"

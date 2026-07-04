@@ -1,0 +1,217 @@
+---
+- name: 04K | Ensure target Nova compute service row for re-home host
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_nova_compute_service_apply: false
+    target_nova_compute_service_id: ""
+    target_nova_compute_service_container: "mariadb"
+    target_nova_compute_service_user: root
+    target_nova_compute_service_socket: "{{ target_db_backup_socket | default('/run/mysqld/mysqld.sock') }}"
+    target_nova_compute_service_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_nova_compute_service_disabled: true
+    target_nova_compute_service_disabled_reason: "rehome safe-mode precreated service"
+    target_nova_compute_service_no_log: true
+    target_nova_compute_service_fetch: true
+  tasks:
+    - name: Target Nova compute service | validate required inputs
+      ansible.builtin.assert:
+        that:
+          - manifest_file | length > 0
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_nova_compute_service_password_key | length > 0
+          - target_nova_compute_service_socket | length > 0
+        fail_msg: "Set re-home manifest and Kolla DB password inputs before ensuring Nova compute service row."
+
+    - name: Target Nova compute service | load re-home manifest
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: target_nova_compute_service_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Target Nova compute service | select source compute service
+      ansible.builtin.set_fact:
+        target_nova_compute_service_source_service: >-
+          {{
+            (
+              target_nova_compute_service_manifest.source.compute_service
+              | default([])
+              | selectattr('Host', 'equalto', rehome_host)
+              | selectattr('Binary', 'equalto', 'nova-compute')
+              | list
+              | first
+            )
+            | default({}, true)
+          }}
+
+    - name: Target Nova compute service | validate source compute service
+      ansible.builtin.assert:
+        that:
+          - target_nova_compute_service_source_service | length > 0
+          - target_nova_compute_service_source_service.ID is defined
+          - target_nova_compute_service_source_service.Host == rehome_host
+          - target_nova_compute_service_source_service.Binary == 'nova-compute'
+        fail_msg: "Manifest must contain source nova-compute service for rehome_host."
+
+    - name: Target Nova compute service | freeze run id
+      ansible.builtin.set_fact:
+        target_nova_compute_service_id_effective: >-
+          {{
+            target_nova_compute_service_id
+            if target_nova_compute_service_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target Nova compute service | set run paths
+      ansible.builtin.set_fact:
+        target_nova_compute_service_remote_dir_effective: "{{ rehome_stage_dir }}/target-nova-compute-service/{{ target_nova_compute_service_id_effective }}"
+        target_nova_compute_service_remote_sql_effective: "{{ rehome_stage_dir }}/target-nova-compute-service/{{ target_nova_compute_service_id_effective }}/ensure-compute-service.sql"
+        target_nova_compute_service_remote_report_effective: "{{ rehome_stage_dir }}/target-nova-compute-service/{{ target_nova_compute_service_id_effective }}/report.tsv"
+        target_nova_compute_service_local_run_dir_effective: "{{ local_artifact_dir }}/target-nova-compute-service/{{ target_nova_compute_service_id_effective }}"
+
+    - name: Target Nova compute service | create remote run directory
+      ansible.builtin.file:
+        path: "{{ target_nova_compute_service_remote_dir_effective }}"
+        state: directory
+        mode: "0700"
+
+    - name: Target Nova compute service | load target DB password
+      ansible.builtin.set_fact:
+        target_nova_compute_service_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_nova_compute_service_password_key]
+          }}
+      no_log: true
+
+    - name: Target Nova compute service | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_nova_compute_service_container }}"
+          - test
+          - "-S"
+          - "{{ target_nova_compute_service_socket }}"
+      changed_when: false
+
+    - name: Target Nova compute service | initialize report
+      ansible.builtin.copy:
+        dest: "{{ target_nova_compute_service_remote_report_effective }}"
+        mode: "0600"
+        content: |
+          phase	host	row_count	value
+
+    - name: Target Nova compute service | ensure service row
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          mysql_bin="$({{ container_runtime_cli }} exec {{ target_nova_compute_service_container }} sh -lc 'command -v mariadb || command -v mysql')"
+          sql_file={{ target_nova_compute_service_remote_sql_effective | quote }}
+          cat > "$sql_file" <<'SQL'
+          SET @host = '{{ rehome_host | string | replace("'", "''") }}';
+          SET @service_uuid = '{{ target_nova_compute_service_source_service.ID | string | replace("'", "''") }}';
+          SET @disabled = {{ 1 if target_nova_compute_service_disabled | bool else 0 }};
+          SET @disabled_reason = '{{ target_nova_compute_service_disabled_reason | string | replace("'", "''") }}';
+          SET @version = COALESCE((
+            SELECT MAX(`version`)
+            FROM `nova`.`services`
+            WHERE `binary` = 'nova-compute'
+              AND `deleted` = 0
+          ), 0);
+          SELECT 'before', @host, COUNT(*), COALESCE(MAX(`uuid`), '')
+          FROM `nova`.`services`
+          WHERE `host` = @host
+            AND `binary` = 'nova-compute'
+            AND `deleted` = 0;
+          {% if target_nova_compute_service_apply | bool %}
+          INSERT INTO `nova`.`services`
+            (`created_at`, `updated_at`, `host`, `binary`, `topic`, `report_count`,
+             `disabled`, `deleted`, `disabled_reason`, `last_seen_up`,
+             `forced_down`, `version`, `uuid`)
+          SELECT UTC_TIMESTAMP(), UTC_TIMESTAMP(), @host, 'nova-compute', 'compute', 0,
+                 @disabled, 0, @disabled_reason, NULL, 0, @version, @service_uuid
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM `nova`.`services`
+            WHERE `host` = @host
+              AND `binary` = 'nova-compute'
+              AND `deleted` = 0
+          );
+          SELECT 'inserted', @host, ROW_COUNT(), @service_uuid;
+          {% else %}
+          SELECT 'dry_run', @host, 0, @service_uuid;
+          {% endif %}
+          SELECT 'after', @host, COUNT(*), COALESCE(MAX(`uuid`), '')
+          FROM `nova`.`services`
+          WHERE `host` = @host
+            AND `binary` = 'nova-compute'
+            AND `deleted` = 0;
+          SQL
+          {{ container_runtime_cli }} exec \
+            -e MYSQL_PWD="$TARGET_NOVA_COMPUTE_SERVICE_PASSWORD" \
+            -i {{ target_nova_compute_service_container }} \
+            "$mysql_bin" \
+            -u"{{ target_nova_compute_service_user }}" \
+            --socket={{ target_nova_compute_service_socket | quote }} \
+            --batch \
+            --raw \
+            --skip-column-names \
+            < "$sql_file" \
+            | tee -a {{ target_nova_compute_service_remote_report_effective | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_NOVA_COMPUTE_SERVICE_PASSWORD: "{{ target_nova_compute_service_password }}"
+      register: target_nova_compute_service_sql_result
+      changed_when:
+        - target_nova_compute_service_apply | bool
+        - >-
+          (target_nova_compute_service_sql_result.stdout_lines | default([])
+          | select('match', '^inserted\t.*\t[1-9][0-9]*\t.*$') | list | length) > 0
+      no_log: "{{ target_nova_compute_service_no_log | bool }}"
+
+    - name: Target Nova compute service | write run manifest
+      ansible.builtin.copy:
+        dest: "{{ target_nova_compute_service_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-nova-compute-service/v1alpha1",
+            "normalization_id": "{{ target_nova_compute_service_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "apply": {{ target_nova_compute_service_apply | bool | to_json }},
+            "rehome_host": "{{ rehome_host }}",
+            "remote_report": "{{ target_nova_compute_service_remote_report_effective }}",
+            "socket": "{{ target_nova_compute_service_socket }}"
+          }
+
+    - name: Target Nova compute service | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ target_nova_compute_service_local_run_dir_effective }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+      when: target_nova_compute_service_fetch | bool
+
+    - name: Target Nova compute service | fetch run artifacts
+      ansible.builtin.fetch:
+        src: "{{ target_nova_compute_service_remote_dir_effective }}/{{ item }}"
+        dest: "{{ target_nova_compute_service_local_run_dir_effective }}/{{ item }}"
+        flat: true
+      loop:
+        - report.tsv
+        - manifest.json
+      when: target_nova_compute_service_fetch | bool
+
+    - name: Target Nova compute service | show run artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Normalization id: {{ target_nova_compute_service_id_effective }}"
+          - "Apply: {{ target_nova_compute_service_apply | bool }}"
+          - "Remote report: {{ target_nova_compute_service_remote_report_effective }}"
+          - "Local run dir: {{ target_nova_compute_service_local_run_dir_effective }}"

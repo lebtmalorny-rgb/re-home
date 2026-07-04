@@ -1,0 +1,1 @@
+-- reviewed host-scoped SQL placeholder: 60-nova-cell-compute-nodes-services-if-needed.sql

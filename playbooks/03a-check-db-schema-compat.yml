@@ -1,0 +1,86 @@
+---
+- name: 03A | Collect source DB schema compatibility report
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect source schema compatibility artifacts
+      ansible.builtin.include_tasks: tasks/collect-schema-compat-report.yml
+      vars:
+        schema_compat_side: source
+
+- name: 03A | Collect target DB schema compatibility report
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect target schema compatibility artifacts
+      ansible.builtin.include_tasks: tasks/collect-schema-compat-report.yml
+      vars:
+        schema_compat_side: target
+
+- name: 03A | Compare source and target schema reports
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Schema compat | ensure diff directory exists
+      ansible.builtin.file:
+        path: "{{ schema_compat_local_artifact_dir }}/diffs"
+        state: directory
+        mode: "0750"
+
+    - name: Schema compat | compare normalized DB migration versions
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u \
+          {{ schema_compat_local_artifact_dir }}/source/versions-normalized.txt \
+          {{ schema_compat_local_artifact_dir }}/target/versions-normalized.txt \
+          > {{ schema_compat_local_artifact_dir }}/diffs/versions.diff
+      args:
+        executable: /bin/bash
+      register: schema_compat_versions_diff
+      changed_when: false
+      failed_when: schema_compat_versions_diff.rc not in [0, 1]
+
+    - name: Schema compat | compare information_schema snapshots
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u \
+          {{ schema_compat_local_artifact_dir }}/source/information-schema.tsv \
+          {{ schema_compat_local_artifact_dir }}/target/information-schema.tsv \
+          > {{ schema_compat_local_artifact_dir }}/diffs/information-schema.diff
+      args:
+        executable: /bin/bash
+      register: schema_compat_info_schema_diff
+      changed_when: false
+      failed_when: schema_compat_info_schema_diff.rc not in [0, 1]
+
+    - name: Schema compat | write comparison summary
+      ansible.builtin.copy:
+        dest: "{{ schema_compat_local_artifact_dir }}/comparison-summary.txt"
+        mode: "0640"
+        content: |
+          versions_diff_rc={{ schema_compat_versions_diff.rc }}
+          information_schema_diff_rc={{ schema_compat_info_schema_diff.rc }}
+
+          source_versions={{ schema_compat_local_artifact_dir }}/source/versions-normalized.txt
+          target_versions={{ schema_compat_local_artifact_dir }}/target/versions-normalized.txt
+          versions_diff={{ schema_compat_local_artifact_dir }}/diffs/versions.diff
+
+          source_information_schema={{ schema_compat_local_artifact_dir }}/source/information-schema.tsv
+          target_information_schema={{ schema_compat_local_artifact_dir }}/target/information-schema.tsv
+          information_schema_diff={{ schema_compat_local_artifact_dir }}/diffs/information-schema.diff
+
+    - name: Schema compat | assert source and target schemas match
+      ansible.builtin.assert:
+        that:
+          - schema_compat_versions_diff.rc == 0
+          - schema_compat_info_schema_diff.rc == 0
+        fail_msg: >-
+          Source and target DB schemas are not identical. Review
+          {{ schema_compat_local_artifact_dir }}/comparison-summary.txt and the
+          diff files before any metadata import or cutover.
+        success_msg: >-
+          Source and target DB migration versions and information_schema
+          snapshots match. Schema compatibility precheck passed.

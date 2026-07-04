@@ -1,0 +1,322 @@
+# Lab inventory for the os1 -> os2 re-home experiment.
+#
+# This file is intentionally concrete: it documents the exact hosts, VIPs,
+# image tags and local input paths used in the lab. Treat it as a working
+# example, not as a portable inventory. For another infrastructure, copy it and
+# replace:
+# - hostnames and ansible_host IPs;
+# - source_vip and target_vip;
+# - rehome_host and hypervisor_hostname;
+# - local paths to clouds.yaml, passwords.yml and artifacts;
+# - target image tags/base distro;
+# - runtime_guard_probe_targets;
+# - source-only services that do not exist in the target cluster;
+# - storage-specific metadata replacements.
+#
+# Do not add plaintext passwords to this file. Kolla passwords are referenced by
+# local paths and read on the Ansible runner.
+all:
+  vars: &lab_rehome_vars
+    ansible_user: root
+
+    # Canonical host identity. Nova must see the same host/hypervisor name after
+    # re-home, otherwise imported metadata and Placement allocations will not
+    # match the runtime host.
+    rehome_host: os1-compute-02.example.local
+    hypervisor_hostname: os1-compute-02.example.local
+    instances_path: /var/lib/nova/instances
+
+    # Lab-local staging and artifact paths. Replace these when running from a
+    # different Ansible runner.
+    rehome_stage_dir: /var/tmp/openstack-rehome
+    source_config_backup_dir: /var/tmp/openstack-rehome/source-config-backup
+    target_config_stage_dir: /var/tmp/openstack-rehome/target-config-stage
+    local_artifact_dir: /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible/artifacts/os1-compute-02
+    manifest_file: /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible/artifacts/os1-compute-02/rehome_manifest.yml
+    manifest_remote_dir: /var/tmp/openstack-rehome/manifest
+    target_prep_remote_dir: /var/tmp/openstack-rehome/target-api-prep
+    target_prep_apply: false
+    target_prep_fail_on_db_required: false
+    db_import_sql_review_dir: /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible/artifacts/os1-compute-02/target-db-import-sql-review
+
+    deployment_driver: kolla
+    container_runtime_cli: docker
+    network_backend: ovs
+    openstack_cli_container: kolla_toolbox
+    source_cloud_name: kolla-admin
+    target_cloud_name: kolla-admin
+
+    # Schema compatibility commands are Kolla/container aware. They run on
+    # source_control and target_control hosts and use passwords from the
+    # referenced Kolla passwords.yml files.
+    schema_compat_nova_manage_command: docker exec nova_api nova-manage
+    schema_compat_neutron_db_manage_command: docker exec neutron_server neutron-db-manage
+    schema_compat_cinder_manage_command: docker exec cinder_api cinder-manage
+    schema_compat_mysql_query_command: docker exec -e MYSQL_PWD="$SCHEMA_COMPAT_DB_PASSWORD" -i mariadb mysql -u"$SCHEMA_COMPAT_DB_USER" -h "$SCHEMA_COMPAT_DB_HOST" --batch --raw --skip-column-names
+    schema_compat_mysql_query_user: root
+    schema_compat_mysql_query_no_log: true
+    schema_compat_kolla_database_password_key: database_password
+    schema_compat_cinder_enabled: true
+    schema_compat_report_dir: /var/tmp/openstack-rehome/schema-compat
+    schema_compat_local_artifact_dir: /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible/artifacts/schema-compat/os1-to-os2
+    source_db_names:
+      - keystone
+      - nova_api
+      - nova_cell0
+      - nova
+      - neutron
+      - cinder
+      - placement
+    target_db_names:
+      - keystone
+      - nova_api
+      - nova_cell0
+      - nova
+      - neutron
+      - cinder
+      - placement
+    schema_compat_db_names:
+      - keystone
+      - nova_api
+      - nova_cell0
+      - nova
+      - neutron
+      - cinder
+      - placement
+    schema_compat_mysql_service_queries:
+      - label: keystone
+        user: keystone
+        password_key: keystone_database_password
+        db_names:
+          - keystone
+      - label: nova_api
+        user: nova_api
+        password_key: nova_api_database_password
+        db_names:
+          - nova_api
+      - label: nova_cell
+        user: nova
+        password_key: nova_database_password
+        db_names:
+          - nova_cell0
+          - nova
+      - label: neutron
+        user: neutron
+        password_key: neutron_database_password
+        db_names:
+          - neutron
+      - label: cinder
+        user: cinder
+        password_key: cinder_database_password
+        db_names:
+          - cinder
+      - label: placement
+        user: placement
+        password_key: placement_database_password
+        db_names:
+          - placement
+    source_db_rows_nova_cell_db_name: nova
+    target_preimport_guard_fail_on_conflict: true
+
+    # Lab-specific DB value normalizations discovered during os1 -> os2 import.
+    # Rebuild this list from collected source/target metadata in every new
+    # environment.
+    target_db_import_literal_replacements:
+      - old: os1-ctrl-01.example.local@nfs-1#nfs-1
+        new: os2-ctrl-01.example.local@nfs-1#nfs-1
+      - old: 704983e7-3077-489b-ac8b-d6eb8e943666
+        new: 8fbf0d43-8aec-4f38-b660-02d8b1169697
+    target_db_import_column_replacements:
+      - table: nova_api.host_mappings
+        column: cell_id
+        value: "6"
+      - table: nova_api.instance_mappings
+        column: cell_id
+        value: "6"
+      - table: cinder.volumes
+        column: volume_type_id
+        value: 81bf219f-8f67-493b-927f-215176983345
+    target_metadata_normalizations:
+      - name: lab-cinder-default-volume-type
+        schema: cinder
+        table: volumes
+        column: volume_type_id
+        old: 59cbeca1-1937-4a44-be09-f612dc4d0373
+        new: 81bf219f-8f67-493b-927f-215176983345
+        where_column: id
+        where_values:
+          - 15c47caf-e3e0-4b14-86f0-a1bbc97d4256
+    target_project_visibility_project_id: b901604b49304f2bb64c42bd3bcf5512
+    target_project_visibility_user_id: 9d209d661e2d456295236254b8caef17
+    source_db_row_service_queries:
+      - label: keystone
+        user: keystone
+        password_key: keystone_database_password
+        sql_file: keystone.sql
+      - label: neutron
+        user: neutron
+        password_key: neutron_database_password
+        sql_file: neutron.sql
+      - label: cinder
+        user: cinder
+        password_key: cinder_database_password
+        sql_file: cinder.sql
+      - label: nova_api
+        user: nova_api
+        password_key: nova_api_database_password
+        sql_file: nova_api.sql
+      - label: nova_cell
+        user: nova
+        password_key: nova_database_password
+        sql_file: nova_cell.sql
+
+    source_cluster_name: os1
+    source_cluster_description: Rocky/Kolla control plane with Masakari enabled
+    source_vip: 192.168.10.90
+    source_kolla_base_distro: rocky
+    source_openstack_release: "2025.1"
+
+    target_cluster_name: os2
+    target_cluster_description: Ubuntu/Kolla control plane without Masakari
+    target_vip: 192.168.10.91
+    target_kolla_base_distro: ubuntu
+    target_openstack_release: "2025.1"
+
+    # CP-A has Masakari hostmonitor/HA pieces; CP-B does not. These services are
+    # source-only for the lab and must be stopped only if the runtime guard proves
+    # that the VM stays running and reachable.
+    source_only_containers:
+      - hacluster_pacemaker_remote
+      - masakari_instancemonitor
+
+    source_runtime_switch_containers:
+      - nova_compute
+      - neutron_openvswitch_agent
+
+    target_runtime_switch_containers:
+      - neutron_openvswitch_agent
+      - nova_compute
+    target_runtime_switch_container_images:
+      neutron_openvswitch_agent: quay.io/openstack.kolla/neutron-openvswitch-agent:2025.1-ubuntu-noble
+      nova_compute: quay.io/openstack.kolla/nova-compute:2025.1-ubuntu-noble
+
+    # Old source runtime images eligible for guarded cleanup after burn-in.
+    # Keep this allowlist narrow: nova_libvirt/OVS/storage helpers are not
+    # runtime agent images and are handled separately.
+    source_runtime_cleanup_container_images:
+      neutron_openvswitch_agent: quay.io/openstack.kolla/neutron-openvswitch-agent:2025.1-rocky-9
+      nova_compute: quay.io/openstack.kolla/nova-compute:2025.1-rocky-9
+    target_host_container_reconcile_default_containers:
+      - fluentd
+      - cron
+      - kolla_toolbox
+      - nova_ssh
+    target_host_container_reconcile_libvirt_containers:
+      - nova_libvirt
+    target_host_container_reconcile_ovs_containers:
+      - openvswitch_db
+      - openvswitch_vswitchd
+    target_host_container_reconcile_images:
+      fluentd: quay.io/openstack.kolla/fluentd:2025.1-ubuntu-noble
+      cron: quay.io/openstack.kolla/cron:2025.1-ubuntu-noble
+      kolla_toolbox: quay.io/openstack.kolla/kolla-toolbox:2025.1-ubuntu-noble
+      nova_ssh: quay.io/openstack.kolla/nova-ssh:2025.1-ubuntu-noble
+      nova_libvirt: quay.io/openstack.kolla/nova-libvirt:2025.1-ubuntu-noble
+      openvswitch_db: quay.io/openstack.kolla/openvswitch-db-server:2025.1-ubuntu-noble
+      openvswitch_vswitchd: quay.io/openstack.kolla/openvswitch-vswitchd:2025.1-ubuntu-noble
+    target_host_container_reconcile_env_overrides:
+      cron:
+        KOLLA_BASE_DISTRO: ubuntu
+      kolla_toolbox:
+        KOLLA_BASE_DISTRO: ubuntu
+      nova_ssh:
+        KOLLA_BASE_DISTRO: ubuntu
+    target_host_container_reconcile_drop_mount_destinations:
+      nova_ssh:
+        - /var/lib/nova/mnt
+
+    # Used by nova_libvirt preflight. A target libvirt image can be applied only
+    # if it supports all machine types used by currently running domains and
+    # does not downgrade libvirt/QEMU.
+    target_host_container_reconcile_nova_libvirt_qemu_paths:
+      - /usr/libexec/qemu-kvm
+      - /usr/bin/qemu-system-x86_64
+    source_runtime_switch_systemd_units:
+      - nova-compute
+      - neutron-openvswitch-agent
+    target_runtime_switch_systemd_units:
+      - neutron-openvswitch-agent
+      - nova-compute
+
+    dataplane_keep_containers:
+      - nova_libvirt
+      - openvswitch_db
+      - openvswitch_vswitchd
+      - iscsid
+      - multipathd
+    dataplane_keep_systemd_units:
+      - libvirtd
+      - virtqemud
+      - openvswitch
+      - openvswitch-switch
+      - iscsid
+      - multipathd
+
+    source_only_systemd_units:
+      - kolla-hacluster_pacemaker_remote-container.service
+    ignored_source_containers: []
+    ignored_source_systemd_units: []
+
+    runtime_guard_enabled: true
+    runtime_guard_virsh_command: docker exec nova_libvirt virsh
+    runtime_guard_domain_capture_retries: 6
+    runtime_guard_domain_capture_delay: 5
+    runtime_guard_compare_domain_interfaces: true
+    runtime_guard_ovs_vsctl_command: docker exec openvswitch_db ovs-vsctl
+    runtime_guard_ovs_capture_retries: 6
+    runtime_guard_ovs_capture_delay: 5
+    runtime_guard_compare_ovs_ports: false
+    runtime_guard_ping_count: 3
+    runtime_guard_ping_timeout: 1
+    runtime_guard_probe_targets:
+      - name: lab-vm-01
+        ip: 192.168.10.100
+        required: true
+    runtime_guard_probe_delegate: os2-ctrl-01
+
+  children:
+    # CP-A/source control plane.
+    source_control:
+      hosts:
+        os1-ctrl-01:
+          <<: *lab_rehome_vars
+          ansible_host: 192.168.10.70
+          mysql_defaults_file: /root/.my.cnf
+          openrc_file: /etc/kolla/admin-openrc.sh
+          schema_compat_kolla_passwords_file_local: /Users/dmitry/Desktop/test_migration/openstack_hosts/ansible/generated/kolla/os1/etc-kolla/passwords.yml
+          schema_compat_mysql_host: 192.168.10.90
+          source_clouds_file_local: /Users/dmitry/Desktop/test_migration/openstack_hosts/ansible/generated/kolla/os1/etc-kolla/clouds.yaml
+    # CP-B/target control plane.
+    target_control:
+      hosts:
+        os2-ctrl-01:
+          <<: *lab_rehome_vars
+          ansible_host: 192.168.10.75
+          mysql_defaults_file: /root/.my.cnf
+          openrc_file: /etc/kolla/admin-openrc.sh
+          schema_compat_kolla_passwords_file_local: /Users/dmitry/Desktop/test_migration/openstack_hosts/ansible/generated/kolla/os2/etc-kolla/passwords.yml
+          schema_compat_mysql_host: 192.168.10.91
+          target_clouds_file_local: /Users/dmitry/Desktop/test_migration/openstack_hosts/ansible/generated/kolla/os2/etc-kolla/clouds.yaml
+    # Healthy target compute used only as a source of reference Kolla configs.
+    target_reference_compute:
+      hosts:
+        os2-compute-01:
+          <<: *lab_rehome_vars
+          ansible_host: 192.168.10.78
+          target_kolla_config_reference_hostname: os2-compute-01.example.local
+    # The compute host being adopted by CP-B while its VM stays running.
+    rehome_compute:
+      hosts:
+        os1-compute-02:
+          <<: *lab_rehome_vars
+          ansible_host: 192.168.10.74

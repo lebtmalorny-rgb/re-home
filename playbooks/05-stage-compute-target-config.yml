@@ -1,0 +1,69 @@
+---
+- name: 05 | Stage target compute configuration without restarting source services
+  hosts: rehome_compute
+  become: true
+  gather_facts: true
+  vars:
+    nova_safe_mode_defaults:
+      running_deleted_instance_action: noop
+      running_deleted_instance_poll_interval: 0
+      sync_power_state_interval: -1
+      resume_guests_state_on_host_boot: false
+      enable_new_services: false
+      handle_virt_lifecycle_events: false
+  tasks:
+    - name: Set effective Nova safe-mode options
+      ansible.builtin.set_fact:
+        nova_safe_mode_effective: "{{ nova_safe_mode | default(nova_safe_mode_defaults) }}"
+
+    - name: Backup active source configs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mkdir -p {{ source_config_backup_dir }}/etc
+        rsync -a /etc/nova {{ source_config_backup_dir }}/etc/ || true
+        rsync -a /etc/neutron {{ source_config_backup_dir }}/etc/ || true
+        rsync -a /etc/openvswitch {{ source_config_backup_dir }}/etc/ || true
+        systemctl list-unit-files '*nova*' '*neutron*' '*ovn*' > {{ source_config_backup_dir }}/systemd-units.txt || true
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Create staged target config directories
+      ansible.builtin.file:
+        path: "{{ target_config_stage_dir }}/{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - nova
+        - neutron
+        - systemd
+
+    - name: Place target Nova safe-mode overlay in staging
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/nova-rehome-safe.conf.j2"
+        dest: "{{ target_config_stage_dir }}/nova/99-rehome-safe.conf"
+        mode: "0640"
+
+    - name: Place target Neutron OVS sample overlay in staging
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/neutron-ovs-rehome.conf.j2"
+        dest: "{{ target_config_stage_dir }}/neutron/99-rehome-ovs.conf"
+        mode: "0640"
+      when: network_backend in ['ovs', 'hybrid']
+
+    - name: Place target OVN sample environment in staging
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/ovn-rehome.env.j2"
+        dest: "{{ target_config_stage_dir }}/systemd/ovn-rehome.env"
+        mode: "0640"
+      when: network_backend in ['ovn', 'hybrid']
+
+    - name: Confirm libvirt domains still running after staging
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF'
+      args:
+        executable: /bin/bash
+      register: domains_after_stage
+      changed_when: false
+      failed_when: domains_after_stage.stdout_lines | length == 0

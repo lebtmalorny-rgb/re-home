@@ -1,0 +1,196 @@
+---
+- name: 04H | Normalize target metadata values after import
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_metadata_normalize_apply: false
+    target_metadata_normalize_id: ""
+    target_metadata_normalize_container: "mariadb"
+    target_metadata_normalize_user: root
+    target_metadata_normalize_socket: "{{ target_db_backup_socket | default('/run/mysqld/mysqld.sock') }}"
+    target_metadata_normalize_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_metadata_normalize_no_log: true
+    target_metadata_normalize_fetch: true
+    target_metadata_normalize_allowed_targets:
+      - cinder.volumes.volume_type_id
+  tasks:
+    - name: Target metadata normalization | validate required inputs
+      ansible.builtin.assert:
+        that:
+          - target_metadata_normalizations | default([]) | length > 0
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_metadata_normalize_password_key | length > 0
+          - target_metadata_normalize_socket | length > 0
+        fail_msg: "Set target_metadata_normalizations and Kolla DB password inputs before metadata normalization."
+
+    - name: Target metadata normalization | validate requested targets
+      ansible.builtin.assert:
+        that:
+          - item.schema is defined
+          - item.table is defined
+          - item.column is defined
+          - item.old is defined
+          - item.new is defined
+          - item.schema is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - item.table is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - item.column is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - item.where_column is not defined or item.where_column is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - >-
+            (item.where_column is not defined and item.where_values is not defined)
+            or
+            (item.where_column is defined and item.where_values is defined and (item.where_values | length > 0))
+          - (item.schema ~ '.' ~ item.table ~ '.' ~ item.column) in target_metadata_normalize_allowed_targets
+        fail_msg: "Metadata normalization target is not allowed or is underspecified."
+      loop: "{{ target_metadata_normalizations | default([]) }}"
+
+    - name: Target metadata normalization | freeze run id
+      ansible.builtin.set_fact:
+        target_metadata_normalize_id_effective: >-
+          {{
+            target_metadata_normalize_id
+            if target_metadata_normalize_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target metadata normalization | set run paths
+      ansible.builtin.set_fact:
+        target_metadata_normalize_remote_dir_effective: "{{ rehome_stage_dir }}/target-metadata-normalization/{{ target_metadata_normalize_id_effective }}"
+        target_metadata_normalize_remote_sql_effective: "{{ rehome_stage_dir }}/target-metadata-normalization/{{ target_metadata_normalize_id_effective }}/normalization.sql"
+        target_metadata_normalize_remote_report_effective: "{{ rehome_stage_dir }}/target-metadata-normalization/{{ target_metadata_normalize_id_effective }}/report.tsv"
+        target_metadata_normalize_local_run_dir_effective: "{{ local_artifact_dir }}/target-metadata-normalization/{{ target_metadata_normalize_id_effective }}"
+
+    - name: Target metadata normalization | create remote run directory
+      ansible.builtin.file:
+        path: "{{ target_metadata_normalize_remote_dir_effective }}"
+        state: directory
+        mode: "0700"
+
+    - name: Target metadata normalization | load target DB password
+      ansible.builtin.set_fact:
+        target_metadata_normalize_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_metadata_normalize_password_key]
+          }}
+      no_log: true
+
+    - name: Target metadata normalization | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_metadata_normalize_container }}"
+          - test
+          - "-S"
+          - "{{ target_metadata_normalize_socket }}"
+      changed_when: false
+
+    - name: Target metadata normalization | initialize report
+      ansible.builtin.copy:
+        dest: "{{ target_metadata_normalize_remote_report_effective }}"
+        mode: "0600"
+        content: |
+          phase	label	row_count
+
+    - name: Target metadata normalization | run normalization SQL
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          mysql_bin="$({{ container_runtime_cli }} exec {{ target_metadata_normalize_container }} sh -lc 'command -v mariadb || command -v mysql')"
+          sql_file={{ target_metadata_normalize_remote_sql_effective | quote }}
+          cat > "$sql_file" <<'SQL'
+          {% set label = item.name | default(item.schema ~ '.' ~ item.table ~ '.' ~ item.column) %}
+          SELECT 'before', '{{ label | string | replace("'", "''") }}', COUNT(*)
+          FROM `{{ item.schema }}`.`{{ item.table }}`
+          WHERE `{{ item.column }}` = '{{ item.old | string | replace("'", "''") }}'
+          {% if item.where_column is defined and item.where_values is defined %}
+            AND `{{ item.where_column }}` IN ({% for value in item.where_values %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          {% endif %}
+          ;
+          {% if target_metadata_normalize_apply | bool %}
+          UPDATE `{{ item.schema }}`.`{{ item.table }}`
+          SET `{{ item.column }}` = '{{ item.new | string | replace("'", "''") }}'
+          WHERE `{{ item.column }}` = '{{ item.old | string | replace("'", "''") }}'
+          {% if item.where_column is defined and item.where_values is defined %}
+            AND `{{ item.where_column }}` IN ({% for value in item.where_values %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          {% endif %}
+          ;
+          SELECT 'updated', '{{ label | string | replace("'", "''") }}', ROW_COUNT();
+          {% else %}
+          SELECT 'dry_run', '{{ label | string | replace("'", "''") }}', 0;
+          {% endif %}
+          SELECT 'after', '{{ label | string | replace("'", "''") }}', COUNT(*)
+          FROM `{{ item.schema }}`.`{{ item.table }}`
+          WHERE `{{ item.column }}` = '{{ item.old | string | replace("'", "''") }}'
+          {% if item.where_column is defined and item.where_values is defined %}
+            AND `{{ item.where_column }}` IN ({% for value in item.where_values %}'{{ value | string | replace("'", "''") }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          {% endif %}
+          ;
+          SQL
+          {{ container_runtime_cli }} exec \
+            -e MYSQL_PWD="$TARGET_METADATA_NORMALIZE_PASSWORD" \
+            -i {{ target_metadata_normalize_container }} \
+            "$mysql_bin" \
+            -u"{{ target_metadata_normalize_user }}" \
+            --socket={{ target_metadata_normalize_socket | quote }} \
+            --batch \
+            --raw \
+            --skip-column-names \
+            < "$sql_file" \
+            | tee -a {{ target_metadata_normalize_remote_report_effective | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_METADATA_NORMALIZE_PASSWORD: "{{ target_metadata_normalize_password }}"
+      loop: "{{ target_metadata_normalizations | default([]) }}"
+      register: target_metadata_normalize_sql_result
+      changed_when:
+        - target_metadata_normalize_apply | bool
+        - >-
+          (target_metadata_normalize_sql_result.stdout_lines | default([])
+          | select('match', '^updated\t.*\t[1-9][0-9]*$') | list | length) > 0
+      no_log: "{{ target_metadata_normalize_no_log | bool }}"
+
+    - name: Target metadata normalization | write run manifest
+      ansible.builtin.copy:
+        dest: "{{ target_metadata_normalize_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-metadata-normalization/v1alpha1",
+            "normalization_id": "{{ target_metadata_normalize_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "apply": {{ target_metadata_normalize_apply | bool | to_json }},
+            "normalization_count": {{ target_metadata_normalizations | default([]) | length }},
+            "remote_report": "{{ target_metadata_normalize_remote_report_effective }}",
+            "socket": "{{ target_metadata_normalize_socket }}"
+          }
+
+    - name: Target metadata normalization | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ target_metadata_normalize_local_run_dir_effective }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+      when: target_metadata_normalize_fetch | bool
+
+    - name: Target metadata normalization | fetch run artifacts
+      ansible.builtin.fetch:
+        src: "{{ target_metadata_normalize_remote_dir_effective }}/{{ item }}"
+        dest: "{{ target_metadata_normalize_local_run_dir_effective }}/{{ item }}"
+        flat: true
+      loop:
+        - report.tsv
+        - manifest.json
+      when: target_metadata_normalize_fetch | bool
+
+    - name: Target metadata normalization | show run artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Normalization id: {{ target_metadata_normalize_id_effective }}"
+          - "Apply: {{ target_metadata_normalize_apply | bool }}"
+          - "Remote report: {{ target_metadata_normalize_remote_report_effective }}"
+          - "Local run dir: {{ target_metadata_normalize_local_run_dir_effective }}"

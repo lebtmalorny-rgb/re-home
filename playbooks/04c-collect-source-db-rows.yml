@@ -1,0 +1,134 @@
+---
+- name: 04C | Collect source DB rows for metadata import review
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    source_db_rows_plan_json_local: "{{ local_artifact_dir }}/target-db-import-plan.json"
+    source_db_rows_remote_dir: "{{ rehome_stage_dir }}/source-db-rows"
+    source_db_rows_archive_remote: "{{ rehome_stage_dir }}/source-db-rows.tar.gz"
+    source_db_rows_archive_local: "{{ local_artifact_dir }}/source-db-rows.tar.gz"
+    source_db_rows_local_dir: "{{ local_artifact_dir }}/source-db-rows"
+    source_db_rows_nova_cell_db_name: "nova"
+  tasks:
+    - name: Source DB rows | validate inputs
+      ansible.builtin.assert:
+        that:
+          - source_db_rows_plan_json_local is file
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - source_db_row_service_queries | length > 0
+        fail_msg: >-
+          Run 04b first and set source_db_row_service_queries plus
+          schema_compat_kolla_passwords_file_local before source DB row collection.
+
+    - name: Source DB rows | reset remote row collection directory
+      ansible.builtin.file:
+        path: "{{ source_db_rows_remote_dir }}"
+        state: absent
+
+    - name: Source DB rows | create remote query and row directories
+      ansible.builtin.file:
+        path: "{{ source_db_rows_remote_dir }}/{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - queries
+        - rows
+
+    - name: Source DB rows | copy DB import plan to source control
+      ansible.builtin.copy:
+        src: "{{ source_db_rows_plan_json_local }}"
+        dest: "{{ source_db_rows_remote_dir }}/target-db-import-plan.json"
+        mode: "0600"
+
+    - name: Source DB rows | copy query builder to source control
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/collect_source_db_rows.py"
+        dest: "{{ source_db_rows_remote_dir }}/collect_source_db_rows.py"
+        mode: "0750"
+
+    - name: Source DB rows | generate read-only service SQL queries
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ source_db_rows_remote_dir }}/collect_source_db_rows.py"
+          - --db-import-plan-json
+          - "{{ source_db_rows_remote_dir }}/target-db-import-plan.json"
+          - --out-dir
+          - "{{ source_db_rows_remote_dir }}"
+          - --nova-cell-db-name
+          - "{{ source_db_rows_nova_cell_db_name }}"
+      changed_when: true
+
+    - name: Source DB rows | execute service queries
+      ansible.builtin.include_tasks: tasks/collect-source-db-row-service.yml
+      loop: "{{ source_db_row_service_queries }}"
+      loop_control:
+        loop_var: source_db_row_service
+
+    - name: Source DB rows | archive row collection artifacts on source control
+      ansible.builtin.archive:
+        path: "{{ source_db_rows_remote_dir }}"
+        dest: "{{ source_db_rows_archive_remote }}"
+        format: gz
+
+    - name: Source DB rows | fetch row collection archive
+      ansible.builtin.fetch:
+        src: "{{ source_db_rows_archive_remote }}"
+        dest: "{{ source_db_rows_archive_local }}"
+        flat: true
+
+- name: 04C | Unpack and validate source DB row artifacts locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    source_db_rows_archive_local: "{{ local_artifact_dir }}/source-db-rows.tar.gz"
+    source_db_rows_local_dir: "{{ local_artifact_dir }}/source-db-rows"
+  tasks:
+    - name: Source DB rows local | reset unpack directory
+      ansible.builtin.file:
+        path: "{{ source_db_rows_local_dir }}"
+        state: absent
+
+    - name: Source DB rows local | recreate unpack directory
+      ansible.builtin.file:
+        path: "{{ source_db_rows_local_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Source DB rows local | unpack source DB row archive
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ source_db_rows_archive_local }}"
+          - -C
+          - "{{ source_db_rows_local_dir }}"
+          - --strip-components
+          - "1"
+      changed_when: true
+
+    - name: Source DB rows local | assert all service query return codes are zero
+      ansible.builtin.shell: |
+        set -euo pipefail
+        bad=0
+        for f in {{ source_db_rows_local_dir }}/rows/*.rc; do
+          rc="$(cat "$f")"
+          if [ "$rc" != "0" ]; then
+            echo "$f=$rc"
+            bad=1
+          fi
+        done
+        exit "$bad"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Source DB rows local | show artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Archive: {{ source_db_rows_archive_local }}"
+          - "Unpacked rows: {{ source_db_rows_local_dir }}/rows"
+          - "Queries: {{ source_db_rows_local_dir }}/queries"
+          - "Manifest: {{ source_db_rows_local_dir }}/source-db-row-query-manifest.json"

@@ -1,0 +1,42 @@
+---
+- name: 01 | Freeze scheduling and API operations on source
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Disable source nova-compute service for scheduling
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% if use_os_cloud %}export OS_CLOUD={{ source_os_cloud }}{% else %}source {{ openrc_file }}{% endif %}
+        openstack compute service set --disable --disable-reason "{{ rehome_id }} host re-home to target" {{ rehome_host }} nova-compute
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Capture source servers on host
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mkdir -p {{ local_artifact_dir | quote }}
+        {% if use_os_cloud %}export OS_CLOUD={{ source_os_cloud }}{% else %}source {{ openrc_file }}{% endif %}
+        openstack server list --all-projects --host {{ rehome_host }} --long -f json | tee {{ local_artifact_dir }}/source_servers.json
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Fail if no source servers found unless explicitly allowed
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        p='{{ local_artifact_dir }}/source_servers.json'
+        data=json.load(open(p))
+        print(len(data))
+        raise SystemExit(0 if data else 2)
+        PY
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      changed_when: false

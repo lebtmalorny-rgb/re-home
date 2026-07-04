@@ -1,0 +1,395 @@
+---
+- name: 05b | Collect target Kolla runtime configs from reference compute
+  hosts: target_reference_compute[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_kolla_config_services:
+      - nova-compute
+      - neutron-openvswitch-agent
+      - cron
+      - kolla-toolbox
+      - nova-ssh
+    target_kolla_config_archive_name: target-kolla-config-reference.tar.gz
+    target_kolla_config_archive_remote: "{{ rehome_stage_dir }}/{{ target_kolla_config_archive_name }}"
+    target_kolla_config_archive_local: "{{ local_artifact_dir }}/{{ target_kolla_config_archive_name }}"
+  tasks:
+    - name: Target Kolla config | validate reference compute inputs
+      ansible.builtin.assert:
+        that:
+          - target_kolla_config_reference_hostname is defined
+          - target_kolla_config_reference_hostname | length > 0
+          - local_artifact_dir is defined
+          - local_artifact_dir | length > 0
+        fail_msg: "Set target_kolla_config_reference_hostname and local_artifact_dir for target_reference_compute."
+
+    - name: Target Kolla config | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Target Kolla config | ensure remote stage directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target Kolla config | check required target service config.json files
+      ansible.builtin.stat:
+        path: "/etc/kolla/{{ item }}/config.json"
+      loop: "{{ target_kolla_config_services }}"
+      register: target_kolla_config_json_stats
+
+    - name: Target Kolla config | assert required target service configs exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Missing /etc/kolla/{{ item.item }}/config.json on target reference compute."
+      loop: "{{ target_kolla_config_json_stats.results }}"
+
+    - name: Target Kolla config | archive full target Kolla service config directories
+      ansible.builtin.shell: |
+        set -euo pipefail
+        tar -C /etc/kolla -czf {{ target_kolla_config_archive_remote | quote }} {{ target_kolla_config_services | join(' ') }}
+        chmod 0600 {{ target_kolla_config_archive_remote | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Target Kolla config | fetch target Kolla config archive locally
+      ansible.builtin.fetch:
+        src: "{{ target_kolla_config_archive_remote }}"
+        dest: "{{ target_kolla_config_archive_local }}"
+        flat: true
+
+    - name: Target Kolla config | restrict local target Kolla config archive permissions
+      ansible.builtin.file:
+        path: "{{ target_kolla_config_archive_local }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+- name: 05b | Stage target Kolla runtime configs on re-home compute
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  vars:
+    target_kolla_config_services:
+      - nova-compute
+      - neutron-openvswitch-agent
+      - cron
+      - kolla-toolbox
+      - nova-ssh
+    target_kolla_config_archive_name: target-kolla-config-reference.tar.gz
+    target_kolla_config_archive_remote: "{{ rehome_stage_dir }}/{{ target_kolla_config_archive_name }}"
+    target_kolla_config_archive_local: "{{ local_artifact_dir }}/{{ target_kolla_config_archive_name }}"
+    # final path ends with target-config-stage/kolla
+    target_kolla_config_stage_dir: "{{ target_config_stage_dir | default(rehome_stage_dir + '/target-config-stage') }}/kolla"
+    target_kolla_config_manifest_path: "{{ target_kolla_config_stage_dir }}/target-kolla-config-stage-manifest.json"
+    target_kolla_config_reference_inventory_hostname: "{{ groups['target_reference_compute'][0] }}"
+    target_kolla_config_reference_hostname: "{{ hostvars[target_kolla_config_reference_inventory_hostname].target_kolla_config_reference_hostname }}"
+    target_kolla_config_reference_short_hostname: "{{ target_kolla_config_reference_hostname.split('.')[0] }}"
+    target_kolla_config_reference_ip: "{{ hostvars[target_kolla_config_reference_inventory_hostname].ansible_host }}"
+    target_kolla_config_rehome_ip: "{{ ansible_host | default(inventory_hostname) }}"
+    target_kolla_config_rehome_short_hostname: "{{ rehome_host.split('.')[0] }}"
+    nova_safe_mode_effective:
+      running_deleted_instance_action: "{{ nova_safe_mode.running_deleted_instance_action | default('noop') if nova_safe_mode is defined else 'noop' }}"
+      running_deleted_instance_poll_interval: "{{ nova_safe_mode.running_deleted_instance_poll_interval | default(0) if nova_safe_mode is defined else 0 }}"
+      sync_power_state_interval: "{{ nova_safe_mode.sync_power_state_interval | default(-1) if nova_safe_mode is defined else -1 }}"
+      enable_new_services: "{{ nova_safe_mode.enable_new_services | default(false) if nova_safe_mode is defined else false }}"
+      handle_virt_lifecycle_events: "{{ nova_safe_mode.handle_virt_lifecycle_events | default(false) if nova_safe_mode is defined else false }}"
+  tasks:
+    - name: Target Kolla config | validate staging inputs
+      ansible.builtin.assert:
+        that:
+          - rehome_host is defined
+          - rehome_host | length > 0
+          - target_kolla_config_reference_hostname | length > 0
+          - target_kolla_config_rehome_ip | length > 0
+          - instances_path is defined
+          - instances_path | length > 0
+        fail_msg: "Missing rehome_host, target reference hostname, rehome IP or instances_path."
+
+    - name: Target Kolla config | ensure remote re-home stage directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target Kolla config | reset target Kolla config staging directory
+      ansible.builtin.file:
+        path: "{{ target_kolla_config_stage_dir }}"
+        state: absent
+
+    - name: Target Kolla config | recreate target Kolla config staging directory
+      ansible.builtin.file:
+        path: "{{ target_kolla_config_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target Kolla config | copy target Kolla config archive to re-home compute
+      ansible.builtin.copy:
+        src: "{{ target_kolla_config_archive_local }}"
+        dest: "{{ target_kolla_config_archive_remote }}"
+        mode: "0600"
+
+    - name: Target Kolla config | unpack target Kolla config bundle
+      ansible.builtin.unarchive:
+        src: "{{ target_kolla_config_archive_remote }}"
+        dest: "{{ target_kolla_config_stage_dir }}"
+        remote_src: true
+
+    - name: Target Kolla config | preserve re-home hostnqn if present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dest={{ (target_kolla_config_stage_dir + '/nova-compute/hostnqn') | quote }}
+        if [ -f /etc/nvme/hostnqn ]; then
+          cp /etc/nvme/hostnqn "$dest"
+          chmod 0600 "$dest"
+        elif [ -f /etc/kolla/nova-compute/hostnqn ]; then
+          cp /etc/kolla/nova-compute/hostnqn "$dest"
+          chmod 0600 "$dest"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Target Kolla config | preserve re-home libvirt auth.conf if present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dest={{ (target_kolla_config_stage_dir + '/nova-compute/auth.conf') | quote }}
+        if [ -f /etc/kolla/nova-compute/auth.conf ]; then
+          cp /etc/kolla/nova-compute/auth.conf "$dest"
+          chmod 0600 "$dest"
+        elif [ -f /var/lib/docker/volumes/nova_compute/_data/.config/libvirt/auth.conf ]; then
+          cp /var/lib/docker/volumes/nova_compute/_data/.config/libvirt/auth.conf "$dest"
+          chmod 0600 "$dest"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+
+    - name: Target Kolla config | rewrite host-specific values and enforce Nova safe-mode
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import configparser
+        import os
+        from pathlib import Path
+
+        stage = Path(os.environ["TARGET_KOLLA_CONFIG_STAGE_DIR"])
+        ref_host = os.environ["TARGET_KOLLA_CONFIG_REFERENCE_HOSTNAME"]
+        ref_short = os.environ["TARGET_KOLLA_CONFIG_REFERENCE_SHORT_HOSTNAME"]
+        ref_ip = os.environ["TARGET_KOLLA_CONFIG_REFERENCE_IP"]
+        rehome_host = os.environ["REHOME_HOST"]
+        rehome_short = os.environ["TARGET_KOLLA_CONFIG_REHOME_SHORT_HOSTNAME"]
+        rehome_ip = os.environ["TARGET_KOLLA_CONFIG_REHOME_IP"]
+        instances_path = os.environ["INSTANCES_PATH"]
+
+        for path in stage.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            rewritten = (
+                content
+                .replace(ref_host, rehome_host)
+                .replace(ref_short, rehome_short)
+                .replace(ref_ip, rehome_ip)
+            )
+            if rewritten != content:
+                path.write_text(rewritten, encoding="utf-8")
+
+        def set_ini_values(path, updates):
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            parser.optionxform = str
+            parser.read(path, encoding="utf-8")
+            for section, values in updates.items():
+                if section != "DEFAULT" and not parser.has_section(section):
+                    parser.add_section(section)
+                target = parser[section] if section == "DEFAULT" else parser[section]
+                for key, value in values.items():
+                    target[key] = str(value)
+            with open(path, "w", encoding="utf-8") as handle:
+                parser.write(handle)
+
+        nova_conf = stage / "nova-compute" / "nova.conf"
+        ovs_conf = stage / "neutron-openvswitch-agent" / "openvswitch_agent.ini"
+
+        set_ini_values(nova_conf, {
+            "DEFAULT": {
+                "host": rehome_host,
+                "instances_path": instances_path,
+                "running_deleted_instance_action": os.environ["NOVA_RUNNING_DELETED_INSTANCE_ACTION"],
+                "running_deleted_instance_poll_interval": os.environ["NOVA_RUNNING_DELETED_INSTANCE_POLL_INTERVAL"],
+                "sync_power_state_interval": os.environ["NOVA_SYNC_POWER_STATE_INTERVAL"],
+                "enable_new_services": os.environ["NOVA_ENABLE_NEW_SERVICES"],
+                "resume_guests_state_on_host_boot": "false",
+            },
+            "workarounds": {
+                "handle_virt_lifecycle_events": os.environ["NOVA_HANDLE_VIRT_LIFECYCLE_EVENTS"],
+            },
+        })
+
+        set_ini_values(ovs_conf, {
+            "ovs": {
+                "local_ip": rehome_ip,
+            },
+        })
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_KOLLA_CONFIG_STAGE_DIR: "{{ target_kolla_config_stage_dir }}"
+        TARGET_KOLLA_CONFIG_REFERENCE_HOSTNAME: "{{ target_kolla_config_reference_hostname }}"
+        TARGET_KOLLA_CONFIG_REFERENCE_SHORT_HOSTNAME: "{{ target_kolla_config_reference_short_hostname }}"
+        TARGET_KOLLA_CONFIG_REFERENCE_IP: "{{ target_kolla_config_reference_ip }}"
+        REHOME_HOST: "{{ rehome_host }}"
+        TARGET_KOLLA_CONFIG_REHOME_SHORT_HOSTNAME: "{{ target_kolla_config_rehome_short_hostname }}"
+        TARGET_KOLLA_CONFIG_REHOME_IP: "{{ target_kolla_config_rehome_ip }}"
+        INSTANCES_PATH: "{{ instances_path }}"
+        NOVA_RUNNING_DELETED_INSTANCE_ACTION: "{{ nova_safe_mode_effective.running_deleted_instance_action }}"
+        NOVA_RUNNING_DELETED_INSTANCE_POLL_INTERVAL: "{{ nova_safe_mode_effective.running_deleted_instance_poll_interval }}"
+        NOVA_SYNC_POWER_STATE_INTERVAL: "{{ nova_safe_mode_effective.sync_power_state_interval }}"
+        NOVA_ENABLE_NEW_SERVICES: "{{ nova_safe_mode_effective.enable_new_services | string | lower }}"
+        NOVA_HANDLE_VIRT_LIFECYCLE_EVENTS: "{{ nova_safe_mode_effective.handle_virt_lifecycle_events | string | lower }}"
+      changed_when: true
+      no_log: true
+
+    - name: Target Kolla config | check staged config.json files
+      ansible.builtin.stat:
+        path: "{{ target_kolla_config_stage_dir }}/{{ item }}/config.json"
+      loop: "{{ target_kolla_config_services }}"
+      register: target_kolla_config_staged_json_stats
+
+    - name: Target Kolla config | assert staged config.json files exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Missing staged {{ item.item }}/config.json after unpacking target Kolla config bundle."
+      loop: "{{ target_kolla_config_staged_json_stats.results }}"
+
+    - name: Target Kolla config | validate selected non-secret staged settings
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import configparser
+        import json
+        import os
+        from pathlib import Path
+
+        stage = Path(os.environ["TARGET_KOLLA_CONFIG_STAGE_DIR"])
+
+        def read_ini(path):
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            parser.optionxform = str
+            parser.read(path, encoding="utf-8")
+            return parser
+
+        nova = read_ini(stage / "nova-compute" / "nova.conf")
+        ovs = read_ini(stage / "neutron-openvswitch-agent" / "openvswitch_agent.ini")
+        report = {
+            "nova": {
+                "host": nova["DEFAULT"].get("host"),
+                "instances_path": nova["DEFAULT"].get("instances_path"),
+                "running_deleted_instance_action": nova["DEFAULT"].get("running_deleted_instance_action"),
+                "running_deleted_instance_poll_interval": nova["DEFAULT"].get("running_deleted_instance_poll_interval"),
+                "sync_power_state_interval": nova["DEFAULT"].get("sync_power_state_interval"),
+                "enable_new_services": nova["DEFAULT"].get("enable_new_services"),
+                "handle_virt_lifecycle_events": nova["workarounds"].get("handle_virt_lifecycle_events"),
+            },
+            "ovs": {
+                "local_ip": ovs["ovs"].get("local_ip"),
+                "bridge_mappings": ovs["ovs"].get("bridge_mappings"),
+                "tunnel_types": ovs["agent"].get("tunnel_types") if ovs.has_section("agent") else None,
+            },
+        }
+        expected = {
+            ("nova", "host"): os.environ["REHOME_HOST"],
+            ("nova", "running_deleted_instance_action"): "noop",
+            ("nova", "running_deleted_instance_poll_interval"): "0",
+            ("nova", "sync_power_state_interval"): "-1",
+            ("nova", "enable_new_services"): "false",
+            ("nova", "handle_virt_lifecycle_events"): "false",
+            ("ovs", "local_ip"): os.environ["TARGET_KOLLA_CONFIG_REHOME_IP"],
+        }
+        for (section, key), value in expected.items():
+            actual = report[section][key]
+            if actual != value:
+                raise SystemExit(f"{section}.{key}={actual!r}, expected {value!r}")
+        print(json.dumps(report, indent=2, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_KOLLA_CONFIG_STAGE_DIR: "{{ target_kolla_config_stage_dir }}"
+        REHOME_HOST: "{{ rehome_host }}"
+        TARGET_KOLLA_CONFIG_REHOME_IP: "{{ target_kolla_config_rehome_ip }}"
+      register: target_kolla_config_selected_settings
+      changed_when: false
+
+    - name: Target Kolla config | show selected non-secret staged settings
+      ansible.builtin.debug:
+        var: target_kolla_config_selected_settings.stdout_lines
+
+    - name: Target Kolla config | assert target reference values are absent from staged bundle
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ! grep -R -q -- {{ target_kolla_config_reference_hostname | quote }} {{ target_kolla_config_stage_dir | quote }}
+        ! grep -R -q -- {{ target_kolla_config_reference_ip | quote }} {{ target_kolla_config_stage_dir | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Target Kolla config | write non-secret staging manifest
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        stage = Path(os.environ["TARGET_KOLLA_CONFIG_STAGE_DIR"])
+        manifest = {
+            "reference_host": os.environ["TARGET_KOLLA_CONFIG_REFERENCE_HOSTNAME"],
+            "reference_ip": os.environ["TARGET_KOLLA_CONFIG_REFERENCE_IP"],
+            "rehome_host": os.environ["REHOME_HOST"],
+            "rehome_ip": os.environ["TARGET_KOLLA_CONFIG_REHOME_IP"],
+            "services": os.environ["TARGET_KOLLA_CONFIG_SERVICES"].split(","),
+            "files": [],
+        }
+        for path in sorted(stage.rglob("*")):
+            if path.is_file() and path.name != "target-kolla-config-stage-manifest.json":
+                stat = path.stat()
+                manifest["files"].append({
+                    "path": str(path.relative_to(stage)),
+                    "size": stat.st_size,
+                })
+        out = Path(os.environ["TARGET_KOLLA_CONFIG_MANIFEST_PATH"])
+        out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(str(out))
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_KOLLA_CONFIG_STAGE_DIR: "{{ target_kolla_config_stage_dir }}"
+        TARGET_KOLLA_CONFIG_MANIFEST_PATH: "{{ target_kolla_config_manifest_path }}"
+        TARGET_KOLLA_CONFIG_REFERENCE_HOSTNAME: "{{ target_kolla_config_reference_hostname }}"
+        TARGET_KOLLA_CONFIG_REFERENCE_IP: "{{ target_kolla_config_reference_ip }}"
+        REHOME_HOST: "{{ rehome_host }}"
+        TARGET_KOLLA_CONFIG_REHOME_IP: "{{ target_kolla_config_rehome_ip }}"
+        TARGET_KOLLA_CONFIG_SERVICES: "{{ target_kolla_config_services | join(',') }}"
+      register: target_kolla_config_manifest_write
+      changed_when: true
+
+    - name: Target Kolla config | fetch non-secret staging manifest
+      ansible.builtin.fetch:
+        src: "{{ target_kolla_config_manifest_path }}"
+        dest: "{{ local_artifact_dir }}/target-kolla-config-stage-manifest.json"
+        flat: true

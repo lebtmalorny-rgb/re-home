@@ -1,0 +1,13 @@
+# Managed by OpenStack re-home playbook.
+# Safe-mode overlay for first target nova-compute boot.
+[DEFAULT]
+host = {{ rehome_host }}
+instances_path = {{ instances_path }}
+running_deleted_instance_action = {{ nova_safe_mode_effective.running_deleted_instance_action }}
+running_deleted_instance_poll_interval = {{ nova_safe_mode_effective.running_deleted_instance_poll_interval }}
+sync_power_state_interval = {{ nova_safe_mode_effective.sync_power_state_interval }}
+resume_guests_state_on_host_boot = {{ nova_safe_mode_effective.resume_guests_state_on_host_boot | ternary('true','false') }}
+enable_new_services = {{ nova_safe_mode_effective.enable_new_services | ternary('true','false') }}
+
+[workarounds]
+handle_virt_lifecycle_events = {{ nova_safe_mode_effective.handle_virt_lifecycle_events | ternary('true','false') }}

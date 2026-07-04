@@ -1,0 +1,128 @@
+---
+- name: 03B | Normalize schema compatibility diffs
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    schema_compat_normalized_dir: "{{ schema_compat_local_artifact_dir }}/normalized"
+    schema_compat_normalized_diff_dir: "{{ schema_compat_local_artifact_dir }}/normalized-diffs"
+  tasks:
+    - name: Normalize schema diff | assert collected artifacts exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: schema_compat_artifact_stats
+      loop:
+        - "{{ schema_compat_local_artifact_dir }}/source/versions-normalized.txt"
+        - "{{ schema_compat_local_artifact_dir }}/target/versions-normalized.txt"
+        - "{{ schema_compat_local_artifact_dir }}/source/information-schema.tsv"
+        - "{{ schema_compat_local_artifact_dir }}/target/information-schema.tsv"
+
+    - name: Normalize schema diff | fail when artifacts are missing
+      ansible.builtin.assert:
+        that:
+          - schema_compat_artifact_stats.results | map(attribute='stat.exists') | min
+        fail_msg: >-
+          Schema compatibility artifacts are missing. Run
+          playbooks/03a-check-db-schema-compat.yml first.
+
+    - name: Normalize schema diff | ensure output directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ schema_compat_normalized_dir }}/source"
+        - "{{ schema_compat_normalized_dir }}/target"
+        - "{{ schema_compat_normalized_diff_dir }}"
+
+    - name: Normalize schema diff | normalize version reports
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for side in source target; do
+          src="{{ schema_compat_local_artifact_dir }}/${side}/versions-normalized.txt"
+          dst="{{ schema_compat_normalized_dir }}/${side}/versions.normalized.txt"
+          awk '
+            /^[[:space:]]*$/ { next }
+            /^Running current/ { next }
+            /^OK$/ { next }
+            /^tput:/ { next }
+            { print }
+          ' "$src" | LC_ALL=C sort > "$dst"
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Normalize schema diff | normalize information_schema snapshots
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for side in source target; do
+          src="{{ schema_compat_local_artifact_dir }}/${side}/information-schema.tsv"
+          dst="{{ schema_compat_normalized_dir }}/${side}/information-schema.normalized.tsv"
+          awk '
+            /^[[:space:]]*$/ { next }
+            /^tput:/ { next }
+            { print }
+          ' "$src" | LC_ALL=C sort > "$dst"
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Normalize schema diff | compare normalized version reports
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u \
+          {{ schema_compat_normalized_dir }}/source/versions.normalized.txt \
+          {{ schema_compat_normalized_dir }}/target/versions.normalized.txt \
+          > {{ schema_compat_normalized_diff_dir }}/versions.normalized.diff
+      args:
+        executable: /bin/bash
+      register: schema_compat_normalized_versions_diff
+      changed_when: false
+      failed_when: schema_compat_normalized_versions_diff.rc not in [0, 1]
+
+    - name: Normalize schema diff | compare normalized information_schema snapshots
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u \
+          {{ schema_compat_normalized_dir }}/source/information-schema.normalized.tsv \
+          {{ schema_compat_normalized_dir }}/target/information-schema.normalized.tsv \
+          > {{ schema_compat_normalized_diff_dir }}/information-schema.normalized.diff
+      args:
+        executable: /bin/bash
+      register: schema_compat_normalized_info_schema_diff
+      changed_when: false
+      failed_when: schema_compat_normalized_info_schema_diff.rc not in [0, 1]
+
+    - name: Normalize schema diff | write normalization summary
+      ansible.builtin.copy:
+        dest: "{{ schema_compat_local_artifact_dir }}/normalization-summary.txt"
+        mode: "0640"
+        content: |
+          normalized_versions_diff_rc={{ schema_compat_normalized_versions_diff.rc }}
+          normalized_information_schema_diff_rc={{ schema_compat_normalized_info_schema_diff.rc }}
+
+          normalized_source_versions={{ schema_compat_normalized_dir }}/source/versions.normalized.txt
+          normalized_target_versions={{ schema_compat_normalized_dir }}/target/versions.normalized.txt
+          normalized_versions_diff={{ schema_compat_normalized_diff_dir }}/versions.normalized.diff
+
+          normalized_source_information_schema={{ schema_compat_normalized_dir }}/source/information-schema.normalized.tsv
+          normalized_target_information_schema={{ schema_compat_normalized_dir }}/target/information-schema.normalized.tsv
+          normalized_information_schema_diff={{ schema_compat_normalized_diff_dir }}/information-schema.normalized.diff
+
+          Note: this playbook performs conservative text normalization only. It
+          removes empty lines, known command noise, and ordering noise by sorting
+          normalized lines. A non-empty normalized diff still blocks metadata
+          import and cutover.
+
+    - name: Normalize schema diff | assert normalized schemas match
+      ansible.builtin.assert:
+        that:
+          - schema_compat_normalized_versions_diff.rc == 0
+          - schema_compat_normalized_info_schema_diff.rc == 0
+        fail_msg: >-
+          Normalized schema diffs are still non-empty. Review
+          {{ schema_compat_local_artifact_dir }}/normalization-summary.txt before
+          metadata import or cutover.
+        success_msg: "Normalized schema diffs are empty."

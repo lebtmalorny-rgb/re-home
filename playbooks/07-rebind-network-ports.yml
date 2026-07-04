@@ -1,0 +1,41 @@
+---
+- name: 07 | Rebind target Neutron ports to the re-homed host
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    manifest_path: "{{ manifest_file }}"
+  tasks:
+    - name: Load manifest from Ansible runner
+      ansible.builtin.include_vars:
+        file: "{{ manifest_path }}"
+        name: manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Build port list from manifest
+      ansible.builtin.set_fact:
+        manifest_ports: "{{ manifest.rehome_instances | default([]) | map(attribute='ports') | list | flatten }}"
+
+    - name: Rebind each target port to the compute host
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% if use_os_cloud %}export OS_CLOUD={{ target_os_cloud }}{% else %}source {{ openrc_file }}{% endif %}
+        openstack port set --host {{ rehome_host }} {{ item.id }}
+        {% if item.binding_profile is defined and item.binding_profile | length > 0 %}
+        {% for k, v in item.binding_profile.items() %}
+        openstack port set --binding-profile {{ k }}={{ v | quote }} {{ item.id }}
+        {% endfor %}
+        {% endif %}
+        openstack port show {{ item.id }} -f yaml
+      args:
+        executable: /bin/bash
+      loop: "{{ manifest_ports }}"
+      register: port_rebind_results
+      changed_when: true
+
+    - name: Save port rebind output on target
+      ansible.builtin.copy:
+        content: "{{ port_rebind_results.results | to_nice_yaml }}"
+        dest: "/var/backups/openstack-rehome/{{ rehome_id }}/target-port-rebind-results.yml"
+        mode: "0600"

@@ -1,0 +1,52 @@
+---
+- name: 04B | Plan target DB metadata import review pack
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    db_import_plan_manifest_json: "{{ local_artifact_dir }}/rehome_manifest.json"
+    db_import_plan_api_report_json: "{{ local_artifact_dir }}/target-api-prep-report.json"
+    db_import_plan_json: "{{ local_artifact_dir }}/target-db-import-plan.json"
+    db_import_plan_yaml: "{{ local_artifact_dir }}/target-db-import-plan.yml"
+    db_import_plan_markdown: "{{ local_artifact_dir }}/target-db-import-plan.md"
+    db_import_sql_review_dir: "{{ local_artifact_dir }}/target-db-import-sql-review"
+  tasks:
+    - name: DB import plan | validate local input artifacts
+      ansible.builtin.assert:
+        that:
+          - db_import_plan_manifest_json is file
+          - db_import_plan_api_report_json is file
+        fail_msg: "Run 02a-build-rehome-manifest.yml and 04a-plan-target-api-prep.yml before 04b."
+
+    - name: DB import plan | ensure SQL review directory exists
+      ansible.builtin.file:
+        path: "{{ db_import_sql_review_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: DB import plan | generate metadata import review pack
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/plan_db_metadata_import.py"
+          - --manifest-json
+          - "{{ db_import_plan_manifest_json }}"
+          - --target-api-prep-report
+          - "{{ db_import_plan_api_report_json }}"
+          - --out-json
+          - "{{ db_import_plan_json }}"
+          - --out-yaml
+          - "{{ db_import_plan_yaml }}"
+          - --out-md
+          - "{{ db_import_plan_markdown }}"
+          - --sql-review-dir
+          - "{{ db_import_sql_review_dir }}"
+      changed_when: true
+
+    - name: DB import plan | show generated artifacts
+      ansible.builtin.debug:
+        msg:
+          - "JSON plan: {{ db_import_plan_json }}"
+          - "YAML plan: {{ db_import_plan_yaml }}"
+          - "Markdown plan: {{ db_import_plan_markdown }}"
+          - "SQL review dir: {{ db_import_sql_review_dir }}"

@@ -1,0 +1,244 @@
+---
+- name: 02A | Prepare local manifest artifact directory
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Manifest | create local artifact directory
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Manifest | reset local unpack directories
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}/{{ item }}"
+        state: absent
+      loop:
+        - source
+        - target
+        - compute
+
+    - name: Manifest | recreate local unpack directories
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}/{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - source
+        - target
+        - compute
+
+- name: 02A | Collect source OpenStack API manifest
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Manifest source | validate source clouds.yaml input
+      ansible.builtin.assert:
+        that:
+          - source_clouds_file_local | length > 0
+        fail_msg: "Set source_clouds_file_local before running manifest collection."
+
+    - name: Manifest source | ensure remote manifest directory exists
+      ansible.builtin.file:
+        path: "{{ manifest_remote_dir }}/source"
+        state: directory
+        mode: "0750"
+
+    - name: Manifest source | place source clouds.yaml on remote control
+      ansible.builtin.copy:
+        src: "{{ source_clouds_file_local }}"
+        dest: "{{ manifest_remote_dir }}/source-clouds.yaml"
+        mode: "0600"
+
+    - name: Manifest source | place OpenStack collector on remote control
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/collect_openstack_rehome_manifest.py"
+        dest: "{{ manifest_remote_dir }}/collect_openstack_rehome_manifest.py"
+        mode: "0750"
+
+    - name: Manifest source | collect source OpenStack API state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ manifest_remote_dir }}/collect_openstack_rehome_manifest.py"
+          - --clouds-file
+          - "{{ manifest_remote_dir }}/source-clouds.yaml"
+          - --cloud
+          - "{{ source_cloud_name }}"
+          - --rehome-host
+          - "{{ rehome_host }}"
+          - --out-dir
+          - "{{ manifest_remote_dir }}/source"
+          - --side
+          - source
+          - --container
+          - "{{ openstack_cli_container }}"
+      changed_when: false
+
+    - name: Manifest source | archive source OpenStack artifacts
+      ansible.builtin.archive:
+        path: "{{ manifest_remote_dir }}/source"
+        dest: "{{ manifest_remote_dir }}/source-openstack-manifest.tar.gz"
+        format: gz
+
+    - name: Manifest source | fetch source OpenStack artifacts
+      ansible.builtin.fetch:
+        src: "{{ manifest_remote_dir }}/source-openstack-manifest.tar.gz"
+        dest: "{{ local_artifact_dir }}/source-openstack-manifest.tar.gz"
+        flat: true
+
+- name: 02A | Collect target OpenStack API pre-state
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Manifest target | validate target clouds.yaml input
+      ansible.builtin.assert:
+        that:
+          - target_clouds_file_local | length > 0
+        fail_msg: "Set target_clouds_file_local before running manifest collection."
+
+    - name: Manifest target | ensure remote manifest directory exists
+      ansible.builtin.file:
+        path: "{{ manifest_remote_dir }}/target"
+        state: directory
+        mode: "0750"
+
+    - name: Manifest target | place target clouds.yaml on remote control
+      ansible.builtin.copy:
+        src: "{{ target_clouds_file_local }}"
+        dest: "{{ manifest_remote_dir }}/target-clouds.yaml"
+        mode: "0600"
+
+    - name: Manifest target | place OpenStack collector on remote control
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/collect_openstack_rehome_manifest.py"
+        dest: "{{ manifest_remote_dir }}/collect_openstack_rehome_manifest.py"
+        mode: "0750"
+
+    - name: Manifest target | collect target OpenStack API pre-state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ manifest_remote_dir }}/collect_openstack_rehome_manifest.py"
+          - --clouds-file
+          - "{{ manifest_remote_dir }}/target-clouds.yaml"
+          - --cloud
+          - "{{ target_cloud_name }}"
+          - --rehome-host
+          - "{{ rehome_host }}"
+          - --out-dir
+          - "{{ manifest_remote_dir }}/target"
+          - --side
+          - target
+          - --container
+          - "{{ openstack_cli_container }}"
+      changed_when: false
+
+    - name: Manifest target | archive target OpenStack artifacts
+      ansible.builtin.archive:
+        path: "{{ manifest_remote_dir }}/target"
+        dest: "{{ manifest_remote_dir }}/target-openstack-manifest.tar.gz"
+        format: gz
+
+    - name: Manifest target | fetch target OpenStack artifacts
+      ansible.builtin.fetch:
+        src: "{{ manifest_remote_dir }}/target-openstack-manifest.tar.gz"
+        dest: "{{ local_artifact_dir }}/target-openstack-manifest.tar.gz"
+        flat: true
+
+- name: 02A | Collect compute runtime manifest
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Manifest compute | ensure remote compute manifest directory exists
+      ansible.builtin.file:
+        path: "{{ manifest_remote_dir }}/compute"
+        state: directory
+        mode: "0750"
+
+    - name: Manifest compute | place compute collector on re-home host
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/collect_compute_runtime.py"
+        dest: "{{ manifest_remote_dir }}/collect_compute_runtime.py"
+        mode: "0750"
+
+    - name: Manifest compute | collect compute runtime state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ manifest_remote_dir }}/collect_compute_runtime.py"
+          - --out-dir
+          - "{{ manifest_remote_dir }}/compute"
+          - --virsh-command
+          - "{{ runtime_guard_virsh_command }}"
+      changed_when: false
+
+    - name: Manifest compute | archive compute runtime artifacts
+      ansible.builtin.archive:
+        path: "{{ manifest_remote_dir }}/compute"
+        dest: "{{ manifest_remote_dir }}/compute-runtime-manifest.tar.gz"
+        format: gz
+
+    - name: Manifest compute | fetch compute runtime artifacts
+      ansible.builtin.fetch:
+        src: "{{ manifest_remote_dir }}/compute-runtime-manifest.tar.gz"
+        dest: "{{ local_artifact_dir }}/compute-runtime-manifest.tar.gz"
+        flat: true
+
+- name: 02A | Build combined re-home manifest locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Manifest local | unpack source OpenStack artifacts
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ local_artifact_dir }}/source-openstack-manifest.tar.gz"
+          - -C
+          - "{{ local_artifact_dir }}/source"
+      changed_when: true
+
+    - name: Manifest local | unpack target OpenStack artifacts
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ local_artifact_dir }}/target-openstack-manifest.tar.gz"
+          - -C
+          - "{{ local_artifact_dir }}/target"
+      changed_when: true
+
+    - name: Manifest local | unpack compute runtime artifacts
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ local_artifact_dir }}/compute-runtime-manifest.tar.gz"
+          - -C
+          - "{{ local_artifact_dir }}/compute"
+      changed_when: true
+
+    - name: Manifest local | build combined manifest
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/build_rehome_manifest.py"
+          - --artifact-dir
+          - "{{ local_artifact_dir }}"
+          - --output-json
+          - "{{ local_artifact_dir }}/rehome_manifest.json"
+          - --output-yaml
+          - "{{ manifest_file }}"
+      changed_when: true
+
+    - name: Manifest local | show manifest paths
+      ansible.builtin.debug:
+        msg:
+          - "YAML manifest: {{ manifest_file }}"
+          - "JSON manifest: {{ local_artifact_dir }}/rehome_manifest.json"

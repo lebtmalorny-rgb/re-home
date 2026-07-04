@@ -1,0 +1,77 @@
+---
+- name: Source-only container | refuse dataplane or cutover services
+  ansible.builtin.assert:
+    that:
+      - source_only_container_name not in dataplane_keep_containers
+      - source_only_container_name not in source_runtime_switch_containers
+      - source_only_container_name not in target_runtime_switch_containers
+    fail_msg: >-
+      {{ source_only_container_name }} is not safe for pre-cutover stop. Put it
+      in source_runtime_switch_containers for cutover or dataplane_keep_containers
+      if it must remain running.
+
+- name: Source-only container | stop with runtime guard
+  block:
+    - name: Source-only container | stop if running
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if state="$({{ container_runtime_cli }} inspect -f '{% raw %}{{.State.Running}}{% endraw %}' {{ source_only_container_name | quote }} 2>/dev/null)"; then
+          state="$(printf '%s\n' "$state" | awk 'NF { print; exit }')"
+          if [ -z "$state" ]; then
+            state=absent
+          fi
+        else
+          state=absent
+        fi
+        case "$state" in
+          true)
+            {{ container_runtime_cli }} stop {{ source_only_container_name | quote }} >/dev/null
+            echo "STOPPED {{ source_only_container_name }}"
+            ;;
+          false)
+            echo "ALREADY_STOPPED {{ source_only_container_name }}"
+            ;;
+          absent)
+            echo "ABSENT {{ source_only_container_name }}"
+            ;;
+          *)
+            echo "UNKNOWN_STATE ${state}" >&2
+            exit 1
+            ;;
+        esac
+      args:
+        executable: /bin/bash
+      register: source_only_container_stop
+      changed_when: "'STOPPED ' in source_only_container_stop.stdout"
+
+    - name: Source-only container | verify VM runtime after stop
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after source-only container {{ source_only_container_name }}"
+
+  rescue:
+    - name: Source-only container | restart service stopped by this task
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ container_runtime_cli }} start {{ source_only_container_name | quote }}
+      args:
+        executable: /bin/bash
+      when:
+        - source_only_container_stop is defined
+        - "'STOPPED ' in source_only_container_stop.stdout"
+
+    - name: Source-only container | verify VM runtime after rollback attempt
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after rollback of source-only container {{ source_only_container_name }}"
+      ignore_errors: true
+
+    - name: Source-only container | fail after failed guarded stop
+      ansible.builtin.fail:
+        msg: >-
+          Guarded stop for {{ source_only_container_name }} failed. This can be
+          a container operation error or a VM runtime/network guard failure. The
+          service was restarted if this playbook had stopped it. Re-home must
+          not continue until the failure is reviewed.

@@ -1,0 +1,125 @@
+---
+- name: Runtime guard | validate mode
+  ansible.builtin.assert:
+    that:
+      - runtime_guard_mode in ['baseline', 'check']
+    fail_msg: "runtime_guard_mode must be either 'baseline' or 'check'"
+  when: runtime_guard_enabled | bool
+
+- name: Runtime guard | capture VM runtime state
+  when: runtime_guard_enabled | bool
+  block:
+    - name: Runtime guard | ensure stage directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Runtime guard | capture running libvirt domains
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF' | sort > {{ rehome_stage_dir }}/runtime-guard-domains-current.txt
+        test -s {{ rehome_stage_dir }}/runtime-guard-domains-current.txt
+      args:
+        executable: /bin/bash
+      register: runtime_guard_domains_capture
+      changed_when: false
+      retries: "{{ runtime_guard_domain_capture_retries | default(1) }}"
+      delay: "{{ runtime_guard_domain_capture_delay | default(1) }}"
+      until: runtime_guard_domains_capture.rc == 0
+
+    - name: Runtime guard | capture libvirt domain interfaces
+      ansible.builtin.shell: |
+        set -euo pipefail
+        out={{ rehome_stage_dir }}/runtime-guard-domain-ifaces-current.txt
+        : > "$out"
+        while read -r domain; do
+          echo "### ${domain}" >> "$out"
+          {{ runtime_guard_virsh_command }} domiflist "$domain" | awk 'NF' >> "$out"
+        done < {{ rehome_stage_dir }}/runtime-guard-domains-current.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Runtime guard | capture OVS ports if strict OVS comparison is enabled
+      ansible.builtin.shell: |
+        set -euo pipefail
+        out={{ rehome_stage_dir }}/runtime-guard-ovs-ports-current.txt
+        : > "$out"
+        for bridge in br-int br-ex; do
+          if {{ runtime_guard_ovs_vsctl_command }} br-exists "$bridge"; then
+            echo "### ${bridge}" >> "$out"
+            {{ runtime_guard_ovs_vsctl_command }} list-ports "$bridge" | sort >> "$out"
+          fi
+        done
+        test -s "$out"
+      args:
+        executable: /bin/bash
+      register: runtime_guard_ovs_ports_capture
+      changed_when: false
+      retries: "{{ runtime_guard_ovs_capture_retries | default(1) }}"
+      delay: "{{ runtime_guard_ovs_capture_delay | default(1) }}"
+      until: runtime_guard_ovs_ports_capture.rc == 0
+      when: runtime_guard_compare_ovs_ports | bool
+
+    - name: Runtime guard | save baseline
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cp {{ rehome_stage_dir }}/runtime-guard-domains-current.txt {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt
+        cp {{ rehome_stage_dir }}/runtime-guard-domain-ifaces-current.txt {{ rehome_stage_dir }}/runtime-guard-domain-ifaces-baseline.txt
+        if [ -f {{ rehome_stage_dir }}/runtime-guard-ovs-ports-current.txt ]; then
+          cp {{ rehome_stage_dir }}/runtime-guard-ovs-ports-current.txt {{ rehome_stage_dir }}/runtime-guard-ovs-ports-baseline.txt
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: runtime_guard_mode == 'baseline'
+
+    - name: Runtime guard | compare running domain set
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt {{ rehome_stage_dir }}/runtime-guard-domains-current.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: runtime_guard_mode == 'check'
+
+    - name: Runtime guard | compare domain interface snapshot
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u {{ rehome_stage_dir }}/runtime-guard-domain-ifaces-baseline.txt {{ rehome_stage_dir }}/runtime-guard-domain-ifaces-current.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - runtime_guard_mode == 'check'
+        - runtime_guard_compare_domain_interfaces | bool
+
+    - name: Runtime guard | compare OVS port snapshot
+      ansible.builtin.shell: |
+        set -euo pipefail
+        diff -u {{ rehome_stage_dir }}/runtime-guard-ovs-ports-baseline.txt {{ rehome_stage_dir }}/runtime-guard-ovs-ports-current.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - runtime_guard_mode == 'check'
+        - runtime_guard_compare_ovs_ports | bool
+
+    - name: Runtime guard | probe VM network reachability
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% for probe in runtime_guard_probe_targets | default([]) %}
+        echo "probe {{ probe.name | default(probe.ip) }} {{ probe.ip }}"
+        ping -c {{ probe.count | default(runtime_guard_ping_count) }} -W {{ probe.timeout | default(runtime_guard_ping_timeout) }} {{ probe.ip | quote }} >/dev/null
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      become: false
+      delegate_to: "{{ runtime_guard_probe_delegate }}"
+      when: runtime_guard_probe_targets | default([]) | length > 0
+
+    - name: Runtime guard | report passed check
+      ansible.builtin.debug:
+        msg: "Runtime guard {{ runtime_guard_mode }} passed: {{ runtime_guard_label | default('unnamed checkpoint') }}"

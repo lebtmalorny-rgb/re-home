@@ -1,0 +1,58 @@
+---
+- name: Source-only unit | refuse dataplane or cutover services
+  ansible.builtin.assert:
+    that:
+      - source_only_systemd_unit_name not in dataplane_keep_systemd_units
+      - source_only_systemd_unit_name not in source_runtime_switch_systemd_units
+      - source_only_systemd_unit_name not in target_runtime_switch_systemd_units
+    fail_msg: >-
+      {{ source_only_systemd_unit_name }} is not safe for pre-cutover stop. Put it
+      in source_runtime_switch_systemd_units for cutover or dataplane_keep_systemd_units
+      if it must remain running.
+
+- name: Source-only unit | stop with runtime guard
+  block:
+    - name: Source-only unit | stop if active
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if ! systemctl list-unit-files {{ source_only_systemd_unit_name | quote }} >/dev/null 2>&1; then
+          echo "ABSENT {{ source_only_systemd_unit_name }}"
+        elif systemctl is-active --quiet {{ source_only_systemd_unit_name | quote }}; then
+          systemctl stop {{ source_only_systemd_unit_name | quote }}
+          echo "STOPPED {{ source_only_systemd_unit_name }}"
+        else
+          echo "ALREADY_STOPPED {{ source_only_systemd_unit_name }}"
+        fi
+      args:
+        executable: /bin/bash
+      register: source_only_systemd_unit_stop
+      changed_when: "'STOPPED ' in source_only_systemd_unit_stop.stdout"
+
+    - name: Source-only unit | verify VM runtime after stop
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after source-only systemd unit {{ source_only_systemd_unit_name }}"
+
+  rescue:
+    - name: Source-only unit | restart service stopped by this task
+      ansible.builtin.systemd:
+        name: "{{ source_only_systemd_unit_name }}"
+        state: started
+      when:
+        - source_only_systemd_unit_stop is defined
+        - "'STOPPED ' in source_only_systemd_unit_stop.stdout"
+
+    - name: Source-only unit | verify VM runtime after rollback attempt
+      ansible.builtin.include_tasks: runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after rollback of source-only systemd unit {{ source_only_systemd_unit_name }}"
+      ignore_errors: true
+
+    - name: Source-only unit | fail after failed guarded stop
+      ansible.builtin.fail:
+        msg: >-
+          Stopping {{ source_only_systemd_unit_name }} changed VM runtime state
+          or network reachability. The service was restarted if this playbook had
+          stopped it. Re-home must not continue.

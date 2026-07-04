@@ -1,0 +1,189 @@
+---
+- name: 09A | Enable target compute service after successful Kolla validation
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_enable_compute_apply: false
+    target_enable_compute_require_validation_artifact: true
+    target_enable_compute_openstack_cli_container: "{{ openstack_cli_container | default('kolla_toolbox') }}"
+    target_enable_compute_clouds_remote: "{{ rehome_stage_dir }}/enable-target-clouds.yaml"
+    target_enable_compute_clouds_in_container: /tmp/rehome-enable-target-clouds.yaml
+    target_enable_compute_artifact_dir: "/var/backups/openstack-rehome/{{ rehome_id | default(rehome_host | default(inventory_hostname)) }}"
+  tasks:
+    - name: Target enable | require explicit apply and Kolla inputs
+      ansible.builtin.assert:
+        that:
+          - target_enable_compute_apply | bool
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - target_clouds_file_local | default('') | length > 0
+          - target_cloud_name | default('') | length > 0
+          - target_enable_compute_openstack_cli_container | length > 0
+        fail_msg: >-
+          Set target_enable_compute_apply=true after successful 08 validation,
+          and provide Kolla target cloud inputs before enabling scheduling.
+
+    - name: Target enable | check validation artifact
+      ansible.builtin.stat:
+        path: "{{ target_enable_compute_artifact_dir }}/target-validation.yml"
+      register: target_enable_validation_artifact
+
+    - name: Target enable | require previous validation artifact
+      ansible.builtin.assert:
+        that:
+          - target_enable_validation_artifact.stat.exists
+        fail_msg: >-
+          Missing {{ target_enable_compute_artifact_dir }}/target-validation.yml.
+          Run playbooks/08-heal-and-validate.yml successfully first, or set
+          target_enable_compute_require_validation_artifact=false only for a
+          reviewed manual recovery.
+      when: target_enable_compute_require_validation_artifact | bool
+
+    - name: Target enable | ensure remote stage and artifact directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ rehome_stage_dir }}"
+        - "{{ target_enable_compute_artifact_dir }}"
+
+    - name: Target enable | place target clouds.yaml on target control
+      ansible.builtin.copy:
+        src: "{{ target_clouds_file_local }}"
+        dest: "{{ target_enable_compute_clouds_remote }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Target enable | run compute service enable through Kolla toolbox
+      block:
+        - name: Target enable | place target clouds.yaml inside OpenStack CLI container
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker cp {{ target_enable_compute_clouds_remote | quote }} {{ target_enable_compute_openstack_cli_container | quote }}:{{ target_enable_compute_clouds_in_container | quote }}
+            docker exec -u 0 {{ target_enable_compute_openstack_cli_container | quote }} chmod 0644 {{ target_enable_compute_clouds_in_container | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+          no_log: true
+
+        - name: Target enable | read compute service status before enable
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ target_enable_compute_clouds_in_container | quote }} \
+              {{ target_enable_compute_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ target_cloud_name | quote }} \
+              compute service list --host {{ rehome_host | quote }} --service nova-compute -f value -c Status
+          args:
+            executable: /bin/bash
+          register: target_compute_service_status_before
+          changed_when: false
+
+        - name: Target enable | enable target compute service for scheduling
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ target_enable_compute_clouds_in_container | quote }} \
+              {{ target_enable_compute_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ target_cloud_name | quote }} \
+              compute service set --enable {{ rehome_host | quote }} nova-compute
+          args:
+            executable: /bin/bash
+          register: target_compute_service_enable
+          changed_when: true
+          when: "'enabled' not in target_compute_service_status_before.stdout_lines"
+
+        - name: Target enable | show target compute service after enable
+          ansible.builtin.shell: |
+            set -euo pipefail
+            docker exec \
+              -e OS_CLIENT_CONFIG_FILE={{ target_enable_compute_clouds_in_container | quote }} \
+              {{ target_enable_compute_openstack_cli_container | quote }} \
+              openstack --os-cloud {{ target_cloud_name | quote }} \
+              compute service list --host {{ rehome_host | quote }} --service nova-compute -f yaml
+          args:
+            executable: /bin/bash
+          register: target_compute_service_after
+          changed_when: false
+
+        - name: Target enable | save target enable output
+          ansible.builtin.copy:
+            content: |
+              status_before:
+              {{ target_compute_service_status_before.stdout | indent(2) }}
+              enable_command:
+              {{ target_compute_service_enable | default({}) | to_nice_yaml(indent=2) | indent(2) }}
+              status_after:
+              {{ target_compute_service_after.stdout | indent(2) }}
+            dest: "{{ target_enable_compute_artifact_dir }}/target-enable-compute-service.yml"
+            mode: "0600"
+      always:
+        - name: Target enable | remove target clouds.yaml from OpenStack CLI container
+          ansible.builtin.shell: |
+            set +e
+            docker exec -u 0 {{ target_enable_compute_openstack_cli_container | quote }} rm -f {{ target_enable_compute_clouds_in_container | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: false
+          no_log: true
+
+        - name: Target enable | remove target clouds.yaml from target control
+          ansible.builtin.file:
+            path: "{{ target_enable_compute_clouds_remote }}"
+            state: absent
+          no_log: true
+
+    - name: Target enable | print target compute service after enable
+      ansible.builtin.debug:
+        var: target_compute_service_after.stdout_lines
+
+- name: 09B | Validate compute runtime remains stable with safe-mode still installed
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Target enable compute | run runtime guard check
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "09 enable target compute service"
+
+    - name: Target enable compute | verify Kolla Nova safe-mode remains installed
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nova_conf=/etc/kolla/nova-compute/nova.conf
+        grep -Eq '^running_deleted_instance_action[[:space:]]*=[[:space:]]*noop$' "$nova_conf"
+        grep -Eq '^running_deleted_instance_poll_interval[[:space:]]*=[[:space:]]*0$' "$nova_conf"
+        grep -Eq '^sync_power_state_interval[[:space:]]*=[[:space:]]*-1$' "$nova_conf"
+        grep -Eq '^enable_new_services[[:space:]]*=[[:space:]]*false$' "$nova_conf"
+        grep -Eq '^handle_virt_lifecycle_events[[:space:]]*=[[:space:]]*false$' "$nova_conf"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Target enable compute | compare current domains to cutover baseline
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF' | sort > {{ rehome_stage_dir }}/domains-after-target-enable.txt
+        diff -u {{ rehome_stage_dir }}/runtime-guard-domains-baseline.txt {{ rehome_stage_dir }}/domains-after-target-enable.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Target enable compute | show target runtime container status
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker ps --filter name='neutron_openvswitch_agent' --filter name='nova_compute' \
+          --format '{% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}' | sort
+      args:
+        executable: /bin/bash
+      register: target_enable_compute_container_status
+      changed_when: false
+
+    - name: Target enable compute | report safe-mode remains installed
+      ansible.builtin.debug:
+        msg:
+          - "safe-mode remains installed; scheduling is enabled but Nova destructive sync/lifecycle actions remain guarded"
+          - "{{ target_enable_compute_container_status.stdout_lines }}"

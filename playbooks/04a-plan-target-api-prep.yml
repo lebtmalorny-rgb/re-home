@@ -1,0 +1,90 @@
+---
+- name: 04A | Plan target API preparation from re-home manifest
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_prep_manifest_json_local: "{{ local_artifact_dir }}/rehome_manifest.json"
+    target_prep_remote_dir: "{{ rehome_stage_dir }}/target-api-prep"
+    target_prep_report_json_remote: "{{ target_prep_remote_dir }}/target-api-prep-report.json"
+    target_prep_report_yaml_remote: "{{ target_prep_remote_dir }}/target-api-prep-report.yml"
+    target_prep_report_json_local: "{{ local_artifact_dir }}/target-api-prep-report.json"
+    target_prep_report_yaml_local: "{{ local_artifact_dir }}/target-api-prep-report.yml"
+    target_prep_apply: false
+    target_prep_fail_on_db_required: false
+  tasks:
+    - name: Target prep | validate manifest and target clouds inputs
+      ansible.builtin.assert:
+        that:
+          - target_prep_manifest_json_local | length > 0
+          - target_clouds_file_local | length > 0
+          - target_cloud_name | length > 0
+        fail_msg: "Set target_prep_manifest_json_local, target_clouds_file_local and target_cloud_name."
+
+    - name: Target prep | ensure remote target prep directory exists
+      ansible.builtin.file:
+        path: "{{ target_prep_remote_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target prep | place manifest JSON on target control
+      ansible.builtin.copy:
+        src: "{{ target_prep_manifest_json_local }}"
+        dest: "{{ target_prep_remote_dir }}/rehome_manifest.json"
+        mode: "0600"
+
+    - name: Target prep | place target clouds.yaml on target control
+      ansible.builtin.copy:
+        src: "{{ target_clouds_file_local }}"
+        dest: "{{ target_prep_remote_dir }}/target-clouds.yaml"
+        mode: "0600"
+
+    - name: Target prep | place helper on target control
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/plan_target_api_prep.py"
+        dest: "{{ target_prep_remote_dir }}/plan_target_api_prep.py"
+        mode: "0750"
+
+    - name: Target prep | build report-first target API preparation plan
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              'python3',
+              target_prep_remote_dir + '/plan_target_api_prep.py',
+              '--manifest-json',
+              target_prep_remote_dir + '/rehome_manifest.json',
+              '--clouds-file',
+              target_prep_remote_dir + '/target-clouds.yaml',
+              '--cloud',
+              target_cloud_name,
+              '--out-json',
+              target_prep_report_json_remote,
+              '--out-yaml',
+              target_prep_report_yaml_remote,
+              '--container',
+              openstack_cli_container
+            ]
+            + (target_prep_apply | bool | ternary(['--apply'], []))
+            + (target_prep_fail_on_db_required | bool | ternary(['--fail-on-db-required'], []))
+          }}
+      changed_when: target_prep_apply | bool
+
+    - name: Target prep | fetch JSON report
+      ansible.builtin.fetch:
+        src: "{{ target_prep_report_json_remote }}"
+        dest: "{{ target_prep_report_json_local }}"
+        flat: true
+
+    - name: Target prep | fetch YAML report
+      ansible.builtin.fetch:
+        src: "{{ target_prep_report_yaml_remote }}"
+        dest: "{{ target_prep_report_yaml_local }}"
+        flat: true
+
+    - name: Target prep | show report paths
+      ansible.builtin.debug:
+        msg:
+          - "Remote JSON report: {{ target_prep_report_json_remote }}"
+          - "Local JSON report: {{ target_prep_report_json_local }}"
+          - "Local YAML report: {{ target_prep_report_yaml_local }}"

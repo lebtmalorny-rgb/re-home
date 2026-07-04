@@ -1,0 +1,58 @@
+---
+- name: 04 | Prepare target DB schema and import host-scoped metadata
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Optional target Nova DB sync
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nova-manage api_db sync
+        nova-manage db sync
+        set +e
+        nova-manage db online_data_migrations --max-count 1000
+        rc=$?
+        set -e
+        # rc 0 = complete, rc 1 = partial success. rc 2+ requires manual intervention.
+        if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+      args:
+        executable: /bin/bash
+      when: allow_target_db_sync | bool
+      changed_when: true
+
+    - name: Optional target Neutron/Cinder DB sync
+      ansible.builtin.shell: |
+        set -euo pipefail
+        neutron-db-manage upgrade heads
+        if command -v cinder-manage >/dev/null 2>&1; then cinder-manage db sync; fi
+      args:
+        executable: /bin/bash
+      when: allow_target_db_sync | bool
+      changed_when: true
+
+    - name: Copy reviewed target SQL files to target DB node
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ item }}"
+        dest: "/var/backups/openstack-rehome/{{ rehome_id }}/{{ item | basename }}"
+        mode: "0600"
+      loop: "{{ target_sql_files }}"
+      when: allow_target_sql_import | bool
+
+    - name: Import reviewed target SQL files in order
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for f in {% for f in target_sql_files %}/var/backups/openstack-rehome/{{ rehome_id }}/{{ f | basename }} {% endfor %}; do
+          echo "Importing $f"
+          mysql --defaults-extra-file={{ mysql_defaults_file | quote }} < "$f"
+        done
+      args:
+        executable: /bin/bash
+      when: allow_target_sql_import | bool
+      changed_when: true
+
+    - name: Stop if SQL import was not explicitly enabled
+      ansible.builtin.debug:
+        msg: >-
+          Target SQL import is disabled. sql-skeleton/*.sql is only a reference skeleton.
+          Generate reviewed runtime SQL under artifacts and use the guarded 04g import path.
+      when: not allow_target_sql_import | bool

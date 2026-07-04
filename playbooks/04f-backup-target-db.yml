@@ -1,0 +1,177 @@
+---
+- name: 04F | Backup target DB before metadata import
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    target_db_backup_id: ""
+    target_db_backup_db_names: "{{ target_db_names }}"
+    target_db_backup_container: "mariadb"
+    target_db_backup_user: root
+    target_db_backup_password_key: "{{ schema_compat_kolla_database_password_key }}"
+    target_db_backup_socket: "/run/mysqld/mysqld.sock"
+    target_db_backup_host: ""
+    target_db_backup_fetch: true
+  tasks:
+    - name: Target DB backup | validate inputs
+      ansible.builtin.assert:
+        that:
+          - target_db_backup_db_names | length > 0
+          - schema_compat_kolla_passwords_file_local | length > 0
+          - target_db_backup_password_key | length > 0
+          - target_db_backup_socket | length > 0 or target_db_backup_host | length > 0
+        fail_msg: "Set target_db_names and schema_compat_kolla_passwords_file_local before target DB backup."
+
+    - name: Target DB backup | freeze backup id and paths for this run
+      ansible.builtin.set_fact:
+        target_db_backup_id_effective: >-
+          {{
+            target_db_backup_id
+            if target_db_backup_id | length > 0
+            else lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ')
+          }}
+
+    - name: Target DB backup | set backup paths
+      ansible.builtin.set_fact:
+        target_db_backup_remote_dir_effective: "{{ rehome_stage_dir }}/target-db-backup/{{ target_db_backup_id_effective }}"
+        target_db_backup_archive_remote_effective: "{{ rehome_stage_dir }}/target-db-backup/{{ target_db_backup_id_effective }}.tar.gz"
+        target_db_backup_local_archive_effective: "{{ local_artifact_dir }}/target-db-backup/{{ target_db_backup_id_effective }}.tar.gz"
+        target_db_backup_local_manifest_effective: "{{ local_artifact_dir }}/target-db-backup/{{ target_db_backup_id_effective }}.manifest.json"
+
+    - name: Target DB backup | load target DB password
+      ansible.builtin.set_fact:
+        target_db_backup_password: >-
+          {{
+            (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[target_db_backup_password_key]
+          }}
+      no_log: true
+
+    - name: Target DB backup | create remote backup directory
+      ansible.builtin.file:
+        path: "{{ target_db_backup_remote_dir_effective }}"
+        state: directory
+        mode: "0700"
+
+    - name: Target DB backup | verify MariaDB socket exists in container
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - exec
+          - "{{ target_db_backup_container }}"
+          - test
+          - "-S"
+          - "{{ target_db_backup_socket }}"
+      changed_when: false
+      when: target_db_backup_socket | length > 0
+
+    - name: Target DB backup | dump target databases through Kolla MariaDB container
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dump_bin="$({{ container_runtime_cli }} exec {{ target_db_backup_container }} sh -lc 'command -v mariadb-dump || command -v mysqldump')"
+        {% if target_db_backup_socket | length > 0 %}
+        dump_connection_args=(--socket={{ target_db_backup_socket | quote }})
+        {% else %}
+        dump_connection_args=(-h {{ target_db_backup_host | quote }})
+        {% endif %}
+        {{ container_runtime_cli }} exec \
+          -e MYSQL_PWD="$TARGET_DB_BACKUP_PASSWORD" \
+          -i {{ target_db_backup_container }} \
+          "$dump_bin" \
+          -u"{{ target_db_backup_user }}" \
+          "${dump_connection_args[@]}" \
+          --single-transaction \
+          --quick \
+          --routines \
+          --events \
+          --databases {{ target_db_backup_db_names | join(' ') }} \
+          | gzip -c > {{ target_db_backup_remote_dir_effective }}/target-preimport-full.sql.gz
+
+        {{ container_runtime_cli }} exec \
+          -e MYSQL_PWD="$TARGET_DB_BACKUP_PASSWORD" \
+          -i {{ target_db_backup_container }} \
+          "$dump_bin" \
+          -u"{{ target_db_backup_user }}" \
+          "${dump_connection_args[@]}" \
+          --single-transaction \
+          --no-data \
+          --databases {{ target_db_backup_db_names | join(' ') }} \
+          | gzip -c > {{ target_db_backup_remote_dir_effective }}/target-preimport-schema.sql.gz
+      args:
+        executable: /bin/bash
+      environment:
+        TARGET_DB_BACKUP_PASSWORD: "{{ target_db_backup_password }}"
+      changed_when: true
+      no_log: "{{ schema_compat_mysql_query_no_log | bool }}"
+
+    - name: Target DB backup | write checksums
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd {{ target_db_backup_remote_dir_effective }}
+        sha256sum target-preimport-full.sql.gz target-preimport-schema.sql.gz > checksums.sha256
+        wc -c target-preimport-full.sql.gz target-preimport-schema.sql.gz > sizes.txt
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Target DB backup | write backup manifest
+      ansible.builtin.copy:
+        dest: "{{ target_db_backup_remote_dir_effective }}/manifest.json"
+        mode: "0600"
+        content: |
+          {
+            "schema_version": "openstack-rehome-target-db-backup/v1alpha1",
+            "backup_id": "{{ target_db_backup_id_effective }}",
+            "generated_at_utc": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "inventory_hostname": "{{ inventory_hostname }}",
+            "target_cluster_name": "{{ target_cluster_name | default('target') }}",
+            "target_db_backup_remote_dir": "{{ target_db_backup_remote_dir_effective }}",
+            "target_db_backup_archive_remote": "{{ target_db_backup_archive_remote_effective }}",
+            "target_db_backup_socket": "{{ target_db_backup_socket }}",
+            "target_db_backup_host": "{{ target_db_backup_host }}",
+            "database_names": {{ target_db_backup_db_names | to_json }},
+            "files": [
+              "target-preimport-full.sql.gz",
+              "target-preimport-schema.sql.gz",
+              "checksums.sha256",
+              "sizes.txt"
+            ]
+          }
+
+    - name: Target DB backup | create remote backup archive
+      ansible.builtin.archive:
+        path: "{{ target_db_backup_remote_dir_effective }}"
+        dest: "{{ target_db_backup_archive_remote_effective }}"
+        format: gz
+        mode: "0600"
+
+    - name: Target DB backup | ensure local backup artifact directory exists
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}/target-db-backup"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+      when: target_db_backup_fetch | bool
+
+    - name: Target DB backup | fetch remote backup archive
+      ansible.builtin.fetch:
+        src: "{{ target_db_backup_archive_remote_effective }}"
+        dest: "{{ target_db_backup_local_archive_effective }}"
+        flat: true
+      when: target_db_backup_fetch | bool
+
+    - name: Target DB backup | fetch backup manifest
+      ansible.builtin.fetch:
+        src: "{{ target_db_backup_remote_dir_effective }}/manifest.json"
+        dest: "{{ target_db_backup_local_manifest_effective }}"
+        flat: true
+      when: target_db_backup_fetch | bool
+
+    - name: Target DB backup | show backup artifact paths
+      ansible.builtin.debug:
+        msg:
+          - "Backup id: {{ target_db_backup_id_effective }}"
+          - "Remote backup dir: {{ target_db_backup_remote_dir_effective }}"
+          - "Remote backup archive: {{ target_db_backup_archive_remote_effective }}"
+          - "Local backup archive: {{ target_db_backup_local_archive_effective }}"
+          - "Local backup manifest: {{ target_db_backup_local_manifest_effective }}"

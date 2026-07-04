@@ -1,0 +1,154 @@
+---
+- name: 11A | Verify source quarantine before old source runtime image cleanup
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  vars:
+    source_runtime_image_cleanup_apply: false
+    source_runtime_image_cleanup_require_quarantine_artifact: true
+    source_runtime_image_cleanup_quarantine_artifact_dir: "/var/backups/openstack-rehome/{{ rehome_id | default(rehome_host | default(inventory_hostname)) }}/source-quarantine"
+  tasks:
+    - name: Source runtime image cleanup preflight | check source quarantine artifact
+      ansible.builtin.stat:
+        path: "{{ source_runtime_image_cleanup_quarantine_artifact_dir }}/source-quarantine.yml"
+      register: source_runtime_image_cleanup_quarantine_artifact
+
+    - name: Source runtime image cleanup preflight | require source quarantine artifact
+      ansible.builtin.assert:
+        that:
+          - source_runtime_image_cleanup_quarantine_artifact.stat.exists
+        fail_msg: >-
+          Missing {{ source_runtime_image_cleanup_quarantine_artifact_dir }}/source-quarantine.yml.
+          Run 10-source-quarantine.yml successfully before cleanup.
+      when: source_runtime_image_cleanup_require_quarantine_artifact | bool
+
+- name: 11B | Report or remove old source runtime images on re-home compute
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  vars:
+    source_runtime_image_cleanup_apply: false
+    source_runtime_image_cleanup_remote_dir: "{{ rehome_stage_dir }}/source-runtime-image-cleanup"
+    source_runtime_image_cleanup_report: "{{ source_runtime_image_cleanup_remote_dir }}/report.txt"
+  tasks:
+    - name: Source runtime image cleanup | validate image allowlist
+      ansible.builtin.assert:
+        that:
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - source_runtime_cleanup_container_images is defined
+          - source_runtime_cleanup_container_images | length > 0
+          - cleanup_allowlist_in_runtime | length == source_runtime_cleanup_container_images | length
+          - cleanup_runtime_not_dataplane | length == source_runtime_cleanup_container_images | length
+        fail_msg: >-
+          Define source_runtime_cleanup_container_images for old source runtime
+          containers only. Do not include dataplane_keep_containers.
+      vars:
+        cleanup_allowlist_in_runtime: >-
+          {{
+            source_runtime_cleanup_container_images.keys()
+            | intersect(source_runtime_switch_containers | default([]))
+            | list
+          }}
+        cleanup_runtime_not_dataplane: >-
+          {{
+            source_runtime_cleanup_container_images.keys()
+            | difference(dataplane_keep_containers | default([]))
+            | list
+          }}
+
+    - name: Source runtime image cleanup | require explicit apply for destructive mode
+      ansible.builtin.assert:
+        that:
+          - source_runtime_image_cleanup_apply | bool
+        fail_msg: >-
+          This run is report-only. Set source_runtime_image_cleanup_apply=true
+          only after burn-in and rollback window decision.
+      when: source_runtime_image_cleanup_apply | bool
+
+    - name: Source runtime image cleanup | ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ source_runtime_image_cleanup_remote_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Source runtime image cleanup | write report header
+      ansible.builtin.copy:
+        dest: "{{ source_runtime_image_cleanup_report }}"
+        mode: "0640"
+        content: |
+          source_runtime_image_cleanup_apply={{ source_runtime_image_cleanup_apply | bool }}
+          rehome_host={{ rehome_host }}
+          checked_images:
+
+    - name: Source runtime image cleanup | inspect old source runtime images
+      ansible.builtin.shell: |
+        set -euo pipefail
+        image={{ item.value | quote }}
+        name={{ item.key | quote }}
+        {
+          echo "--- ${name} ${image}"
+          if docker image inspect "$image" >/dev/null 2>&1; then
+            echo "present=yes"
+            if docker ps -a --format '{% raw %}{{.Image}}{% endraw %}' | grep -Fx "$image" >/dev/null 2>&1; then
+              echo "in_use_by_container=yes"
+            else
+              echo "in_use_by_container=no"
+            fi
+          else
+            echo "present=no"
+          fi
+        } >> {{ source_runtime_image_cleanup_report | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ source_runtime_cleanup_container_images | dict2items }}"
+      changed_when: false
+
+    - name: Source runtime image cleanup | list related containers for audit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {
+          echo
+          echo "containers:"
+          docker ps -a --format '{% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}' \
+            | awk 'BEGIN { found=0 } /nova_compute|neutron_openvswitch_agent|ovn_controller|nova_libvirt|openvswitch/ { found=1; print } END { if (!found) print "none" }'
+        } >> {{ source_runtime_image_cleanup_report | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Source runtime image cleanup | remove old source runtime images if allowed
+      ansible.builtin.shell: |
+        set -euo pipefail
+        image={{ item.value | quote }}
+        name={{ item.key | quote }}
+        {
+          echo
+          echo "--- cleanup ${name} ${image}"
+          if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "skip=absent"
+            exit 0
+          fi
+          if docker ps -a --format '{% raw %}{{.Image}}{% endraw %}' | grep -Fx "$image" >/dev/null 2>&1; then
+            echo "skip=in_use_by_container"
+            exit 0
+          fi
+          docker rmi "$image"
+          echo "removed=yes"
+        } >> {{ source_runtime_image_cleanup_report | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ source_runtime_cleanup_container_images | dict2items }}"
+      register: source_runtime_image_cleanup_remove
+      changed_when: "'removed=yes' in source_runtime_image_cleanup_remove.stdout"
+      when: source_runtime_image_cleanup_apply | bool
+
+    - name: Source runtime image cleanup | run runtime guard check after report/apply
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "11 old source runtime image cleanup"
+
+    - name: Source runtime image cleanup | show report path
+      ansible.builtin.debug:
+        msg: "Old source runtime image cleanup report: {{ source_runtime_image_cleanup_report }}"

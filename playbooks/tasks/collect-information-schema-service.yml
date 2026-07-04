@@ -1,0 +1,58 @@
+---
+- name: Schema compat | load local DB password for service query
+  ansible.builtin.set_fact:
+    schema_compat_mysql_password: >-
+      {{
+        (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[schema_compat_service_query.password_key]
+      }}
+  no_log: true
+
+- name: Schema compat | append information_schema snapshot for service DBs
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {
+      echo "SERVICE:{{ schema_compat_service_query.label }}"
+      echo "SECTION:TABLES"
+      {{ schema_compat_mysql_query_command }} <<'SQL'
+    SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COLLATION
+    FROM information_schema.TABLES
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_service_query.db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME;
+    SQL
+
+      echo "SECTION:COLUMNS"
+      {{ schema_compat_mysql_query_command }} <<'SQL'
+    SELECT TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME, COLUMN_TYPE,
+           IS_NULLABLE, COLUMN_DEFAULT, EXTRA, CHARACTER_SET_NAME, COLLATION_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_service_query.db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+    SQL
+
+      echo "SECTION:KEY_COLUMN_USAGE"
+      {{ schema_compat_mysql_query_command }} <<'SQL'
+    SELECT CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME,
+           ORDINAL_POSITION, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME,
+           REFERENCED_COLUMN_NAME
+    FROM information_schema.KEY_COLUMN_USAGE
+    WHERE CONSTRAINT_SCHEMA IN ({% for db in schema_compat_service_query.db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION;
+    SQL
+
+      echo "SECTION:STATISTICS"
+      {{ schema_compat_mysql_query_command }} <<'SQL'
+    SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME,
+           NON_UNIQUE, INDEX_TYPE
+    FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_service_query.db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+    SQL
+    } >> {{ schema_compat_report_dir }}/information-schema.tsv
+  args:
+    executable: /bin/bash
+  environment:
+    SCHEMA_COMPAT_DB_PASSWORD: "{{ schema_compat_mysql_password }}"
+    SCHEMA_COMPAT_DB_USER: "{{ schema_compat_service_query.user }}"
+    SCHEMA_COMPAT_DB_HOST: "{{ schema_compat_mysql_host }}"
+  changed_when: false
+  no_log: "{{ schema_compat_mysql_query_no_log | bool }}"

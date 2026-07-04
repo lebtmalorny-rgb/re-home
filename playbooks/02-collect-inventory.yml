@@ -1,0 +1,77 @@
+---
+- name: 02 | Collect compute-local state
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Create local artifact directory on controller
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Create compute artifact directory
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}/inventory"
+        state: directory
+        mode: "0750"
+
+    - name: Dump libvirt domain list
+      ansible.builtin.shell: |
+        set -euo pipefail
+        virsh list --all --uuid --name > {{ rehome_stage_dir }}/inventory/virsh-list.txt
+        virsh list --all --name | awk 'NF' | while read d; do virsh dumpxml "$d" > {{ rehome_stage_dir }}/inventory/"$d".xml; done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Dump local network state
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ip -br link > {{ rehome_stage_dir }}/inventory/ip-link.txt || true
+        ip -br addr > {{ rehome_stage_dir }}/inventory/ip-addr.txt || true
+        ovs-vsctl show > {{ rehome_stage_dir }}/inventory/ovs-show.txt 2>&1 || true
+        ovs-vsctl --format=json list Interface > {{ rehome_stage_dir }}/inventory/ovs-interfaces.json 2>&1 || true
+        ovs-vsctl --format=json list Port > {{ rehome_stage_dir }}/inventory/ovs-ports.json 2>&1 || true
+        ovn-sbctl show > {{ rehome_stage_dir }}/inventory/ovn-sb-show.txt 2>&1 || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Dump storage and PCI state
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ls -la {{ instances_path }} > {{ rehome_stage_dir }}/inventory/instances-path-ls.txt 2>&1 || true
+        find {{ instances_path }} -maxdepth 2 -type f -printf '%p %s\n' > {{ rehome_stage_dir }}/inventory/instances-files.txt 2>&1 || true
+        iscsiadm -m session > {{ rehome_stage_dir }}/inventory/iscsi-sessions.txt 2>&1 || true
+        rbd showmapped > {{ rehome_stage_dir }}/inventory/rbd-showmapped.txt 2>&1 || true
+        multipath -ll > {{ rehome_stage_dir }}/inventory/multipath-ll.txt 2>&1 || true
+        lspci -nn > {{ rehome_stage_dir }}/inventory/lspci.txt 2>&1 || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Archive compute inventory
+      ansible.builtin.archive:
+        path: "{{ rehome_stage_dir }}/inventory"
+        dest: "{{ rehome_stage_dir }}/compute-inventory.tar.gz"
+        format: gz
+
+    - name: Fetch compute inventory
+      ansible.builtin.fetch:
+        src: "{{ rehome_stage_dir }}/compute-inventory.tar.gz"
+        dest: "{{ local_artifact_dir }}/compute-inventory.tar.gz"
+        flat: true
+
+- name: 02 | Collect OpenStack source/target API state
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Run helper inventory script
+      ansible.builtin.command: >-
+        {{ playbook_dir }}/../scripts/export_source_inventory.sh
+        {{ source_os_cloud }} {{ target_os_cloud }} {{ rehome_host }} {{ local_artifact_dir }}
+      changed_when: false
+      when: use_os_cloud | bool

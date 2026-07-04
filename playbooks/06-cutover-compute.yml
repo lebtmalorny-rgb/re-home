@@ -1,0 +1,448 @@
+---
+- name: 06 | Kolla guarded compute cutover from source to target containers
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    cutover_apply: false
+    target_kolla_config_stage_dir: "{{ target_config_stage_dir }}/kolla"
+    cutover_container_restart_policy: "no"
+    cutover_rebind_ports_during_cutover: true
+    cutover_mount_leak_guard_path: /var/lib/nova/mnt
+    cutover_mount_leak_guard_max_entries: 128
+    cutover_target_control_host: "{{ groups['target_control'][0] }}"
+    cutover_target_clouds_file_local: >-
+      {{
+        hostvars[cutover_target_control_host].target_clouds_file_local
+        | default(target_clouds_file_local | default(''))
+      }}
+    cutover_target_clouds_remote: "{{ rehome_stage_dir }}/cutover-target-clouds.yaml"
+    cutover_target_clouds_in_container: /tmp/rehome-cutover-target-clouds.yaml
+    cutover_openstack_cli_container: "{{ openstack_cli_container | default('kolla_toolbox') }}"
+    cutover_kolla_config_dirs:
+      neutron_openvswitch_agent: neutron-openvswitch-agent
+      nova_compute: nova-compute
+    cutover_kolla_service_names:
+      neutron_openvswitch_agent: neutron-openvswitch-agent
+      nova_compute: nova-compute
+    cutover_target_container_specs:
+      - name: neutron_openvswitch_agent
+        config_dir: neutron-openvswitch-agent
+        image: "{{ target_runtime_switch_container_images.neutron_openvswitch_agent | default('') }}"
+        env:
+          - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+          - KOLLA_LEGACY_IPTABLES=false
+          - KOLLA_SERVICE_NAME=neutron-openvswitch-agent
+        volumes:
+          - /etc/kolla/neutron-openvswitch-agent:/var/lib/kolla/config_files
+          - /etc/localtime:/etc/localtime:ro
+          - /lib/modules:/lib/modules:ro
+          - /run/openvswitch:/run/openvswitch
+          - /var/lib/docker/volumes/kolla_logs/_data:/var/log/kolla
+          - /dev/shm:/dev/shm
+        ipc: private
+      - name: nova_compute
+        config_dir: nova-compute
+        image: "{{ target_runtime_switch_container_images.nova_compute | default('') }}"
+        env:
+          - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+          - LIBGUESTFS_BACKEND=direct
+          - KOLLA_SERVICE_NAME=nova-compute
+        volumes:
+          - /etc/kolla/nova-compute:/var/lib/kolla/config_files
+          - /etc/localtime:/etc/localtime:ro
+          - /lib/modules:/lib/modules:ro
+          - /run:/run
+          - /dev:/dev
+          - /var/lib/docker/volumes/kolla_logs/_data:/var/log/kolla
+          - /var/lib/docker/volumes/libvirtd/_data:/var/lib/libvirt
+          - /var/lib/docker/volumes/nova_compute/_data:/var/lib/nova
+          - /var/lib/nova/mnt:/var/lib/nova/mnt
+        ipc: host
+  tasks:
+    - name: Cutover preflight | require explicit apply and Kolla driver
+      ansible.builtin.assert:
+        that:
+          - cutover_apply | bool
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - source_runtime_switch_containers | default([]) | length > 0
+          - target_runtime_switch_containers | default([]) | length > 0
+        fail_msg: "Set cutover_apply=true and use the Kolla/Docker inventory before running cutover."
+
+    - name: Cutover preflight | validate container classification
+      ansible.builtin.assert:
+        that:
+          - unsafe_source_runtime_containers | length == 0
+          - unsafe_target_runtime_containers | length == 0
+          - target_runtime_switch_containers | default([]) | last == 'nova_compute'
+        fail_msg: >-
+          Runtime switch container lists are unsafe. Dataplane containers must stay out of
+          source/target runtime switch lists, and nova_compute must start last.
+      vars:
+        unsafe_source_runtime_containers: >-
+          {{
+            (source_runtime_switch_containers | default([]))
+            | intersect(dataplane_keep_containers | default([]))
+          }}
+        unsafe_target_runtime_containers: >-
+          {{
+            (target_runtime_switch_containers | default([]))
+            | intersect(dataplane_keep_containers | default([]))
+          }}
+
+    - name: Cutover preflight | validate target image map
+      ansible.builtin.assert:
+        that:
+          - target_runtime_switch_container_images is defined
+          - target_runtime_switch_container_images[item] is defined
+          - target_runtime_switch_container_images[item] | length > 0
+        fail_msg: "Set target_runtime_switch_container_images for every target runtime container."
+      loop: "{{ target_runtime_switch_containers | default([]) }}"
+
+    - name: Cutover preflight | ensure stage directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Cutover preflight | guard against leaked nova mnt mount entries
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import os
+        path = os.environ["CUTOVER_MOUNT_LEAK_GUARD_PATH"]
+        count = 0
+        with open("/proc/1/mountinfo", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                parts = line.split()
+                if len(parts) > 4 and parts[4].startswith(path):
+                    count += 1
+        print(count)
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        CUTOVER_MOUNT_LEAK_GUARD_PATH: "{{ cutover_mount_leak_guard_path }}"
+      register: cutover_mount_leak_guard_count
+      changed_when: false
+
+    - name: Cutover preflight | assert nova mnt mount entry count is bounded
+      ansible.builtin.assert:
+        that:
+          - cutover_mount_leak_guard_count.stdout | int <= cutover_mount_leak_guard_max_entries | int
+        fail_msg: >-
+          Refusing cutover: {{ cutover_mount_leak_guard_path }} has
+          {{ cutover_mount_leak_guard_count.stdout | int }} mount entries in /proc/1/mountinfo,
+          above limit {{ cutover_mount_leak_guard_max_entries | int }}. This usually means a
+          shared mount propagation leak; clean it in a maintenance window before cutover.
+
+    - name: Cutover preflight | verify runtime guard can see running domains
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ runtime_guard_virsh_command }} list --name | awk 'NF' | sort
+      args:
+        executable: /bin/bash
+      register: cutover_preflight_domains
+      changed_when: false
+      failed_when: cutover_preflight_domains.stdout_lines | length == 0
+
+    - name: Cutover preflight | validate staged target Kolla config files
+      ansible.builtin.stat:
+        path: "{{ target_kolla_config_stage_dir }}/{{ item.config_dir }}/config.json"
+      loop: "{{ cutover_target_container_specs }}"
+      register: cutover_staged_config_json
+
+    - name: Cutover preflight | assert staged target Kolla config files exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: >-
+          Missing staged target Kolla config.json for {{ item.item.name }} at
+          {{ target_kolla_config_stage_dir }}/{{ item.item.config_dir }}/config.json.
+          Stage full target Kolla configs before cutover; do not start target images with source configs.
+      loop: "{{ cutover_staged_config_json.results }}"
+
+    - name: Cutover preflight | validate staged Nova safe-mode settings
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nova_conf={{ (target_kolla_config_stage_dir + '/nova-compute/nova.conf') | quote }}
+        test -f "$nova_conf"
+        grep -Eq '^running_deleted_instance_action[[:space:]]*=[[:space:]]*noop$' "$nova_conf"
+        grep -Eq '^running_deleted_instance_poll_interval[[:space:]]*=[[:space:]]*0$' "$nova_conf"
+        grep -Eq '^sync_power_state_interval[[:space:]]*=[[:space:]]*-1$' "$nova_conf"
+        grep -Eq '^enable_new_services[[:space:]]*=[[:space:]]*false$' "$nova_conf"
+        grep -Eq '^handle_virt_lifecycle_events[[:space:]]*=[[:space:]]*false$' "$nova_conf"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Cutover preflight | verify target images are already present
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - image
+          - inspect
+          - "{{ target_runtime_switch_container_images[item] }}"
+      loop: "{{ target_runtime_switch_containers | default([]) }}"
+      changed_when: false
+
+    - name: Cutover preflight | load re-home manifest
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+        name: cutover_manifest
+      delegate_to: localhost
+      become: false
+
+    - name: Cutover preflight | build manifest port list
+      ansible.builtin.set_fact:
+        cutover_manifest_ports: >-
+          {{
+            cutover_manifest.rehome_instances
+            | default(cutover_manifest.get('openstack', {}).get('rehome_instances', []), true)
+            | default(cutover_manifest.source.instances | default([]), true)
+            | map(attribute='ports')
+            | list
+            | flatten
+          }}
+
+    - name: Cutover preflight | validate target Neutron rebind inputs
+      ansible.builtin.assert:
+        that:
+          - not (cutover_rebind_ports_during_cutover | bool) or cutover_manifest_ports | length > 0
+          - not (cutover_rebind_ports_during_cutover | bool) or cutover_target_clouds_file_local | length > 0
+          - not (cutover_rebind_ports_during_cutover | bool) or target_cloud_name | length > 0
+          - not (cutover_rebind_ports_during_cutover | bool) or cutover_openstack_cli_container | length > 0
+        fail_msg: "Set manifest_file, target_clouds_file_local, target_cloud_name and openstack_cli_container for in-cutover Neutron rebind."
+
+    - name: Cutover preflight | ensure target control re-home directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: "{{ cutover_target_control_host }}"
+      when: cutover_rebind_ports_during_cutover | bool
+
+    - name: Cutover preflight | place target clouds.yaml on target control
+      ansible.builtin.copy:
+        src: "{{ cutover_target_clouds_file_local }}"
+        dest: "{{ cutover_target_clouds_remote }}"
+        mode: "0600"
+      delegate_to: "{{ cutover_target_control_host }}"
+      when: cutover_rebind_ports_during_cutover | bool
+      no_log: true
+
+    - name: Cutover preflight | place target clouds.yaml inside OpenStack CLI container
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker cp {{ cutover_target_clouds_remote | quote }} {{ cutover_openstack_cli_container | quote }}:{{ cutover_target_clouds_in_container | quote }}
+        docker exec -u 0 {{ cutover_openstack_cli_container | quote }} chmod 0644 {{ cutover_target_clouds_in_container | quote }}
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ cutover_target_control_host }}"
+      changed_when: true
+      when: cutover_rebind_ports_during_cutover | bool
+
+    - name: Cutover preflight | verify target Neutron ports are visible before source stop
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ cutover_target_clouds_in_container | quote }} \
+          {{ cutover_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          port show {{ item.id | quote }} -f value -c id -c binding_host_id -c status -c device_id
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ cutover_target_control_host }}"
+      loop: "{{ cutover_manifest_ports }}"
+      register: cutover_target_port_preflight
+      changed_when: false
+      when: cutover_rebind_ports_during_cutover | bool
+
+    - name: Cutover preflight | create VM runtime baseline
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: baseline
+        runtime_guard_label: "before Kolla compute cutover"
+
+    - name: Cutover audit | save source container inspect before cutover
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ container_runtime_cli }} inspect {{ source_runtime_switch_containers | join(' ') }} \
+          > {{ rehome_stage_dir }}/source-runtime-containers-before-cutover.json
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Cutover config | backup current Kolla runtime configs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        backup_dir={{ (rehome_stage_dir + '/source-kolla-config-before-cutover') | quote }}
+        mkdir -p "$backup_dir"
+        {% for container in target_runtime_switch_containers | default([]) %}
+        rsync -a /etc/kolla/{{ cutover_kolla_config_dirs[container] }}/ "$backup_dir"/{{ cutover_kolla_config_dirs[container] }}/
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Cutover config | install staged target Kolla runtime configs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% for container in target_runtime_switch_containers | default([]) %}
+        mkdir -p /etc/kolla/{{ cutover_kolla_config_dirs[container] }}
+        rsync -a --delete {{ target_kolla_config_stage_dir }}/{{ cutover_kolla_config_dirs[container] }}/ /etc/kolla/{{ cutover_kolla_config_dirs[container] }}/
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Cutover stop | stop source Kolla container systemd units
+      ansible.builtin.shell: |
+        set -euo pipefail
+        unit="kolla-{{ item }}-container.service"
+        if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | awk '{print $1}' | grep -Fx "$unit" >/dev/null; then
+          state="$(systemctl is-active "$unit" || true)"
+          if [ "$state" = "active" ] || [ "$state" = "activating" ]; then
+            systemctl stop "$unit"
+            echo "STOPPED $unit"
+          else
+            echo "INACTIVE $unit"
+          fi
+          systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+        else
+          echo "MISSING $unit"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ source_runtime_switch_containers | default([]) }}"
+      register: cutover_source_kolla_unit_stop
+      changed_when: "'STOPPED ' in cutover_source_kolla_unit_stop.stdout"
+
+    - name: Cutover stop | stop source runtime containers only
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if {{ container_runtime_cli }} ps --format '{% raw %}{{.Names}}{% endraw %}' | grep -qx '{{ item }}'; then
+          docker stop {{ item }}
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ source_runtime_switch_containers | default([]) }}"
+      changed_when: true
+
+    - name: Cutover guard | verify VM after stopping source runtime containers
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after source runtime containers stopped"
+
+    - name: Cutover start | start target network containers before nova_compute
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker rm -f {{ item.name }} >/dev/null 2>&1 || true
+        docker run -d {{ cutover_docker_run_options | join(' ') }} {{ item.image | quote }} \
+          --single-child -- kolla_start
+      args:
+        executable: /bin/bash
+      loop: "{{ cutover_target_container_specs }}"
+      when:
+        - item.name in target_runtime_switch_containers
+        - item.name != 'nova_compute'
+      changed_when: true
+      vars:
+        cutover_docker_run_options: >-
+          {{
+            [
+              '--name', item.name,
+              '--hostname', rehome_host,
+              '--net=host',
+              '--privileged',
+              '--restart=' + cutover_container_restart_policy,
+              '--entrypoint', 'dumb-init'
+            ]
+            + ((item.ipc | default('') | length > 0) | ternary(['--ipc=' + item.ipc], []))
+            + (item.env | default([]) | map('regex_replace', '^(.*)$', '-e \1') | list)
+            + (item.volumes | default([]) | map('regex_replace', '^(.*)$', '-v \1') | list)
+          }}
+
+    - name: Cutover network | rebind target Neutron ports to re-home host
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ cutover_target_clouds_in_container | quote }} \
+          {{ cutover_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          port set --host {{ rehome_host | quote }} {{ item.id | quote }}
+        docker exec \
+          -e OS_CLIENT_CONFIG_FILE={{ cutover_target_clouds_in_container | quote }} \
+          {{ cutover_openstack_cli_container | quote }} \
+          openstack --os-cloud {{ target_cloud_name | quote }} \
+          port show {{ item.id | quote }} -f value -c id -c binding_host_id -c status -c device_id
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ cutover_target_control_host }}"
+      loop: "{{ cutover_manifest_ports }}"
+      register: cutover_target_port_rebind
+      changed_when: true
+      when: cutover_rebind_ports_during_cutover | bool
+
+    - name: Cutover network | wait briefly for target Neutron agent to process rebound ports
+      ansible.builtin.pause:
+        seconds: 5
+      when: cutover_rebind_ports_during_cutover | bool
+
+    - name: Cutover guard | verify VM after target network containers started
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after target network containers started"
+
+    - name: Cutover start | start target nova_compute last
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker rm -f {{ item.name }} >/dev/null 2>&1 || true
+        docker run -d {{ cutover_docker_run_options | join(' ') }} {{ item.image | quote }} \
+          --single-child -- kolla_start
+      args:
+        executable: /bin/bash
+      loop: "{{ cutover_target_container_specs }}"
+      when:
+        - item.name in target_runtime_switch_containers
+        - item.name == 'nova_compute'
+      changed_when: true
+      vars:
+        cutover_docker_run_options: >-
+          {{
+            [
+              '--name', item.name,
+              '--hostname', rehome_host,
+              '--net=host',
+              '--privileged',
+              '--restart=' + cutover_container_restart_policy,
+              '--entrypoint', 'dumb-init'
+            ]
+            + ((item.ipc | default('') | length > 0) | ternary(['--ipc=' + item.ipc], []))
+            + (item.env | default([]) | map('regex_replace', '^(.*)$', '-e \1') | list)
+            + (item.volumes | default([]) | map('regex_replace', '^(.*)$', '-v \1') | list)
+          }}
+
+    - name: Cutover guard | verify VM after target nova_compute started
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after target nova_compute started"
+
+    - name: Cutover audit | show target runtime container status
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ container_runtime_cli }} ps --filter name='neutron_openvswitch_agent' --filter name='nova_compute' \
+          --format '{% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}' | sort
+      args:
+        executable: /bin/bash
+      register: cutover_target_container_status
+      changed_when: false
+
+    - name: Cutover audit | print target runtime container status
+      ansible.builtin.debug:
+        var: cutover_target_container_status.stdout_lines

@@ -1,0 +1,69 @@
+---
+- name: 04D | Generate target SQL import draft from reviewed source rows
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    target_sql_draft_source_rows_dir: "{{ local_artifact_dir }}/source-db-rows"
+    target_sql_draft_source_information_schema: "{{ schema_compat_local_artifact_dir }}/source/information-schema.tsv"
+    target_sql_draft_dir: "{{ local_artifact_dir }}/target-db-import-sql-draft"
+    target_sql_draft_summary_json: "{{ local_artifact_dir }}/target-db-import-sql-draft-summary.json"
+    target_sql_draft_summary_yaml: "{{ local_artifact_dir }}/target-db-import-sql-draft-summary.yml"
+    target_sql_draft_summary_md: "{{ local_artifact_dir }}/target-db-import-sql-draft-summary.md"
+    target_sql_draft_source_rows_manifest: "{{ target_sql_draft_source_rows_dir }}/source-db-row-query-manifest.json"
+  tasks:
+    - name: Target SQL draft | validate local input artifacts
+      ansible.builtin.assert:
+        that:
+          - target_sql_draft_source_rows_dir is directory
+          - target_sql_draft_source_rows_manifest is file
+          - target_sql_draft_source_information_schema is file
+        fail_msg: "Run 03a/03b and 04c before generating the target SQL draft."
+
+    - name: Target SQL draft | reset output directory
+      ansible.builtin.file:
+        path: "{{ target_sql_draft_dir }}"
+        state: absent
+
+    - name: Target SQL draft | create output directory
+      ansible.builtin.file:
+        path: "{{ target_sql_draft_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target SQL draft | generate hard-stopped SQL draft files
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/generate_target_sql_draft.py"
+          - --source-db-rows-dir
+          - "{{ target_sql_draft_source_rows_dir }}"
+          - --source-information-schema
+          - "{{ target_sql_draft_source_information_schema }}"
+          - --out-dir
+          - "{{ target_sql_draft_dir }}"
+          - --out-json
+          - "{{ target_sql_draft_summary_json }}"
+          - --out-yaml
+          - "{{ target_sql_draft_summary_yaml }}"
+          - --out-md
+          - "{{ target_sql_draft_summary_md }}"
+      changed_when: true
+
+    - name: Target SQL draft | assert every generated SQL file has a hard-stop
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for f in {{ target_sql_draft_dir }}/*.sql; do
+          grep -q "SIGNAL SQLSTATE '45000'" "$f"
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Target SQL draft | show generated artifacts
+      ansible.builtin.debug:
+        msg:
+          - "Draft SQL dir: {{ target_sql_draft_dir }}"
+          - "Summary JSON: {{ target_sql_draft_summary_json }}"
+          - "Summary YAML: {{ target_sql_draft_summary_yaml }}"
+          - "Summary Markdown: {{ target_sql_draft_summary_md }}"

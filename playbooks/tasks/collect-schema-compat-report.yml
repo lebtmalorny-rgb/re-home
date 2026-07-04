@@ -1,0 +1,145 @@
+---
+- name: Schema compat | validate side
+  ansible.builtin.assert:
+    that:
+      - schema_compat_side in ['source', 'target']
+    fail_msg: "schema_compat_side must be source or target"
+
+- name: Schema compat | ensure remote report directory exists
+  ansible.builtin.file:
+    path: "{{ schema_compat_report_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Schema compat | collect normalized DB migration versions
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {
+      echo "[nova_api_db_version]"
+      {{ schema_compat_nova_manage_command }} api_db version
+      echo "[nova_cell_db_version]"
+      {{ schema_compat_nova_manage_command }} db version
+      echo "[neutron_db_heads]"
+      {{ schema_compat_neutron_db_manage_command }} current | awk '/\(head\)/ { print }' | sort
+      {% if schema_compat_cinder_enabled | bool %}
+      echo "[cinder_db_version]"
+      {{ schema_compat_cinder_manage_command }} db version
+      {% endif %}
+    } > {{ schema_compat_report_dir }}/versions-normalized.txt
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Schema compat | collect detailed DB migration report
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {
+      echo "side={{ schema_compat_side }}"
+      echo "inventory_hostname={{ inventory_hostname }}"
+      echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo
+      echo "## nova-manage api_db version"
+      {{ schema_compat_nova_manage_command }} api_db version
+      echo
+      echo "## nova-manage db version"
+      {{ schema_compat_nova_manage_command }} db version
+      echo
+      echo "## neutron-db-manage current"
+      {{ schema_compat_neutron_db_manage_command }} current
+      echo
+      echo "## neutron-db-manage current --verbose"
+      {{ schema_compat_neutron_db_manage_command }} current --verbose
+      {% if schema_compat_cinder_enabled | bool %}
+      echo
+      echo "## cinder-manage db version"
+      {{ schema_compat_cinder_manage_command }} db version
+      {% endif %}
+    } > {{ schema_compat_report_dir }}/versions-report.txt
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Schema compat | load local Kolla DB password for information_schema query
+  ansible.builtin.set_fact:
+    schema_compat_mysql_password: >-
+      {{
+        (lookup('file', schema_compat_kolla_passwords_file_local) | from_yaml)[schema_compat_kolla_database_password_key]
+      }}
+  no_log: true
+  when:
+    - schema_compat_kolla_passwords_file_local is defined
+    - schema_compat_mysql_service_queries | default([]) | length == 0
+
+- name: Schema compat | collect information_schema snapshot
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ schema_compat_mysql_query_command }} > {{ schema_compat_report_dir }}/information-schema.tsv <<'SQL'
+    SELECT 'SECTION:TABLES';
+    SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COLLATION
+    FROM information_schema.TABLES
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+    SELECT 'SECTION:COLUMNS';
+    SELECT TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME, COLUMN_TYPE,
+           IS_NULLABLE, COLUMN_DEFAULT, EXTRA, CHARACTER_SET_NAME, COLLATION_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+
+    SELECT 'SECTION:KEY_COLUMN_USAGE';
+    SELECT CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME,
+           ORDINAL_POSITION, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME,
+           REFERENCED_COLUMN_NAME
+    FROM information_schema.KEY_COLUMN_USAGE
+    WHERE CONSTRAINT_SCHEMA IN ({% for db in schema_compat_db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION;
+
+    SELECT 'SECTION:STATISTICS';
+    SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME,
+           NON_UNIQUE, INDEX_TYPE
+    FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA IN ({% for db in schema_compat_db_names %}'{{ db }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+    SQL
+  args:
+    executable: /bin/bash
+  environment:
+    SCHEMA_COMPAT_DB_PASSWORD: "{{ schema_compat_mysql_password | default('') }}"
+    SCHEMA_COMPAT_DB_USER: "{{ schema_compat_mysql_query_user }}"
+    SCHEMA_COMPAT_DB_HOST: "{{ schema_compat_mysql_host }}"
+  changed_when: false
+  no_log: "{{ schema_compat_mysql_query_no_log | bool }}"
+  when: schema_compat_mysql_service_queries | default([]) | length == 0
+
+- name: Schema compat | reset service-user information_schema snapshot
+  ansible.builtin.copy:
+    dest: "{{ schema_compat_report_dir }}/information-schema.tsv"
+    mode: "0640"
+    content: ""
+  when: schema_compat_mysql_service_queries | default([]) | length > 0
+
+- name: Schema compat | collect service-user information_schema snapshots
+  ansible.builtin.include_tasks: collect-information-schema-service.yml
+  loop: "{{ schema_compat_mysql_service_queries }}"
+  loop_control:
+    loop_var: schema_compat_service_query
+  when: schema_compat_mysql_service_queries | default([]) | length > 0
+
+- name: Schema compat | ensure local artifact directory exists
+  ansible.builtin.file:
+    path: "{{ schema_compat_local_artifact_dir }}/{{ schema_compat_side }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+
+- name: Schema compat | fetch report artifacts
+  ansible.builtin.fetch:
+    src: "{{ schema_compat_report_dir }}/{{ item }}"
+    dest: "{{ schema_compat_local_artifact_dir }}/{{ schema_compat_side }}/{{ item }}"
+    flat: true
+  loop:
+    - versions-normalized.txt
+    - versions-report.txt
+    - information-schema.tsv

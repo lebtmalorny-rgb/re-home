@@ -1,0 +1,48 @@
+---
+- name: 03 | Backup source databases
+  hosts: source_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Create backup directory on source DB node
+      ansible.builtin.file:
+        path: "/var/backups/openstack-rehome/{{ rehome_id }}"
+        state: directory
+        mode: "0700"
+
+    - name: Dump source DBs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mariadb-dump --defaults-extra-file={{ mysql_defaults_file | quote }} \
+          --single-transaction --routines --events --databases {{ source_db_names | join(' ') }} \
+          > /var/backups/openstack-rehome/{{ rehome_id }}/source-full.sql
+        mariadb-dump --defaults-extra-file={{ mysql_defaults_file | quote }} \
+          --no-data --databases {{ source_db_names | join(' ') }} \
+          > /var/backups/openstack-rehome/{{ rehome_id }}/source-schema.sql
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+- name: 03 | Backup target databases before import
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Create backup directory on target DB node
+      ansible.builtin.file:
+        path: "/var/backups/openstack-rehome/{{ rehome_id }}"
+        state: directory
+        mode: "0700"
+
+    - name: Dump target DBs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mariadb-dump --defaults-extra-file={{ mysql_defaults_file | quote }} \
+          --single-transaction --routines --events --databases {{ target_db_names | join(' ') }} \
+          > /var/backups/openstack-rehome/{{ rehome_id }}/target-preimport-full.sql
+        mariadb-dump --defaults-extra-file={{ mysql_defaults_file | quote }} \
+          --no-data --databases {{ target_db_names | join(' ') }} \
+          > /var/backups/openstack-rehome/{{ rehome_id }}/target-preimport-schema.sql
+      args:
+        executable: /bin/bash
+      changed_when: true

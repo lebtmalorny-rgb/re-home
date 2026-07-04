@@ -1,0 +1,98 @@
+---
+- name: 04i | Pre-pull target Kolla runtime images on re-home compute
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  vars:
+    target_image_prepull_report_dir: "{{ rehome_stage_dir }}/target-image-prepull"
+    target_image_prepull_digest_report: "{{ target_image_prepull_report_dir }}/target-image-digests.txt"
+    target_image_prepull_local_digest_report: "{{ local_artifact_dir }}/target-image-digests.txt"
+  tasks:
+    - name: Target image pre-pull | validate Kolla Docker inputs
+      ansible.builtin.assert:
+        that:
+          - deployment_driver == 'kolla'
+          - container_runtime_cli == 'docker'
+          - target_runtime_switch_containers | default([]) | length > 0
+          - target_runtime_switch_container_images is defined
+          - local_artifact_dir is defined
+          - local_artifact_dir | length > 0
+        fail_msg: "Set Kolla/Docker target runtime container image map before pre-pulling target images."
+
+    - name: Target image pre-pull | validate target image map
+      ansible.builtin.assert:
+        that:
+          - target_runtime_switch_container_images[item] is defined
+          - target_runtime_switch_container_images[item] | length > 0
+        fail_msg: "Missing target image for {{ item }} in target_runtime_switch_container_images."
+      loop: "{{ target_runtime_switch_containers }}"
+
+    - name: Target image pre-pull | ensure local artifact directory exists
+      ansible.builtin.file:
+        path: "{{ local_artifact_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Target image pre-pull | ensure remote report directory exists
+      ansible.builtin.file:
+        path: "{{ target_image_prepull_report_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Target image pre-pull | inspect target images before pull
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - image
+          - inspect
+          - "{{ target_runtime_switch_container_images[item] }}"
+      loop: "{{ target_runtime_switch_containers }}"
+      register: target_image_inspect_before_results
+      failed_when: false
+      changed_when: false
+
+    - name: Target image pre-pull | pull target runtime images
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - pull
+          - "{{ target_runtime_switch_container_images[item] }}"
+      loop: "{{ target_runtime_switch_containers }}"
+      register: target_image_pull_result
+      changed_when: "'Image is up to date' not in target_image_pull_result.stdout"
+
+    - name: Target image pre-pull | inspect target image RepoDigests after pull
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime_cli }}"
+          - image
+          - inspect
+          - "--format"
+          - "{% raw %}{{.Id}} {{json .RepoDigests}}{% endraw %}"
+          - "{{ target_runtime_switch_container_images[item] }}"
+      loop: "{{ target_runtime_switch_containers }}"
+      register: target_image_digest_results
+      changed_when: false
+
+    - name: Target image pre-pull | write digest report
+      ansible.builtin.copy:
+        dest: "{{ target_image_prepull_digest_report }}"
+        mode: "0640"
+        content: |
+          target_image_prepull_report
+          rehome_host={{ rehome_host }}
+          inventory_hostname={{ inventory_hostname }}
+          {% for result in target_image_digest_results.results %}
+
+          container={{ result.item }}
+          image={{ target_runtime_switch_container_images[result.item] }}
+          digest={{ result.stdout }}
+          {% endfor %}
+
+    - name: Target image pre-pull | fetch digest report locally
+      ansible.builtin.fetch:
+        src: "{{ target_image_prepull_digest_report }}"
+        dest: "{{ target_image_prepull_local_digest_report }}"
+        flat: true

@@ -1,0 +1,166 @@
+# Unique label for audit artifacts.
+rehome_id: "rehome-{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+
+# Compute identity. Must match Nova CONF.host and hypervisor_hostname used by source.
+rehome_host: "compute-023"
+hypervisor_hostname: "compute-023"
+instances_path: "/var/lib/nova/instances"
+
+# Target cell UUID. Fill after `nova-manage cell_v2 list_cells` on target.
+target_cell_uuid: "REPLACE_WITH_TARGET_CELL_UUID"
+
+# Backend: ovs, ovn, linuxbridge, sriov, hybrid.
+network_backend: "ovs"
+
+# Deployment driver. The lab uses Kolla containers on Docker, but the
+# source-only service guard also supports systemd units for non-Kolla hosts.
+deployment_driver: "kolla"
+container_runtime_cli: "docker"
+
+# Whether playbook 04 is allowed to run DB migrations on target.
+allow_target_db_sync: false
+allow_target_sql_import: false
+
+# Host-scoped SQL files prepared and reviewed by operators.
+# They are copied to the target DB node and imported in order.
+target_sql_files:
+  - "sql-skeleton/10-keystone-projects-users-optional.sql"
+  - "sql-skeleton/20-neutron-networks-ports-sg.sql"
+  - "sql-skeleton/30-cinder-volumes-attachments.sql"
+  - "sql-skeleton/40-nova-api-instance-mappings-request-specs.sql"
+  - "sql-skeleton/50-nova-cell-instances-bdm-info-cache.sql"
+  - "sql-skeleton/60-nova-cell-compute-nodes-services-if-needed.sql"
+
+# Read-only schema compatibility check commands. Override these for Kolla or
+# any environment where management commands run inside containers.
+schema_compat_db_names: "{{ target_db_names }}"
+schema_compat_report_dir: "{{ rehome_stage_dir }}/schema-compat"
+schema_compat_local_artifact_dir: "{{ playbook_dir }}/../artifacts/schema-compat/{{ source_cluster_name | default('source') }}-to-{{ target_cluster_name | default('target') }}"
+schema_compat_nova_manage_command: "nova-manage"
+schema_compat_neutron_db_manage_command: "neutron-db-manage"
+schema_compat_cinder_manage_command: "cinder-manage"
+schema_compat_cinder_enabled: true
+schema_compat_mysql_query_command: "mysql --defaults-extra-file={{ mysql_defaults_file | quote }} --batch --raw --skip-column-names"
+schema_compat_mysql_query_user: "root"
+schema_compat_mysql_host: "127.0.0.1"
+schema_compat_mysql_query_no_log: false
+schema_compat_kolla_database_password_key: "database_password"
+schema_compat_mysql_service_queries: []
+
+# MariaDB DB names. Adjust cell DB name(s).
+source_db_names:
+  - keystone
+  - nova_api
+  - nova_cell0
+  - nova
+  - neutron
+  - cinder
+  - placement
+target_db_names:
+  - keystone
+  - nova_api
+  - nova_cell0
+  - nova
+  - neutron
+  - cinder
+  - placement
+
+# Source DB row collector used after target API prep and DB import planning.
+# Set service users/password keys in environment-specific inventory.
+source_db_rows_nova_cell_db_name: "nova"
+source_db_row_service_queries: []
+
+# Services on the compute host are intentionally split into three groups.
+# 1. source_only_*: explicitly approved non-runtime services present only in CP-A.
+#    They may be stopped before cutover, one by one, with VM runtime guards.
+# 2. *_runtime_switch_*: services switched only inside the cutover window.
+# 3. dataplane_keep_*: services that must not be stopped during re-home.
+source_only_containers: []
+source_only_systemd_units: []
+ignored_source_containers: []
+ignored_source_systemd_units: []
+
+source_runtime_switch_containers:
+  - nova_compute
+  - neutron_openvswitch_agent
+  - ovn_controller
+
+target_runtime_switch_containers:
+  - neutron_openvswitch_agent
+  - ovn_controller
+  - nova_compute
+
+source_runtime_switch_systemd_units:
+  - nova-compute
+  - neutron-openvswitch-agent
+  - ovn-controller
+
+target_runtime_switch_systemd_units:
+  - neutron-openvswitch-agent
+  - ovn-controller
+  - nova-compute
+
+dataplane_keep_containers:
+  - nova_libvirt
+  - openvswitch_db
+  - openvswitch_vswitchd
+  - iscsid
+  - multipathd
+
+dataplane_keep_systemd_units:
+  - libvirtd
+  - virtqemud
+  - openvswitch
+  - openvswitch-switch
+  - iscsid
+  - multipathd
+
+# Backward-compatible generic names used by the original skeleton playbooks.
+source_compute_units: "{{ source_runtime_switch_systemd_units }}"
+target_compute_units: "{{ target_runtime_switch_systemd_units }}"
+
+# Runtime guard. Keep probe targets empty in a generic inventory; set them in a
+# lab or production inventory to one or more VM IPs that must stay reachable.
+runtime_guard_enabled: true
+runtime_guard_compare_domain_interfaces: true
+runtime_guard_compare_ovs_ports: false
+runtime_guard_virsh_command: "virsh"
+runtime_guard_ping_count: 3
+runtime_guard_ping_timeout: 1
+runtime_guard_probe_delegate: "{{ inventory_hostname }}"
+runtime_guard_probe_targets: []
+
+# Safe-mode Nova options for first target boot.
+nova_safe_mode:
+  running_deleted_instance_action: noop
+  running_deleted_instance_poll_interval: 0
+  sync_power_state_interval: -1
+  resume_guests_state_on_host_boot: false
+  enable_new_services: false
+  handle_virt_lifecycle_events: false
+
+# Paths on compute.
+rehome_stage_dir: "/var/tmp/openstack-rehome"
+source_config_backup_dir: "/var/tmp/openstack-rehome/source-config-backup"
+target_config_stage_dir: "/var/tmp/openstack-rehome/target-config-stage"
+
+# Local artifact path on the Ansible runner.
+local_artifact_dir: "{{ playbook_dir }}/../artifacts/{{ rehome_host }}"
+
+# Manifest collection. For Kolla, provide local generated clouds.yaml files and
+# run OpenStack CLI through kolla_toolbox on source/target control nodes.
+manifest_remote_dir: "{{ rehome_stage_dir }}/manifest"
+source_clouds_file_local: ""
+target_clouds_file_local: ""
+source_cloud_name: "{{ source_os_cloud }}"
+target_cloud_name: "{{ target_os_cloud }}"
+openstack_cli_container: "kolla_toolbox"
+
+# OpenStack CLI environment mode.
+# Either use OS_CLOUD values or source openrc files in shell commands.
+source_os_cloud: "source-admin"
+target_os_cloud: "target-admin"
+use_os_cloud: true
+
+# Optional: list of instances and ports after manifest generation.
+manifest_file: "{{ local_artifact_dir }}/rehome_manifest.yml"

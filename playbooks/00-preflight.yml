@@ -1,0 +1,110 @@
+---
+- name: 00 | Preflight on compute host
+  hosts: rehome_compute
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Ensure stage directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ rehome_stage_dir }}"
+        - "{{ source_config_backup_dir }}"
+        - "{{ target_config_stage_dir }}"
+
+    - name: Read nova CONF.host from active source config
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import configparser
+        c=configparser.ConfigParser()
+        c.read(['/etc/nova/nova.conf'])
+        print(c.get('DEFAULT','host',fallback='{{ ansible_hostname }}'))
+        PY
+      args:
+        executable: /bin/bash
+      register: nova_conf_host
+      changed_when: false
+
+    - name: Read instances_path from active source config
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import configparser
+        c=configparser.ConfigParser()
+        c.read(['/etc/nova/nova.conf'])
+        print(c.get('DEFAULT','instances_path',fallback='/var/lib/nova/instances'))
+        PY
+      args:
+        executable: /bin/bash
+      register: nova_instances_path
+      changed_when: false
+
+    - name: Check libvirt is active
+      ansible.builtin.command: systemctl is-active libvirtd
+      register: libvirtd_active
+      changed_when: false
+      failed_when: libvirtd_active.rc != 0
+
+    - name: List running libvirt domains
+      ansible.builtin.command: virsh list --name
+      register: virsh_running
+      changed_when: false
+
+    - name: Assert identity invariants
+      ansible.builtin.assert:
+        that:
+          - nova_conf_host.stdout == rehome_host
+          - nova_instances_path.stdout == instances_path
+          - virsh_running.stdout_lines | length > 0
+        fail_msg: >-
+          Preflight failed. CONF.host, instances_path, or running domains are not as expected.
+          CONF.host={{ nova_conf_host.stdout }}, instances_path={{ nova_instances_path.stdout }}, domains={{ virsh_running.stdout_lines | length }}
+
+- name: 00 | Preflight on target control plane
+  hosts: target_control[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Check target Nova DB versions
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nova-manage api_db version
+        nova-manage db version
+      args:
+        executable: /bin/bash
+      register: target_nova_db_versions
+      changed_when: false
+
+    - name: Check target Neutron DB current heads
+      ansible.builtin.shell: |
+        set -euo pipefail
+        neutron-db-manage current --verbose
+      args:
+        executable: /bin/bash
+      register: target_neutron_current
+      changed_when: false
+
+    - name: Check target Cinder DB version if cinder-manage exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if command -v cinder-manage >/dev/null 2>&1; then cinder-manage db version; else echo 'cinder-manage not installed'; fi
+      args:
+        executable: /bin/bash
+      register: target_cinder_db_version
+      changed_when: false
+
+    - name: List target cells
+      ansible.builtin.command: nova-manage cell_v2 list_cells --verbose
+      register: target_cells
+      changed_when: false
+
+    - name: Show preflight outputs
+      ansible.builtin.debug:
+        msg:
+          nova: "{{ target_nova_db_versions.stdout_lines }}"
+          neutron: "{{ target_neutron_current.stdout_lines[-10:] }}"
+          cinder: "{{ target_cinder_db_version.stdout_lines }}"
+          cells: "{{ target_cells.stdout_lines }}"

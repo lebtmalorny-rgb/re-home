@@ -1,0 +1,116 @@
+---
+- name: 05A | Disable source-only non-runtime services with VM guard
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Source-only guard | validate container classification
+      ansible.builtin.assert:
+        that:
+          - unsafe_source_only_containers | length == 0
+        fail_msg: >-
+          These source_only_containers are not safe for pre-cutover stop:
+          {{ unsafe_source_only_containers }}. Move them to runtime switch or
+          dataplane keep lists.
+      vars:
+        unsafe_source_only_containers: >-
+          {{
+            (source_only_containers | default([]))
+            | intersect(
+                (dataplane_keep_containers | default([]))
+                + (source_runtime_switch_containers | default([]))
+                + (target_runtime_switch_containers | default([]))
+              )
+          }}
+
+    - name: Source-only guard | validate systemd classification
+      ansible.builtin.assert:
+        that:
+          - unsafe_source_only_systemd_units | length == 0
+        fail_msg: >-
+          These source_only_systemd_units are not safe for pre-cutover stop:
+          {{ unsafe_source_only_systemd_units }}. Move them to runtime switch or
+          dataplane keep lists.
+      vars:
+        unsafe_source_only_systemd_units: >-
+          {{
+            (source_only_systemd_units | default([]))
+            | intersect(
+                (dataplane_keep_systemd_units | default([]))
+                + (source_runtime_switch_systemd_units | default([]))
+                + (target_runtime_switch_systemd_units | default([]))
+              )
+          }}
+
+    - name: Source-only guard | ensure stage directory exists
+      ansible.builtin.file:
+        path: "{{ rehome_stage_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Source-only guard | list running containers for operator audit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if command -v {{ container_runtime_cli }} >/dev/null 2>&1; then
+          {{ container_runtime_cli }} ps --format '{% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}' | sort
+        else
+          echo "{{ container_runtime_cli }} unavailable"
+        fi
+      args:
+        executable: /bin/bash
+      register: source_running_containers
+      changed_when: false
+      when: deployment_driver == 'kolla'
+
+    - name: Source-only guard | save running container audit
+      ansible.builtin.copy:
+        dest: "{{ rehome_stage_dir }}/source-running-containers-before-05a.txt"
+        mode: "0640"
+        content: "{{ source_running_containers.stdout | default('not collected') }}\n"
+      when: deployment_driver == 'kolla'
+
+    - name: Source-only guard | list active systemd units for operator audit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        systemctl list-units --type=service --state=running --no-pager --plain \
+          | awk '{print $1}' \
+          | grep -E 'nova|neutron|ovn|ovs|libvirt|qemu|masakari|watcher|mistral|ceilometer|prometheus|fluentd|hacluster|pacemaker' \
+          | sort || true
+      args:
+        executable: /bin/bash
+      register: source_running_systemd_units
+      changed_when: false
+
+    - name: Source-only guard | save running systemd audit
+      ansible.builtin.copy:
+        dest: "{{ rehome_stage_dir }}/source-running-systemd-before-05a.txt"
+        mode: "0640"
+        content: "{{ source_running_systemd_units.stdout | default('not collected') }}\n"
+
+    - name: Source-only guard | create VM runtime baseline
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: baseline
+        runtime_guard_label: "before source-only service stop"
+
+    - name: Source-only guard | stop approved source-only systemd units one by one
+      ansible.builtin.include_tasks: tasks/guarded-stop-systemd-unit.yml
+      loop: "{{ source_only_systemd_units | default([]) }}"
+      loop_control:
+        loop_var: source_only_systemd_unit_name
+      when: source_only_systemd_units | default([]) | length > 0
+
+    - name: Source-only guard | stop approved source-only containers one by one
+      ansible.builtin.include_tasks: tasks/guarded-stop-container.yml
+      loop: "{{ source_only_containers | default([]) }}"
+      loop_control:
+        loop_var: source_only_container_name
+      when:
+        - deployment_driver == 'kolla'
+        - source_only_containers | default([]) | length > 0
+
+    - name: Source-only guard | final VM runtime check
+      ansible.builtin.include_tasks: tasks/runtime-guard.yml
+      vars:
+        runtime_guard_mode: check
+        runtime_guard_label: "after all approved source-only services"
