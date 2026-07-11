@@ -225,311 +225,51 @@
         - "{{ live_discovery_run_control_dir }}"
         - "{{ live_discovery_run_control_dir }}/owners"
 
-    - name: Live discovery | acquire persistent sibling run owner lock
-      ansible.builtin.command:
-        argv:
-          - mkdir
-          - --
-          - "{{ live_discovery_run_owner_dir }}"
-      changed_when: true
-
-    - name: Live discovery | persist unpredictable run owner identity
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_run_owner_dir }}/run-owner.json"
-        mode: "0600"
-        content: >-
-          {{ {'schema_version': 'openstack-rehome-run-owner/v1alpha1',
-              'run_id': live_discovery_frozen_run_id,
-              'owner_token': live_discovery_run_owner_token,
-              'status': 'running'} | to_nice_json }}
-      no_log: true
-
-    - name: Live discovery | inspect protected local inputs
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop:
-        - "{{ live_discovery_phase_hmac_key_file_local }}"
-        - "{{ live_discovery_source_probe_config_file_local }}"
-        - "{{ live_discovery_target_probe_config_file_local }}"
-        - "{{ live_discovery_source_glance_token_file_local }}"
-        - "{{ live_discovery_target_glance_token_file_local }}"
-        - "{{ source_clouds_file_local }}"
-        - "{{ target_clouds_file_local }}"
-        - "{{ live_discovery_source_kolla_passwords_file_local }}"
-        - "{{ live_discovery_target_kolla_passwords_file_local }}"
-      register: live_discovery_protected_local_inputs
-      no_log: true
-
-    - name: Live discovery | require owned 0600 protected local inputs
-      ansible.builtin.assert:
-        that:
-          - item.stat.exists
-          - item.stat.isreg
-          - item.stat.mode == '0600'
-      loop: "{{ live_discovery_protected_local_inputs.results }}"
-      no_log: true
-
-    - name: Live discovery | require independently acquired per-side Glance tokens
-      ansible.builtin.assert:
-        that:
-          - live_discovery_source_glance_token_file_local != live_discovery_target_glance_token_file_local
-          - live_discovery_protected_local_inputs.results[3].stat.checksum != live_discovery_protected_local_inputs.results[4].stat.checksum
-        fail_msg: "Source and target Glance tokens must be independently acquired."
-      no_log: true
-
-    - name: Live discovery | require bounded external HMAC anchor
-      ansible.builtin.assert:
-        that:
-          - live_discovery_protected_local_inputs.results[0].stat.size >= 16
-          - live_discovery_protected_local_inputs.results[0].stat.size <= 4096
-        fail_msg: "The external phase HMAC key must contain 16..4096 bytes."
-      no_log: true
-
-    - name: Live discovery | read protected inputs exactly once
-      ansible.builtin.slurp:
-        src: "{{ item }}"
-      loop:
-        - "{{ live_discovery_phase_hmac_key_file_local }}"
-        - "{{ live_discovery_source_probe_config_file_local }}"
-        - "{{ live_discovery_target_probe_config_file_local }}"
-        - "{{ live_discovery_source_glance_token_file_local }}"
-        - "{{ live_discovery_target_glance_token_file_local }}"
-        - "{{ source_clouds_file_local }}"
-        - "{{ target_clouds_file_local }}"
-        - "{{ live_discovery_source_kolla_passwords_file_local }}"
-        - "{{ live_discovery_target_kolla_passwords_file_local }}"
-      register: live_discovery_protected_local_bytes
-      no_log: true
-
-    - name: Live discovery | create owned frozen protected directory
-      ansible.builtin.file:
-        path: "{{ live_discovery_frozen_protected_dir }}"
-        state: directory
-        mode: "0700"
-
-    - name: Live discovery | freeze protected bytes into owner directory
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_frozen_protected_dir }}/{{ item.1 }}"
-        content: "{{ live_discovery_protected_local_bytes.results[item.0].content | b64decode }}"
-        mode: "0600"
-      loop:
-        - [0, phase-hmac.key]
-        - [1, source-probe-config.json]
-        - [2, target-probe-config.json]
-        - [3, source-glance-token]
-        - [4, target-glance-token]
-        - [5, source-clouds.yaml]
-        - [6, target-clouds.yaml]
-        - [7, source-kolla-passwords.yml]
-        - [8, target-kolla-passwords.yml]
-      no_log: true
-
-    - name: Live discovery | publish immutable frozen protected paths
-      ansible.builtin.set_fact:
-        live_discovery_frozen_protected_paths:
-          phase_key: "{{ live_discovery_frozen_protected_dir }}/phase-hmac.key"
-          source_probe: "{{ live_discovery_frozen_protected_dir }}/source-probe-config.json"
-          target_probe: "{{ live_discovery_frozen_protected_dir }}/target-probe-config.json"
-          source_token: "{{ live_discovery_frozen_protected_dir }}/source-glance-token"
-          target_token: "{{ live_discovery_frozen_protected_dir }}/target-glance-token"
-          source_clouds: "{{ live_discovery_frozen_protected_dir }}/source-clouds.yaml"
-          target_clouds: "{{ live_discovery_frozen_protected_dir }}/target-clouds.yaml"
-          source_kolla: "{{ live_discovery_frozen_protected_dir }}/source-kolla-passwords.yml"
-          target_kolla: "{{ live_discovery_frozen_protected_dir }}/target-kolla-passwords.yml"
-        live_discovery_phase_hmac_key_file_local: "{{ live_discovery_frozen_protected_dir }}/phase-hmac.key"
-        live_discovery_source_probe_config_file_local: "{{ live_discovery_frozen_protected_dir }}/source-probe-config.json"
-        live_discovery_target_probe_config_file_local: "{{ live_discovery_frozen_protected_dir }}/target-probe-config.json"
-        live_discovery_source_glance_token_file_local: "{{ live_discovery_frozen_protected_dir }}/source-glance-token"
-        live_discovery_target_glance_token_file_local: "{{ live_discovery_frozen_protected_dir }}/target-glance-token"
-        source_clouds_file_local: "{{ live_discovery_frozen_protected_dir }}/source-clouds.yaml"
-        target_clouds_file_local: "{{ live_discovery_frozen_protected_dir }}/target-clouds.yaml"
-        live_discovery_source_kolla_passwords_file_local: "{{ live_discovery_frozen_protected_dir }}/source-kolla-passwords.yml"
-        live_discovery_target_kolla_passwords_file_local: "{{ live_discovery_frozen_protected_dir }}/target-kolla-passwords.yml"
-      no_log: true
-
-    - name: Live discovery | load protected per-side probe plans
-      ansible.builtin.set_fact:
-        live_discovery_source_probe_plan: >-
-          {{ lookup('file', live_discovery_frozen_protected_paths.source_probe) | from_json }}
-        live_discovery_target_probe_plan: >-
-          {{ lookup('file', live_discovery_frozen_protected_paths.target_probe) | from_json }}
-      no_log: true
-
-    - name: Live discovery | validate authoritative backend and probe contract
+    - name: Live discovery | acquire persistent sibling run owner lock atomically
       ansible.builtin.command:
         argv:
           - python3
-          - "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py"
-          - --backends-json
-          - "{{ live_discovery_storage_backends | to_json }}"
-          - --source-plan
-          - "{{ live_discovery_frozen_protected_paths.source_probe }}"
-          - --target-plan
-          - "{{ live_discovery_frozen_protected_paths.target_probe }}"
-          - --range-enabled
-          - "{{ live_discovery_glance_range_probe_enabled | bool | ternary('true', 'false') }}"
-          - --source-controller
-          - "{{ live_discovery_source_controller }}"
-          - --target-controller
-          - "{{ live_discovery_target_controller }}"
-          - --inventory-hosts-json
-          - "{{ groups['all'] | to_json }}"
-      register: live_discovery_probe_contract_result
-      changed_when: false
-      no_log: true
-
-    - name: Live discovery | freeze validated probe contract result
-      ansible.builtin.set_fact:
-        live_discovery_probe_contract: "{{ live_discovery_probe_contract_result.stdout | from_json }}"
-      no_log: true
-
-    - name: Live discovery | require derived delegates to match validated contract
-      ansible.builtin.assert:
-        that:
-          - live_discovery_probe_contract.source_delegate == live_discovery_source_storage_probe_host
-          - live_discovery_probe_contract.target_delegate == live_discovery_target_storage_probe_host
-
-    - name: Live discovery | validate probe plan envelopes and range policy
-      ansible.builtin.assert:
-        that:
-          - item.schema_version == 'openstack-rehome-probe-config/v1alpha1'
-          - item.storage is sequence
-          - item.glance is mapping
-          - item.glance.token_env == 'LIVE_DISCOVERY_GLANCE_TOKEN'
-          - live_discovery_glance_range_probe_enabled or item.glance.images | length == 0
-          - live_discovery_storage_backends | length > 0 or item.storage | length == 0
-      loop:
-        - "{{ live_discovery_source_probe_plan }}"
-        - "{{ live_discovery_target_probe_plan }}"
-      no_log: true
-
-    - name: Live discovery | bind source storage plan to authoritative backends
-      ansible.builtin.assert:
-        that:
-          - item.backend_id in live_discovery_storage_backends
-          - item.kind == live_discovery_storage_backends[item.backend_id].kind
-          - item.scope == 'source-compute'
-          - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
-          - live_discovery_storage_backends[item.backend_id].source_delegate == live_discovery_source_storage_probe_host
-      loop: "{{ live_discovery_source_probe_plan.storage }}"
-      no_log: true
-
-    - name: Live discovery | bind target storage plan to authoritative backends
-      ansible.builtin.assert:
-        that:
-          - item.backend_id in live_discovery_storage_backends
-          - item.kind == live_discovery_storage_backends[item.backend_id].kind
-          - item.scope == 'target-storage'
-          - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
-          - live_discovery_storage_backends[item.backend_id].target_delegate == live_discovery_target_storage_probe_host
-      loop: "{{ live_discovery_target_probe_plan.storage }}"
-      no_log: true
-
-    - name: Live discovery | inspect optional protected evidence inputs
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop:
-        - "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}"
-        - "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}"
-        - "{{ live_discovery_target_online_migration_evidence_file_local }}"
-      when: item | length > 0
-      register: live_discovery_optional_protected_inputs
-      no_log: true
-
-    - name: Live discovery | require optional evidence inputs to be protected
-      ansible.builtin.assert:
-        that:
-          - item.stat.exists
-          - item.stat.isreg
-          - item.stat.mode == '0600'
-      loop: "{{ live_discovery_optional_protected_inputs.results }}"
-      when: not item.skipped | default(false)
-      no_log: true
-
-    - name: Live discovery | read optional protected inputs exactly once
-      ansible.builtin.slurp:
-        src: "{{ item }}"
-      loop:
-        - "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}"
-        - "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}"
-        - "{{ live_discovery_target_online_migration_evidence_file_local }}"
-      when: item | length > 0
-      register: live_discovery_optional_protected_bytes
-      no_log: true
-
-    - name: Live discovery | freeze optional protected bytes
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_frozen_protected_dir }}/{{ item.1 }}"
-        content: "{{ live_discovery_optional_protected_bytes.results[item.0].content | b64decode }}"
-        mode: "0600"
-      loop:
-        - [0, source-cinder-sensitive-evidence.json]
-        - [1, target-cinder-sensitive-evidence.json]
-        - [2, target-online-migration-evidence.json]
-      when: not live_discovery_optional_protected_bytes.results[item.0].skipped | default(false)
-      no_log: true
-
-    - name: Live discovery | publish optional frozen protected paths
-      ansible.builtin.set_fact:
-        live_discovery_source_cinder_sensitive_evidence_file_local: >-
-          {{ live_discovery_frozen_protected_dir + '/source-cinder-sensitive-evidence.json'
-             if live_discovery_frozen_source.cinder_sensitive | length > 0 else '' }}
-        live_discovery_target_cinder_sensitive_evidence_file_local: >-
-          {{ live_discovery_frozen_protected_dir + '/target-cinder-sensitive-evidence.json'
-             if live_discovery_frozen_target.cinder_sensitive | length > 0 else '' }}
-        live_discovery_target_online_migration_evidence_file_local: >-
-          {{ live_discovery_frozen_protected_dir + '/target-online-migration-evidence.json'
-             if live_discovery_frozen_target.online_migrations | length > 0 else '' }}
-      no_log: true
-
-    - name: Live discovery | create local artifact parent
-      ansible.builtin.file:
-        path: "{{ live_discovery_local_dir }}"
-        state: directory
-        mode: "0750"
-
-    - name: Live discovery | acquire exclusive local run directory
-      ansible.builtin.command:
-        argv:
-          - mkdir
-          - --
-          - "{{ live_discovery_local_run_dir }}"
+          - "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py"
+          - acquire
+          - --owner
+          - "{{ live_discovery_run_owner_dir }}"
+          - --run-id
+          - "{{ live_discovery_frozen_run_id }}"
+          - --token
+          - "{{ live_discovery_run_owner_token }}"
       changed_when: true
-
-    - name: Live discovery | persist owned run guard
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_local_run_dir }}/run-owner.json"
-        mode: "0640"
-        content: >-
-          {{ {'schema_version': 'openstack-rehome-run-owner/v1alpha1',
-              'run_id': live_discovery_frozen_run_id} | to_nice_json }}
-
-    - name: Live discovery | propagate frozen identity to every execution host
-      ansible.builtin.set_fact:
-        live_discovery_enabled: true
-        live_discovery_frozen_run_id: "{{ hostvars['localhost'].live_discovery_frozen_run_id }}"
-        live_discovery_run_owner_token: "{{ hostvars['localhost'].live_discovery_run_owner_token }}"
-      delegate_to: "{{ item }}"
-      delegate_facts: true
-      loop: >-
-        {{ [live_discovery_source_controller, live_discovery_target_controller,
-            live_discovery_rehome_compute_host, live_discovery_target_reference_host,
-            live_discovery_source_storage_probe_host, live_discovery_target_storage_probe_host]
-           | unique | list }}
       no_log: true
+
+    - name: Live discovery | initialize owned run after lock acquisition
+      block:
+        - name: Live discovery | run all post-lock initialization tasks
+          ansible.builtin.include_tasks: tasks/initialize-live-run.yml
+      rescue:
+        - name: Live discovery | release own incomplete lock after initialization failure
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+
+        - name: Live discovery | stop after owned initialization cleanup
+          ansible.builtin.fail:
+            msg: Live discovery initialization failed; its incomplete owner lock was removed.
 
 - name: 02B | Collect source control-plane evidence
   hosts: source_control
   become: true
   gather_facts: false
+  ignore_unreachable: true
   vars:
     live_discovery_schema_side: source
     live_discovery_schema_service: source-control
     live_discovery_schema_db_names: "{{ source_db_names }}"
     live_discovery_side_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/source"
   pre_tasks:
-    - name: Source live discovery | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Source live discovery | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Source owner preflight failed after ownership-checked cleanup.
   tasks:
     - name: Source live discovery | acquire API, schema and scoped DB evidence
       block:
@@ -639,6 +379,12 @@
             dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/source-information-schema.tsv"
             flat: true
 
+        - name: Source live discovery | confirm controller remains reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          register: live_discovery_source_control_reachability
+          changed_when: false
+
       rescue:
         - name: Source live discovery | release own incomplete run after failure
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
@@ -654,18 +400,33 @@
             state: absent
           no_log: true
 
+        - name: Source live discovery | release owner after unreachable controller
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_source_control_reachability.unreachable | default(false)
+
+        - name: Source live discovery | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Source controller became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_source_control_reachability.unreachable | default(false)
+
 - name: 02B | Collect target control-plane evidence
   hosts: target_control
   become: true
   gather_facts: false
+  ignore_unreachable: true
   vars:
     live_discovery_schema_side: target
     live_discovery_schema_service: target-control
     live_discovery_schema_db_names: "{{ target_db_names }}"
     live_discovery_side_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/target"
   pre_tasks:
-    - name: Target live discovery | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Target live discovery | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Target owner preflight failed after ownership-checked cleanup.
   tasks:
     - name: Target live discovery | acquire API, schema and scoped DB evidence
       block:
@@ -810,6 +571,12 @@
             dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/target-information-schema.tsv"
             flat: true
 
+        - name: Target live discovery | confirm controller remains reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          register: live_discovery_target_control_reachability
+          changed_when: false
+
       rescue:
         - name: Target live discovery | release own incomplete run after failure
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
@@ -825,218 +592,104 @@
             state: absent
           no_log: true
 
+        - name: Target live discovery | release owner after unreachable controller
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_target_control_reachability.unreachable | default(false)
+
+        - name: Target live discovery | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Target controller became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_target_control_reachability.unreachable | default(false)
+
 - name: 02B | Collect re-home compute runtime evidence
   hosts: rehome_compute
   become: true
   gather_facts: false
+  ignore_unreachable: true
   vars:
     live_discovery_compute_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/runtime"
   pre_tasks:
-    - name: Runtime live discovery | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Runtime live discovery | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Runtime owner preflight failed after ownership-checked cleanup.
   tasks:
-    - name: Runtime live discovery | create run directory
-      ansible.builtin.file:
-        path: "{{ live_discovery_compute_remote_dir }}"
-        state: directory
-        mode: "0750"
+    - name: Runtime live discovery | execute owned runtime collection
+      block:
+        - name: Runtime live discovery | run collection tasks
+          ansible.builtin.include_tasks: tasks/collect-live-runtime.yml
 
-    - name: Runtime live discovery | install collector package
-      ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../scripts/"
-        dest: "{{ live_discovery_compute_remote_dir }}/scripts/"
-        mode: preserve
+        - name: Runtime live discovery | confirm compute remains reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          register: live_discovery_runtime_reachability
+          changed_when: false
+      rescue:
+        - name: Runtime live discovery | release own incomplete run after failure
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
 
-    - name: Runtime live discovery | collect domain disk interface and dataplane facts
-      ansible.builtin.command:
-        argv: >-
-          {{ ['python3', live_discovery_compute_remote_dir + '/scripts/collect_live_runtime.py',
-              '--side', 'source', '--out', live_discovery_compute_remote_dir + '/runtime.json',
-              '--network-backend', network_backend, '--virsh-argv'] +
-             live_discovery_source_virsh_argv }}
-      register: live_discovery_runtime_collect
-      changed_when: false
-      failed_when: false
+        - name: Runtime live discovery | stop after owned cleanup
+          ansible.builtin.fail:
+            msg: Runtime discovery failed; its incomplete owner lock was removed.
+      always:
+        - name: Runtime live discovery | release owner after unreachable compute
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_runtime_reachability.unreachable | default(false)
 
-    - name: Runtime live discovery | release own incomplete run on collector failure
-      ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
-      when: live_discovery_runtime_collect.rc != 0
-
-    - name: Runtime live discovery | require successful runtime collector
-      ansible.builtin.assert:
-        that:
-          - live_discovery_runtime_collect.rc == 0
-
-    - name: Runtime live discovery | fetch typed runtime artifact
-      ansible.builtin.fetch:
-        src: "{{ live_discovery_compute_remote_dir }}/runtime.json"
-        dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/runtime.json"
-        flat: true
-
-    - name: Runtime live discovery | persist collector rc
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_compute_remote_dir }}/runtime.rc"
-        mode: "0640"
-        content: "{{ live_discovery_runtime_collect.rc }}\n"
+        - name: Runtime live discovery | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Runtime compute became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_runtime_reachability.unreachable | default(false)
 
 - name: 02B | Collect target reference compute capabilities
   hosts: target_reference_compute
   become: true
   gather_facts: false
+  ignore_unreachable: true
   pre_tasks:
-    - name: Target capability | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Target capability | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Capability owner preflight failed after ownership-checked cleanup.
   tasks:
-    - name: Target capability | collect live virsh version
-      ansible.builtin.command:
-        argv: "{{ live_discovery_target_virsh_argv + ['version'] }}"
-      register: live_discovery_target_virsh_version
-      changed_when: false
-      failed_when: false
+    - name: Target capability | execute owned capability collection
+      block:
+        - name: Target capability | run capability tasks
+          ansible.builtin.include_tasks: tasks/collect-live-target-capability.yml
 
-    - name: Target capability | collect live domain capabilities
-      ansible.builtin.command:
-        argv: "{{ live_discovery_target_virsh_argv + ['domcapabilities'] }}"
-      register: live_discovery_target_domcapabilities
-      changed_when: false
-      failed_when: false
+        - name: Target capability | confirm reference compute remains reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          register: live_discovery_capability_reachability
+          changed_when: false
+      rescue:
+        - name: Target capability | release own incomplete run after failure
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
 
-    - name: Target capability | collect live QEMU machine list
-      ansible.builtin.command:
-        argv: "{{ live_discovery_target_qemu_argv + ['-machine', 'help'] }}"
-      register: live_discovery_target_qemu_machine_help
-      changed_when: false
-      failed_when: false
+        - name: Target capability | stop after owned cleanup
+          ansible.builtin.fail:
+            msg: Target capability discovery failed; its incomplete owner lock was removed.
+      always:
+        - name: Target capability | release owner after unreachable reference compute
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_capability_reachability.unreachable | default(false)
 
-    - name: Target capability | bind rc-bearing live command records
-      ansible.builtin.set_fact:
-        live_discovery_target_capability_records:
-          management:
-            nova_api_db_version:
-              evidence_id: manage-nova-api-db-version
-              command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].cmd }}"
-              returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].rc }}"
-              stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].stdout }}"
-              stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].stderr }}"
-            nova_cell_db_version:
-              evidence_id: manage-nova-cell-db-version
-              command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].cmd }}"
-              returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].rc }}"
-              stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].stdout }}"
-              stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].stderr }}"
-            neutron_heads:
-              evidence_id: manage-neutron-heads
-              command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].cmd }}"
-              returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].rc }}"
-              stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].stdout }}"
-              stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].stderr }}"
-            cinder_db_version:
-              evidence_id: manage-cinder-db-version
-              command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].cmd }}"
-              returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].rc }}"
-              stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].stdout }}"
-              stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].stderr }}"
-            glance_db_version:
-              evidence_id: manage-glance-db-version
-              command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.cmd }}"
-              returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.rc }}"
-              stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.stdout }}"
-              stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.stderr }}"
-          images: {}
-          runtime:
-            runtime-target-virsh-version:
-              evidence_id: runtime-target-virsh-version
-              command: "{{ live_discovery_target_virsh_version.cmd }}"
-              returncode: "{{ live_discovery_target_virsh_version.rc }}"
-              stdout: "{{ live_discovery_target_virsh_version.stdout }}"
-              stderr: "{{ live_discovery_target_virsh_version.stderr }}"
-            runtime-target-domcapabilities:
-              evidence_id: runtime-target-domcapabilities
-              command: "{{ live_discovery_target_domcapabilities.cmd }}"
-              returncode: "{{ live_discovery_target_domcapabilities.rc }}"
-              stdout: "{{ live_discovery_target_domcapabilities.stdout }}"
-              stderr: "{{ live_discovery_target_domcapabilities.stderr }}"
-            runtime-target-qemu-machine-help:
-              evidence_id: runtime-target-qemu-machine-help
-              command: "{{ live_discovery_target_qemu_machine_help.cmd }}"
-              returncode: "{{ live_discovery_target_qemu_machine_help.rc }}"
-              stdout: "{{ live_discovery_target_qemu_machine_help.stdout }}"
-              stderr: "{{ live_discovery_target_qemu_machine_help.stderr }}"
-          target_virsh_argv: "{{ live_discovery_target_virsh_argv }}"
-          target_qemu_argv: "{{ live_discovery_target_qemu_argv }}"
-      delegate_to: localhost
-      delegate_facts: true
-      no_log: true
-
-    - name: Target capability | normalize image command record keys
-      ansible.builtin.set_fact:
-        live_discovery_target_capability_records: >-
-          {{ hostvars['localhost'].live_discovery_target_capability_records | combine({
-             'images': hostvars['localhost'].live_discovery_target_capability_records.images | combine({
-               item.item: {
-                 'evidence_id': 'image-' ~ item.item,
-                 'command': item.cmd,
-                 'returncode': item.rc,
-                 'stdout': item.stdout,
-                 'stderr': item.stderr
-               }
-             })
-          }, recursive=true) }}
-      loop: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_image_inspects_raw.results }}"
-      delegate_to: localhost
-      delegate_facts: true
-      no_log: true
-
-    - name: Target capability | write protected live record document
-      ansible.builtin.copy:
-        dest: "{{ hostvars['localhost'].live_discovery_frozen_protected_dir }}/target-capability-records.json"
-        mode: "0600"
-        content: "{{ hostvars['localhost'].live_discovery_target_capability_records | to_nice_json }}\n"
-      delegate_to: localhost
-      no_log: true
-
-    - name: Target capability | derive profile from successful live evidence
-      ansible.builtin.command:
-        argv: >-
-          {{ ['python3', playbook_dir + '/../scripts/live_discovery/capability_input.py',
-              '--records', hostvars['localhost'].live_discovery_frozen_protected_dir + '/target-capability-records.json',
-              '--out', hostvars['localhost'].live_discovery_frozen_protected_dir + '/target-capability-input.json'] +
-             (['--online-migration-evidence', hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local]
-              if hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local | length > 0 else []) }}
-      delegate_to: localhost
-      register: live_discovery_target_capability_build
-      changed_when: false
-      failed_when: false
-      no_log: true
-
-    - name: Target capability | release own incomplete run on normalizer failure
-      ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
-      when: live_discovery_target_capability_build.rc != 0
-
-    - name: Target capability | require successful evidence normalization
-      ansible.builtin.assert:
-        that:
-          - live_discovery_target_capability_build.rc == 0
-      no_log: true
-
-    - name: Target capability | load normalized protected capability document
-      ansible.builtin.slurp:
-        src: "{{ hostvars['localhost'].live_discovery_frozen_protected_dir }}/target-capability-input.json"
-      register: live_discovery_target_capability_raw
-      delegate_to: localhost
-      no_log: true
-
-    - name: Target capability | publish normalized capability document
-      ansible.builtin.set_fact:
-        live_discovery_target_capability_document: "{{ live_discovery_target_capability_raw.content | b64decode | from_json }}"
-      delegate_to: localhost
-      delegate_facts: true
-      no_log: true
+        - name: Target capability | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Target reference compute became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_capability_reachability.unreachable | default(false)
 
 - name: 02B | Probe source and target storage read-only
   hosts: localhost
   become: false
   gather_facts: false
+  ignore_unreachable: true
   vars:
     live_discovery_run: "{{ live_discovery_frozen_run_id }}"
     live_discovery_source_probe_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/probe-source"
@@ -1044,8 +697,13 @@
     live_discovery_source_controller_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/source"
     live_discovery_target_controller_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/target"
   pre_tasks:
-    - name: Probe live discovery | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Probe live discovery | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Probe owner preflight failed after ownership-checked cleanup.
   tasks:
     - name: Probe live discovery | validate explicit delegates and backend profile
       ansible.builtin.assert:
@@ -1223,6 +881,13 @@
             flat: true
           delegate_to: "{{ live_discovery_source_controller }}"
 
+        - name: Source probe | confirm delegates remain reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          register: live_discovery_source_probe_reachability
+          changed_when: false
+
       rescue:
         - name: Source probe | release own incomplete run after failure
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
@@ -1245,6 +910,15 @@
             state: absent
           delegate_to: "{{ live_discovery_source_controller }}"
           no_log: true
+
+        - name: Source probe | release owner after unreachable delegate
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_source_probe_reachability.unreachable | default(false)
+
+        - name: Source probe | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Source probe delegate became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_source_probe_reachability.unreachable | default(false)
 
     - name: Probe live discovery | refresh target signed phase and combine
       block:
@@ -1421,6 +1095,13 @@
             flat: true
           delegate_to: "{{ live_discovery_target_controller }}"
 
+        - name: Target probe | confirm delegates remain reachable
+          ansible.builtin.command:
+            argv: [/usr/bin/true]
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          register: live_discovery_target_probe_reachability
+          changed_when: false
+
       rescue:
         - name: Target probe | release own incomplete run after failure
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
@@ -1444,71 +1125,36 @@
           delegate_to: "{{ live_discovery_target_controller }}"
           no_log: true
 
+        - name: Target probe | release owner after unreachable delegate
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+          when: live_discovery_target_probe_reachability.unreachable | default(false)
+
+        - name: Target probe | stop after unreachable cleanup
+          ansible.builtin.fail:
+            msg: Target probe delegate became unreachable; its incomplete owner lock was removed.
+          when: live_discovery_target_probe_reachability.unreachable | default(false)
+
 - name: 02B | Assemble live discovery artifacts locally
   hosts: localhost
   become: false
   gather_facts: false
   pre_tasks:
-    - name: Live discovery assembly | verify persistent run owner
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+    - name: Live discovery assembly | guard persistent run owner
+      block:
+        - ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
+      rescue:
+        - ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
+        - ansible.builtin.fail:
+            msg: Assembly owner preflight failed after ownership-checked cleanup.
   tasks:
-    - name: Live discovery assembly | invoke Task 10 assembler
-      ansible.builtin.command:
-        argv:
-          - python3
-          - "{{ playbook_dir }}/../scripts/assemble_live_discovery.py"
-          - --source-control
-          - "{{ live_discovery_local_run_dir }}/source-control.json"
-          - --target-control
-          - "{{ live_discovery_local_run_dir }}/target-control.json"
-          - --runtime
-          - "{{ live_discovery_local_run_dir }}/runtime.json"
-          - --schema-policy
-          - "{{ live_discovery_schema_policy_file }}"
-          - --out-dir
-          - "{{ live_discovery_local_run_dir }}"
-      register: live_discovery_assemble
-      changed_when: false
-      failed_when: false
+    - name: Live discovery assembly | execute owned assembly
+      block:
+        - name: Live discovery assembly | run assembly tasks
+          ansible.builtin.include_tasks: tasks/assemble-live-discovery.yml
+      rescue:
+        - name: Live discovery assembly | release own incomplete run after failure
+          ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
 
-    - name: Live discovery assembly | release own incomplete run on assembly failure
-      ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
-      when: live_discovery_assemble.rc not in [0]
-
-    - name: Live discovery assembly | require successful assembly
-      ansible.builtin.assert:
-        that:
-          - live_discovery_assemble.rc in [0]
-
-    - name: Live discovery assembly | report readiness artifact
-      ansible.builtin.debug:
-        msg: "{{ live_discovery_local_run_dir }}/readiness-report.json"
-
-    - name: Live discovery assembly | recheck ownership before sealing cleanup
-      ansible.builtin.include_tasks: tasks/verify-live-run-owner.yml
-
-    - name: Live discovery assembly | delete frozen protected bytes after success
-      ansible.builtin.file:
-        path: "{{ live_discovery_frozen_protected_dir }}"
-        state: absent
-      no_log: true
-
-    - name: Live discovery assembly | persist immutable success marker
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_run_owner_dir }}/completed.json"
-        mode: "0640"
-        content: >-
-          {{ {'schema_version': 'openstack-rehome-run-completion/v1alpha1',
-              'run_id': live_discovery_frozen_run_id,
-              'status': 'completed'} | to_nice_json }}
-
-    - name: Live discovery assembly | seal persistent owner as completed
-      ansible.builtin.copy:
-        dest: "{{ live_discovery_run_owner_dir }}/run-owner.json"
-        mode: "0600"
-        content: >-
-          {{ {'schema_version': 'openstack-rehome-run-owner/v1alpha1',
-              'run_id': live_discovery_frozen_run_id,
-              'owner_token': live_discovery_run_owner_token,
-              'status': 'completed'} | to_nice_json }}
-      no_log: true
+        - name: Live discovery assembly | stop after owned cleanup
+          ansible.builtin.fail:
+            msg: Live discovery assembly failed; its incomplete owner lock was removed.

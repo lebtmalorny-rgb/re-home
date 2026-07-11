@@ -7,20 +7,19 @@
       - live_discovery_run_owner_token == hostvars['localhost'].live_discovery_run_owner_token
   no_log: true
 
-- name: Live discovery owner | read persistent sibling owner marker
-  ansible.builtin.slurp:
-    src: "{{ hostvars['localhost'].live_discovery_run_owner_dir }}/run-owner.json"
-  register: live_discovery_owner_marker_raw
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
 - name: Live discovery owner | verify persistent sibling ownership
-  ansible.builtin.assert:
-    that:
-      - (live_discovery_owner_marker_raw.content | b64decode | from_json).run_id == hostvars['localhost'].live_discovery_frozen_run_id
-      - (live_discovery_owner_marker_raw.content | b64decode | from_json).owner_token == hostvars['localhost'].live_discovery_run_owner_token
-      - (live_discovery_owner_marker_raw.content | b64decode | from_json).status == 'running'
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py"
+      - verify
+      - --owner
+      - "{{ hostvars['localhost'].live_discovery_run_owner_dir }}"
+      - --run-id
+      - "{{ hostvars['localhost'].live_discovery_frozen_run_id }}"
+      - --token
+      - "{{ hostvars['localhost'].live_discovery_run_owner_token }}"
   delegate_to: localhost
   run_once: true
+  changed_when: false
   no_log: true

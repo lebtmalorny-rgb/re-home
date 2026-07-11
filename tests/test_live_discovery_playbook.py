@@ -20,6 +20,20 @@ DB_TASKS = ROOT / "playbooks/tasks/collect-live-db-jsonl-service.yml"
 ALL_VARS = ROOT / "group_vars/all.yml"
 GENERIC_INVENTORY = ROOT / "inventory/hosts.yml"
 LAB_INVENTORY = ROOT / "inventory/lab-os1-to-os2.yml"
+ORCHESTRATION_TASKS = (
+    ROOT / "playbooks/tasks/initialize-live-run.yml",
+    ROOT / "playbooks/tasks/collect-live-runtime.yml",
+    ROOT / "playbooks/tasks/collect-live-target-capability.yml",
+    ROOT / "playbooks/tasks/assemble-live-discovery.yml",
+    ROOT / "playbooks/tasks/verify-live-run-owner.yml",
+    ROOT / "playbooks/tasks/cleanup-live-run-owner.yml",
+)
+
+
+def _task11_text():
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in (PLAYBOOK, *ORCHESTRATION_TASKS)
+    )
 
 
 def _top_level_play_names(text):
@@ -61,12 +75,15 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         )
 
     def test_every_command_task_is_explicitly_read_only_to_ansible(self):
-        for path in (PLAYBOOK, SCHEMA_TASKS, DB_TASKS):
+        for path in (PLAYBOOK, SCHEMA_TASKS, DB_TASKS, *ORCHESTRATION_TASKS):
             for mapping in _walk(_yaml_documents(path)):
                 if "ansible.builtin.command" in mapping:
                     if mapping.get("name") in {
                         "Live discovery | acquire exclusive local run directory",
-                        "Live discovery | acquire persistent sibling run owner lock",
+                        "Live discovery | acquire persistent sibling run owner lock atomically",
+                        "Live discovery | validate and freeze every protected input from one fd",
+                        "Live discovery assembly | seal owner and delete frozen secrets atomically",
+                        "Live discovery owner cleanup | remove only own incomplete lock",
                     }:
                         self.assertIs(mapping.get("changed_when"), True)
                     else:
@@ -78,7 +95,7 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
                 self.assertNotIn("ansible.builtin.shell", mapping)
 
     def test_sensitive_inspect_outputs_are_not_logged(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         for task_name in (
             "Target live discovery | inspect service container image digests",
         ):
@@ -101,7 +118,7 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("live_discovery_target_qemu_argv:", lab)
 
     def test_hosts_are_explicit_and_singletons_are_asserted(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         for host_pattern in (
             "hosts: localhost",
             "hosts: source_control",
@@ -138,10 +155,10 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
                 self.assertIn("rehome_host", localhost)
                 if inventory == LAB_INVENTORY:
                     self.assertNotEqual(localhost["rehome_host"], source_vars["rehome_host"])
-        self.assertIn("rehome_host: \"{{ live_discovery_frozen_source.rehome_host }}\"", PLAYBOOK.read_text(encoding="utf-8"))
+        self.assertIn("rehome_host: \"{{ live_discovery_frozen_source.rehome_host }}\"", _task11_text())
 
     def test_live_task10_phases_and_protected_handoff_are_wired(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         for required in (
             "collect_live_control.py",
             "collect_live_runtime.py",
@@ -180,7 +197,7 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("item.query_id is match('^[0-9]{4}-[a-z_][a-z0-9_]*-[a-z_][a-z0-9_]*$')", DB_TASKS.read_text(encoding="utf-8"))
 
     def test_sensitive_files_are_run_local_protected_and_cleaned_in_always(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertGreaterEqual(text.count("always:"), 4)
         self.assertGreaterEqual(text.count("state: absent"), 4)
         self.assertIn('mode: "0700"', text)
@@ -194,12 +211,13 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         ):
             self.assertIn(secret_name, text)
         self.assertNotRegex(text, r"(?i)(password|token|secret)\s*:\s*[A-Za-z0-9_-]{12,}")
-        self.assertIn("live_discovery_protected_local_inputs.results[0].stat.size >= 16", text)
-        self.assertIn("live_discovery_optional_protected_inputs", text)
+        protected_helper = (ROOT / "scripts/live_discovery/protected_input.py").read_text(encoding="utf-8")
+        self.assertIn('"hmac": (16, 4096)', protected_helper)
+        self.assertIn("required: false", text)
         self.assertIn("live_discovery_source_glance_token_file_local", text)
         self.assertIn("live_discovery_target_glance_token_file_local", text)
         self.assertNotIn("live_discovery_glance_token_file_local", text)
-        self.assertIn("results[3].stat.checksum != live_discovery_protected_local_inputs.results[4].stat.checksum", text)
+        self.assertIn("live_discovery_frozen_token_stats.results[0].stat.checksum", text)
 
     def test_collection_commands_are_read_only_and_preserve_failures(self):
         text = "\n".join(
@@ -245,7 +263,7 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("password_key", text)
 
     def test_unknown_or_blocked_assembler_exit_fails_play(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertIn("live_discovery_assemble.rc in [0]", text)
         self.assertIn("cleanup-live-run-owner.yml", text)
         self.assertIn("live_discovery_fail_on_not_ready", text)
@@ -261,14 +279,14 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("network_backend: ovs", lab)
         self.assertIn("kind: nfs", lab)
         self.assertIn("probe_template: nfs", lab)
-        self.assertIn("storage_backends | length > 0 or item.storage | length == 0", PLAYBOOK.read_text(encoding="utf-8"))
+        self.assertIn("storage_backends | length > 0 or item.storage | length == 0", _task11_text())
         self.assertIn("allowed_scopes", lab)
         self.assertIn("source_delegate", lab)
         self.assertIn("target_delegate", lab)
-        self.assertIn("live_discovery_glance_range_probe_enabled", PLAYBOOK.read_text(encoding="utf-8"))
+        self.assertIn("live_discovery_glance_range_probe_enabled", _task11_text())
 
     def test_run_id_is_validated_before_use_in_paths(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertIn("live_discovery_frozen_run_id is match", text)
         self.assertIn("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", text)
         self.assertNotIn("ansible.builtin.shell", text)
@@ -304,40 +322,76 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
             )
             self.assertNotEqual(0, second.returncode)
 
-    def test_source_profile_probes_are_not_silently_discarded(self):
+    def test_every_post_lock_play_has_failure_and_unreachable_cleanup(self):
         text = PLAYBOOK.read_text(encoding="utf-8")
+        self.assertGreaterEqual(text.count("cleanup-live-run-owner.yml"), 7)
+        self.assertGreaterEqual(text.count("ignore_unreachable: true"), 5)
+        for prefix in (
+            "source_control", "target_control", "runtime", "capability",
+            "source_probe", "target_probe",
+        ):
+            self.assertIn(f"live_discovery_{prefix}_reachability", text)
+            self.assertIn(
+                f"live_discovery_{prefix}_reachability.unreachable | default(false)",
+                text,
+            )
+
+    def test_source_profile_probes_are_not_silently_discarded(self):
+        text = _task11_text()
         self.assertNotIn("live_discovery_source_profile_probes", text)
         self.assertNotIn("live_discovery_source_image_inspects", text)
 
     def test_target_profile_is_derived_from_live_rc_bearing_records(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertNotIn('release: "2025.1"', text)
         self.assertNotIn("distribution: vanilla", text)
         self.assertIn("capability_input.py", text)
+        self.assertIn("--records-stdin", text)
+        self.assertIn("stdin:", text)
+        self.assertNotIn("target-capability-records.json", text)
         self.assertIn("item.rc", text)
         self.assertIn("item.stderr", text)
         self.assertIn("live_discovery_target_online_migration_evidence_file_local", text)
         self.assertNotIn("online_data_migrations", text)
 
+    def test_runtime_semantic_rc2_is_validated_then_deferred_to_assembler(self):
+        text = _task11_text()
+        self.assertIn("live_discovery_runtime_collect.rc in [0, 2]", text)
+        self.assertIn("validate_live_runtime.py", text)
+        self.assertLess(text.index("fetch typed runtime artifact"), text.index("validate fetched typed runtime artifact"))
+        self.assertNotIn("live_discovery_runtime_collect.rc == 0", text)
+
     def test_run_identity_enablement_and_sibling_owner_lock_are_explicit(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertIn("live_discovery_frozen_source.enabled", text)
         self.assertIn("live_discovery_frozen_target.enabled", text)
         self.assertIn("live_discovery_frozen_target.run_id", text)
         self.assertIn("live_discovery_run_owner_dir", text)
         self.assertIn("live_discovery_run_owner_token", text)
-        self.assertIn("completed.json", text)
+        owner_helper = (ROOT / "scripts/live_discovery/run_owner.py").read_text(encoding="utf-8")
+        self.assertIn("completed.json", owner_helper)
         self.assertIn("delegate_facts: true", text)
         owner_tasks = (ROOT / "playbooks/tasks/verify-live-run-owner.yml").read_text(encoding="utf-8")
         self.assertIn("live_discovery_frozen_run_id == hostvars['localhost'].live_discovery_frozen_run_id", owner_tasks)
 
     def test_protected_inputs_are_frozen_before_any_later_use(self):
-        text = PLAYBOOK.read_text(encoding="utf-8")
+        text = _task11_text()
         self.assertIn("live_discovery_frozen_protected_dir", text)
-        self.assertIn("ansible.builtin.slurp", text)
+        self.assertIn("protected_input.py", text)
+        self.assertIn("--manifest-json", text)
         self.assertIn("live_discovery_frozen_protected_paths", text)
         self.assertNotIn("lookup('file', live_discovery_source_probe_config_file_local)", text)
         self.assertNotIn("lookup('file', live_discovery_target_probe_config_file_local)", text)
+        self.assertNotIn("live_discovery_protected_local_bytes", text)
+        self.assertNotIn("live_discovery_optional_protected_bytes", text)
+
+    def test_every_protected_input_has_typed_bounds_owner_mode_and_symlink_checks(self):
+        text = _task11_text()
+        for kind in ("hmac", "token", "probe", "clouds", "passwords", "cinder", "migration"):
+            self.assertIn(f"type: {kind}", text)
+        helper = (ROOT / "scripts/live_discovery/protected_input.py").read_text(encoding="utf-8")
+        for guard in ("O_NOFOLLOW", "st_uid", "0o600", "S_ISREG", "st_size"):
+            self.assertIn(guard, helper)
 
 
 if __name__ == "__main__":

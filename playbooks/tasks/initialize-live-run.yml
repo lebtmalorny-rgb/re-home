@@ -1,0 +1,183 @@
+- name: Live discovery | define typed protected input manifest
+  ansible.builtin.set_fact:
+    live_discovery_protected_input_manifest:
+      - {key: phase-hmac.key, path: "{{ live_discovery_phase_hmac_key_file_local }}", type: hmac, required: true}
+    - {key: source-probe-config.json, path: "{{ live_discovery_source_probe_config_file_local }}", type: probe, required: true}
+    - {key: target-probe-config.json, path: "{{ live_discovery_target_probe_config_file_local }}", type: probe, required: true}
+      - {key: source-glance-token, path: "{{ live_discovery_source_glance_token_file_local }}", type: token, required: true}
+      - {key: target-glance-token, path: "{{ live_discovery_target_glance_token_file_local }}", type: token, required: true}
+      - {key: source-clouds.yaml, path: "{{ source_clouds_file_local }}", type: clouds, required: true}
+      - {key: target-clouds.yaml, path: "{{ target_clouds_file_local }}", type: clouds, required: true}
+      - {key: source-kolla-passwords.yml, path: "{{ live_discovery_source_kolla_passwords_file_local }}", type: passwords, required: true}
+      - {key: target-kolla-passwords.yml, path: "{{ live_discovery_target_kolla_passwords_file_local }}", type: passwords, required: true}
+    - {key: source-cinder-sensitive-evidence.json, path: "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
+    - {key: target-cinder-sensitive-evidence.json, path: "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
+    - {key: target-online-migration-evidence.json, path: "{{ live_discovery_target_online_migration_evidence_file_local }}", type: migration, required: false}
+  no_log: true
+
+- name: Live discovery | validate and freeze every protected input from one fd
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/protected_input.py"
+      - --manifest-json
+      - "{{ live_discovery_protected_input_manifest | to_json }}"
+      - --destination
+      - "{{ live_discovery_frozen_protected_dir }}"
+  register: live_discovery_protected_freeze
+  changed_when: true
+  no_log: true
+
+- name: Live discovery | publish immutable frozen protected paths
+  ansible.builtin.set_fact:
+    live_discovery_frozen_protected_paths: "{{ live_discovery_protected_freeze.stdout | from_json }}"
+    live_discovery_phase_hmac_key_file_local: "{{ live_discovery_frozen_protected_dir }}/phase-hmac.key"
+    live_discovery_source_probe_config_file_local: "{{ live_discovery_frozen_protected_dir }}/source-probe-config.json"
+    live_discovery_target_probe_config_file_local: "{{ live_discovery_frozen_protected_dir }}/target-probe-config.json"
+    live_discovery_source_glance_token_file_local: "{{ live_discovery_frozen_protected_dir }}/source-glance-token"
+    live_discovery_target_glance_token_file_local: "{{ live_discovery_frozen_protected_dir }}/target-glance-token"
+    source_clouds_file_local: "{{ live_discovery_frozen_protected_dir }}/source-clouds.yaml"
+    target_clouds_file_local: "{{ live_discovery_frozen_protected_dir }}/target-clouds.yaml"
+    live_discovery_source_kolla_passwords_file_local: "{{ live_discovery_frozen_protected_dir }}/source-kolla-passwords.yml"
+    live_discovery_target_kolla_passwords_file_local: "{{ live_discovery_frozen_protected_dir }}/target-kolla-passwords.yml"
+    live_discovery_source_cinder_sensitive_evidence_file_local: >-
+      {{ live_discovery_frozen_protected_dir + '/source-cinder-sensitive-evidence.json'
+         if live_discovery_frozen_source.cinder_sensitive | length > 0 else '' }}
+    live_discovery_target_cinder_sensitive_evidence_file_local: >-
+      {{ live_discovery_frozen_protected_dir + '/target-cinder-sensitive-evidence.json'
+         if live_discovery_frozen_target.cinder_sensitive | length > 0 else '' }}
+    live_discovery_target_online_migration_evidence_file_local: >-
+      {{ live_discovery_frozen_protected_dir + '/target-online-migration-evidence.json'
+         if live_discovery_frozen_target.online_migrations | length > 0 else '' }}
+  no_log: true
+
+- name: Live discovery | inspect frozen per-side Glance tokens
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop:
+    - "{{ live_discovery_frozen_protected_paths['source-glance-token'] }}"
+    - "{{ live_discovery_frozen_protected_paths['target-glance-token'] }}"
+  register: live_discovery_frozen_token_stats
+  no_log: true
+
+- name: Live discovery | require independently acquired frozen Glance tokens
+  ansible.builtin.assert:
+    that:
+      - live_discovery_frozen_token_stats.results[0].stat.checksum != live_discovery_frozen_token_stats.results[1].stat.checksum
+    fail_msg: "Source and target Glance tokens must be independently acquired."
+  no_log: true
+
+- name: Live discovery | load protected per-side probe plans
+  ansible.builtin.set_fact:
+    live_discovery_source_probe_plan: >-
+      {{ lookup('file', live_discovery_frozen_protected_paths['source-probe-config.json']) | from_json }}
+    live_discovery_target_probe_plan: >-
+      {{ lookup('file', live_discovery_frozen_protected_paths['target-probe-config.json']) | from_json }}
+  no_log: true
+
+- name: Live discovery | validate authoritative backend and probe contract
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py"
+      - --backends-json
+      - "{{ live_discovery_storage_backends | to_json }}"
+      - --source-plan
+      - "{{ live_discovery_frozen_protected_paths['source-probe-config.json'] }}"
+      - --target-plan
+      - "{{ live_discovery_frozen_protected_paths['target-probe-config.json'] }}"
+      - --range-enabled
+      - "{{ live_discovery_glance_range_probe_enabled | bool | ternary('true', 'false') }}"
+      - --source-controller
+      - "{{ live_discovery_source_controller }}"
+      - --target-controller
+      - "{{ live_discovery_target_controller }}"
+      - --inventory-hosts-json
+      - "{{ groups['all'] | to_json }}"
+  register: live_discovery_probe_contract_result
+  changed_when: false
+  no_log: true
+
+- name: Live discovery | freeze validated probe contract result
+  ansible.builtin.set_fact:
+    live_discovery_probe_contract: "{{ live_discovery_probe_contract_result.stdout | from_json }}"
+  no_log: true
+
+- name: Live discovery | require derived delegates to match validated contract
+  ansible.builtin.assert:
+    that:
+      - live_discovery_probe_contract.source_delegate == live_discovery_source_storage_probe_host
+      - live_discovery_probe_contract.target_delegate == live_discovery_target_storage_probe_host
+
+- name: Live discovery | validate probe plan envelopes and range policy
+  ansible.builtin.assert:
+    that:
+      - item.schema_version == 'openstack-rehome-probe-config/v1alpha1'
+      - item.storage is sequence
+      - item.glance is mapping
+      - item.glance.token_env == 'LIVE_DISCOVERY_GLANCE_TOKEN'
+      - live_discovery_glance_range_probe_enabled or item.glance.images | length == 0
+      - live_discovery_storage_backends | length > 0 or item.storage | length == 0
+  loop:
+    - "{{ live_discovery_source_probe_plan }}"
+    - "{{ live_discovery_target_probe_plan }}"
+  no_log: true
+
+- name: Live discovery | bind source storage plan to authoritative backends
+  ansible.builtin.assert:
+    that:
+      - item.backend_id in live_discovery_storage_backends
+      - item.kind == live_discovery_storage_backends[item.backend_id].kind
+      - item.scope == 'source-compute'
+      - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
+      - live_discovery_storage_backends[item.backend_id].source_delegate == live_discovery_source_storage_probe_host
+  loop: "{{ live_discovery_source_probe_plan.storage }}"
+  no_log: true
+
+- name: Live discovery | bind target storage plan to authoritative backends
+  ansible.builtin.assert:
+    that:
+      - item.backend_id in live_discovery_storage_backends
+      - item.kind == live_discovery_storage_backends[item.backend_id].kind
+      - item.scope == 'target-storage'
+      - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
+      - live_discovery_storage_backends[item.backend_id].target_delegate == live_discovery_target_storage_probe_host
+  loop: "{{ live_discovery_target_probe_plan.storage }}"
+  no_log: true
+
+- name: Live discovery | create local artifact parent
+  ansible.builtin.file:
+    path: "{{ live_discovery_local_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Live discovery | acquire exclusive local run directory
+  ansible.builtin.command:
+    argv:
+      - mkdir
+      - --
+      - "{{ live_discovery_local_run_dir }}"
+  changed_when: true
+
+- name: Live discovery | persist owned run guard
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_local_run_dir }}/run-owner.json"
+    mode: "0640"
+    content: >-
+      {{ {'schema_version': 'openstack-rehome-run-owner/v1alpha1',
+          'run_id': live_discovery_frozen_run_id} | to_nice_json }}
+
+- name: Live discovery | propagate frozen identity to every execution host
+  ansible.builtin.set_fact:
+    live_discovery_enabled: true
+    live_discovery_frozen_run_id: "{{ hostvars['localhost'].live_discovery_frozen_run_id }}"
+    live_discovery_run_owner_token: "{{ hostvars['localhost'].live_discovery_run_owner_token }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: >-
+    {{ [live_discovery_source_controller, live_discovery_target_controller,
+        live_discovery_rehome_compute_host, live_discovery_target_reference_host,
+        live_discovery_source_storage_probe_host, live_discovery_target_storage_probe_host]
+       | unique | list }}
+  no_log: true

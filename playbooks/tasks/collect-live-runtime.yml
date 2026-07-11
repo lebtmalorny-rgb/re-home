@@ -1,0 +1,56 @@
+- name: Runtime live discovery | create run directory
+  ansible.builtin.file:
+    path: "{{ live_discovery_compute_remote_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Runtime live discovery | install collector package
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/"
+    dest: "{{ live_discovery_compute_remote_dir }}/scripts/"
+    mode: preserve
+
+- name: Runtime live discovery | collect domain disk interface and dataplane facts
+  ansible.builtin.command:
+    argv: >-
+      {{ ['python3', live_discovery_compute_remote_dir + '/scripts/collect_live_runtime.py',
+          '--side', 'source', '--out', live_discovery_compute_remote_dir + '/runtime.json',
+          '--network-backend', network_backend, '--virsh-argv'] +
+         live_discovery_source_virsh_argv }}
+  register: live_discovery_runtime_collect
+  changed_when: false
+  failed_when: false
+
+- name: Runtime live discovery | accept documented semantic verdict return codes
+  ansible.builtin.assert:
+    that:
+      - live_discovery_runtime_collect.rc in [0, 2]
+
+- name: Runtime live discovery | fetch typed runtime artifact
+  ansible.builtin.fetch:
+    src: "{{ live_discovery_compute_remote_dir }}/runtime.json"
+    dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/runtime.json"
+    flat: true
+
+- name: Runtime live discovery | validate fetched typed runtime artifact
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/validate_live_runtime.py"
+      - --runtime
+      - "{{ hostvars['localhost'].live_discovery_local_run_dir }}/runtime.json"
+  delegate_to: localhost
+  register: live_discovery_runtime_validate
+  changed_when: false
+  failed_when: false
+
+- name: Runtime live discovery | require valid typed runtime artifact
+  ansible.builtin.assert:
+    that:
+      - live_discovery_runtime_validate.rc == 0
+
+- name: Runtime live discovery | persist collector rc
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_compute_remote_dir }}/runtime.rc"
+    mode: "0640"
+    content: "{{ live_discovery_runtime_collect.rc }}\n"

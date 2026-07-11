@@ -676,14 +676,15 @@ class _CachedCapabilityRunner:
             # Retain fixture compatibility. Live orchestration always supplies
             # the rc-bearing record shape below.
             return CommandEvidence(evidence_id, [str(item) for item in argv], 0, value, "")
-        expected = {"evidence_id", "command", "returncode", "stdout", "stderr"}
-        if not isinstance(value, dict) or set(value) != expected:
+        success = {"evidence_id", "command", "returncode", "stdout", "stderr_sha256"}
+        failure = {"evidence_id", "command", "returncode", "failure_class", "stdout_sha256", "stderr_sha256"}
+        if not isinstance(value, dict) or frozenset(value) not in {frozenset(success), frozenset(failure)}:
             raise RuntimeError("cached target capability output is missing")
         if value["evidence_id"] != evidence_id or value["command"] != [str(item) for item in argv]:
             raise RuntimeError("cached target capability identity conflicts")
         evidence = CommandEvidence(
             evidence_id, deepcopy(value["command"]), value["returncode"],
-            value["stdout"], value["stderr"],
+            value.get("stdout", ""), "[REDACTED]",
         )
         if evidence.returncode != 0:
             raise ProbeFailed(evidence)

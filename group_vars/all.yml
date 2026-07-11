@@ -215,6 +215,10 @@ live_discovery_source_probe_config_file_local: ""
 live_discovery_target_probe_config_file_local: ""
 live_discovery_source_cinder_sensitive_evidence_file_local: ""
 live_discovery_target_cinder_sensitive_evidence_file_local: ""
+# Optional 0600 JSON envelope. It records a recent timestamp, exact live
+# database revisions for Nova/Neutron/Cinder/Glance, and completed rc=0
+# Nova/Cinder online-migration evidence. It is evidence only: no migration is
+# executed by this playbook.
 live_discovery_target_online_migration_evidence_file_local: ""
 live_discovery_source_glance_token_file_local: ""
 live_discovery_target_glance_token_file_local: ""

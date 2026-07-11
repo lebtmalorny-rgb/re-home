@@ -135,9 +135,15 @@ OVS dataplane и storage helpers.
   inspect/DB команды имеют `changed_when: false`; SQL валидируется как
   SELECT-only. Credentials, HMAC key, Glance token, probe/capability configs,
   raw Cinder evidence и опциональное timestamped evidence уже выполненных
-  Nova/Cinder online migrations имеют режим `0600`. Входные байты один раз
+  Nova/Cinder online migrations имеют режим `0600`. Migration envelope также
+  фиксирует live revisions Nova API/cell, Neutron heads, Cinder и Glance;
+  профиль Epoxy подтверждается только при точном совпадении revisions и
+  `completed=true` для свежего evidence. Входные байты один раз
   фиксируются под sibling owner-lock `.control/owners/<run-id>`; caller paths
-  после этого повторно не читаются. Сам playbook online migrations не запускает.
+  после этого повторно не читаются. Owner-lock проверяется по случайному token;
+  failure и unreachable на любом последующем play удаляют только собственный
+  незавершённый lock, а success сохраняет `completed` marker без secret bytes.
+  Сам playbook online migrations не запускает.
 - **Artifacts:**
   `{{ local_artifact_dir }}/live-discovery/<run-id>/readiness-report.json` и
   companion JSON/YAML/Markdown evidence artifacts.
@@ -149,6 +155,9 @@ OVS dataplane и storage helpers.
   но без явно реализованного безопасного probe template дают `UNKNOWN`. Exit
   code assembler, отличный от
   `0` (`UNKNOWN`/`BLOCKED`), завершает playbook ошибкой.
+  Runtime collector rc `2` является семантическим verdict: artifact сначала
+  проверяется тем же контрактом, что использует assembler, затем итоговый
+  `BLOCKED/UNKNOWN` формируется локальным assembler. Иные rc аварийны.
 
 ### `03-backup-databases.yml`
 

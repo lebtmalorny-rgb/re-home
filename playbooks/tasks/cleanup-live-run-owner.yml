@@ -1,26 +1,17 @@
 ---
-- name: Live discovery owner cleanup | read current owner marker
-  ansible.builtin.slurp:
-    src: "{{ hostvars['localhost'].live_discovery_run_owner_dir }}/run-owner.json"
-  register: live_discovery_cleanup_owner_raw
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
-- name: Live discovery owner cleanup | require own incomplete lock
-  ansible.builtin.assert:
-    that:
-      - (live_discovery_cleanup_owner_raw.content | b64decode | from_json).run_id == hostvars['localhost'].live_discovery_frozen_run_id
-      - (live_discovery_cleanup_owner_raw.content | b64decode | from_json).owner_token == hostvars['localhost'].live_discovery_run_owner_token
-      - (live_discovery_cleanup_owner_raw.content | b64decode | from_json).status == 'running'
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
 - name: Live discovery owner cleanup | remove only own incomplete lock
-  ansible.builtin.file:
-    path: "{{ hostvars['localhost'].live_discovery_run_owner_dir }}"
-    state: absent
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py"
+      - cleanup
+      - --owner
+      - "{{ hostvars['localhost'].live_discovery_run_owner_dir }}"
+      - --run-id
+      - "{{ hostvars['localhost'].live_discovery_frozen_run_id }}"
+      - --token
+      - "{{ hostvars['localhost'].live_discovery_run_owner_token }}"
   delegate_to: localhost
   run_once: true
+  changed_when: true
   no_log: true
