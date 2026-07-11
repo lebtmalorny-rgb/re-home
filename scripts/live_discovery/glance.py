@@ -349,6 +349,7 @@ class GlanceCollector:
         for evidence in (stores_evidence, capabilities_evidence):
             if evidence:
                 inventory_evidence_ids.append(next(iter(evidence.values())))
+        inventory_evidence_ids = list(dict.fromkeys(inventory_evidence_ids))
         inventory_node = ResourceNode(
             "glance_store_inventory", f"{self.side}-enabled-stores", self.side,
             {

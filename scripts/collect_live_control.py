@@ -605,6 +605,65 @@ class _SchemaBoundCombinedClient:
         return getattr(self._client, name)
 
 
+class _ProtectedCinderClient:
+    """Overlay protected attachment fields only on ephemeral collector rows."""
+
+    def __init__(self, client, summaries, sensitive_evidence):
+        if not isinstance(summaries, list) or not isinstance(sensitive_evidence, dict):
+            raise ValueError("protected Cinder overlay is invalid")
+        self._client = client
+        self._by_pair = {}
+        expected_evidence_ids = set()
+        for summary in summaries:
+            if not isinstance(summary, dict):
+                raise ValueError("protected Cinder overlay summary is invalid")
+            evidence_id = summary.get("evidence_id")
+            volume_id = summary.get("volume_id")
+            attachment_id = summary.get("attachment_id")
+            raw = sensitive_evidence.get(evidence_id)
+            connector = raw.get("connector") if isinstance(raw, dict) else None
+            connection_info = raw.get("connection_info") if isinstance(raw, dict) else None
+            driver_type = connection_info.get("driver_volume_type") if isinstance(connection_info, dict) else None
+            normalized_driver = "nfs" if driver_type == "file" else driver_type
+            pair = (volume_id, attachment_id)
+            if (
+                not isinstance(evidence_id, str)
+                or raw is None
+                or raw.get("volume_id") != volume_id
+                or raw.get("attachment_id") != attachment_id
+                or not isinstance(connector, dict)
+                or connector.get("volume_id") != volume_id
+                or connector.get("attachment_id") != attachment_id
+                or not isinstance(connection_info, dict)
+                or normalized_driver != summary.get("backend_kind")
+                or pair in self._by_pair
+            ):
+                raise ValueError("protected Cinder overlay identity is invalid")
+            expected_evidence_ids.add(evidence_id)
+            self._by_pair[pair] = {
+                "connector": deepcopy(connector),
+                "connection_info": deepcopy(connection_info),
+            }
+        if set(sensitive_evidence) != expected_evidence_ids:
+            raise ValueError("protected Cinder overlay evidence set is invalid")
+
+    def db_records(self, table, filters=None):
+        rows, evidence = self._client.db_records(table, filters)
+        if table != "volume_attachment":
+            return rows, evidence
+        overlaid = deepcopy(rows)
+        for envelope in overlaid:
+            row = envelope.get("row") if isinstance(envelope, dict) else None
+            pair = (row.get("volume_id"), row.get("id")) if isinstance(row, dict) else None
+            protected = self._by_pair.get(pair)
+            if protected is not None:
+                row.update(deepcopy(protected))
+        return overlaid, evidence
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
 class _CachedCapabilityRunner:
     def __init__(self, outputs):
         self.outputs = outputs if isinstance(outputs, dict) else {}
@@ -792,7 +851,7 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
     return cinder
 
 
-def _compose_collectors(side, api_result, records, evidence, snapshot):
+def _compose_collectors(side, api_result, records, evidence, snapshot, sensitive_evidence=None):
     client = _CombinedClient(side, api_result, records, evidence)
     collector_schema = getattr(snapshot, "tables", snapshot)
     nova_client = _SchemaBoundCombinedClient(client, NOVA_DB_SCHEMAS)
@@ -833,7 +892,15 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
             api_result.get("target_qemu_argv", ["qemu-system-x86_64"]),
         ))
     results.append(NeutronCollector(neutron_client, side, collector_schema).collect(port_ids))
-    cinder = CinderCollector(cinder_client, side, collector_schema).collect(volume_ids)
+    protected_cinder_client = (
+        _ProtectedCinderClient(
+            cinder_client,
+            api_result.get("cinder_connection_summaries", []),
+            sensitive_evidence,
+        )
+        if sensitive_evidence is not None else cinder_client
+    )
+    cinder = CinderCollector(protected_cinder_client, side, collector_schema).collect(volume_ids)
     _bind_cinder_connection_summaries(
         cinder, api_result.get("cinder_connection_summaries", [])
     )
@@ -1677,7 +1744,8 @@ def _combine_phase(args):
     if not isinstance(schema_policy, dict):
         raise ValueError("schema policy is invalid")
     collectors, cache_misses, db_cache_misses = _compose_collectors(
-        args.side, api["api_result"], records, evidence, snapshot
+        args.side, api["api_result"], records, evidence, snapshot,
+        sensitive_evidence,
     )
     evidence_index = _build_evidence_index(args.side, collectors, api["api_result"], evidence)
     side_filters = {"source": {}, "target": {}}
@@ -1713,7 +1781,9 @@ def _combine_phase(args):
         "schema_capabilities": capabilities,
         "uuid_filters": side_filters,
         "evidence_index": evidence_index,
-        "sensitive_evidence": sensitive_evidence,
+        # Raw protected connector/connection data is consumed only in memory.
+        # The caller-owned protected input remains the sole persisted copy.
+        "sensitive_evidence": {},
     }
     _write_directory(args.out, {"control-result.json": combined})
 
