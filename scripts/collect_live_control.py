@@ -118,7 +118,7 @@ _ROOT_CATEGORIES = frozenset({
     "volumes", "volume_types", "cinder_services", "qos_specs", "snapshots",
     "groups", "group_snapshots", "images", "projects", "services",
     "compute_nodes", "cells", "flavors", "allocations", "attachments",
-    "barbican_secrets", "image_members", "glance_stores",
+    "encryption_keys", "image_members", "glance_stores",
 })
 
 
@@ -471,39 +471,43 @@ class _CombinedClient:
             return None, {"id": "cached-openstack-response-missing"}
         return deepcopy(self._api[key])
 
-    def db_records(self, table, filters=None):
+    def _db_miss(self, schema, table, filters):
+        miss = {
+            "schema": schema,
+            "table": str(table),
+            "filters": deepcopy(filters) if isinstance(filters, dict) else {},
+        }
+        if _canonical(miss) not in {_canonical(item) for item in self.db_cache_misses}:
+            self.db_cache_misses.append(miss)
+        return [], {
+            "evidence_id": f"{self.side}-db:unknown.{schema}.{table}",
+            **deepcopy(miss),
+        }
+
+    def db_records(self, schema, table, filters=None):
+        identity = f"{schema}.{table}"
+        if identity not in _TABLE_ROOT_FILTERS:
+            raise ValueError("collector DB identity is not allowed")
         exact = [
             item for item in self._records
-            if item["table"] == table
+            if item["schema"] == schema and item["table"] == table
             and (filters is None or item["filters"] == filters)
         ]
         matches = exact
         if not matches and isinstance(filters, dict) and filters:
             matches = [
                 item for item in self._records
-                if item["table"] == table
+                if item["schema"] == schema and item["table"] == table
                 and set(item.get("filters", {})) == set(filters)
                 and all(set(filters[column]).issubset(set(item["filters"][column])) for column in filters)
                 and all(any(
                     planned_column == column
                     and set(item["filters"][column]).issubset(set(self._api_result.get("roots", {}).get(category, [])))
-                    for category, planned_column in _TABLE_ROOT_FILTERS.get(f"{item['schema']}.{table}", ())
+                    for category, planned_column in _TABLE_ROOT_FILTERS.get(identity, ())
                 ) for column in filters)
             ]
         if len(matches) != 1:
-            schemas = sorted({
-                identity.split(".", 1)[0]
-                for identity in _TABLE_ROOT_FILTERS
-                if identity.split(".", 1)[1] == table
-            })
-            miss = {
-                "schema": schemas[0] if len(schemas) == 1 else "unknown",
-                "table": str(table),
-                "filters": deepcopy(filters) if isinstance(filters, dict) else {},
-            }
-            if _canonical(miss) not in {_canonical(item) for item in self.db_cache_misses}:
-                self.db_cache_misses.append(miss)
-            return [], {"evidence_id": f"{self.side}-db:unknown.{table}"}
+            return self._db_miss(schema, table, filters)
         match = matches[0]
         evidence_matches = [
             item for item in self._evidence
@@ -514,16 +518,20 @@ class _CombinedClient:
         if len(evidence_matches) != 1:
             raise ValueError("collector DB evidence identity is ambiguous")
         rows = deepcopy(match["rows"])
+        effective_filters = filters if isinstance(filters, dict) else match["filters"]
         proof = {
             "evidence_id": evidence_matches[0]["evidence_id"],
             "schema": match["schema"], "table": match["table"],
-            "filters": deepcopy(filters if filters is not None else match["filters"]),
+            "filters": deepcopy(effective_filters),
         }
         if filters is not None and match["filters"] != filters:
             rows = [row for row in rows if any(row.get("row", {}).get(column) in values for column, values in filters.items())]
+        if identity in {"nova.services", "cinder.services"} and effective_filters and not rows:
+            return self._db_miss(schema, table, effective_filters)
         return rows, proof
 
     def glance_store_capabilities(self, evidence_id):
+        del evidence_id
         values = self._api_result.get("glance_store_capabilities", [])
         if not isinstance(values, list):
             raise ValueError("Glance store capabilities are invalid")
@@ -536,7 +544,7 @@ class _CombinedClient:
             ):
                 raise ValueError("Glance store capability row is invalid")
             normalized.append(deepcopy(item))
-        return normalized, {"evidence_id": evidence_id}
+        return normalized, {"evidence_id": f"glance-{self.side}-stores-info"}
 
     def probe_image_data(self, image_id, expected_size, required):
         values = self._api_result.get("glance_data_probe_results", [])
@@ -578,6 +586,23 @@ class _CombinedClient:
             f"glance.image-data.{image_id}", status, reason,
             [f"image:{image_id}"], [matches[0]["evidence_id"]],
         )
+
+
+class _SchemaBoundCombinedClient:
+    """Expose a collector's table names only within its reviewed DB schemas."""
+
+    def __init__(self, client, table_schemas):
+        self._client = client
+        self._table_schemas = dict(table_schemas)
+
+    def db_records(self, table, filters=None):
+        schema = self._table_schemas.get(table)
+        if schema is None:
+            raise ValueError("collector DB table is not bound to a schema")
+        return self._client.db_records(schema, table, filters)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
 
 
 class _CachedCapabilityRunner:
@@ -730,7 +755,7 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
             and volume_node.facts.get("storage_backend_id") == backend_id
             and backend_id in backend_nodes
             and (f"volume:{volume_id}", f"storage_backend:{backend_id}") in required_backend_edges
-            and graph_driver == backend_kind
+            and graph_driver in {None, backend_kind}
             and (volume_id, attachment_id) not in bound_pairs
         )
         if not valid:
@@ -738,6 +763,10 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
             continue
         summaries_by_volume.setdefault(volume_id, []).append(summary)
         bound_pairs.add((volume_id, attachment_id))
+        if graph_driver is None:
+            sanitized_summary = deepcopy(connection_summary) if isinstance(connection_summary, dict) else {}
+            sanitized_summary["driver_type"] = backend_kind
+            attachment_node.facts["connection_summary"] = sanitized_summary
         attachment_node.evidence_ids.append(summary["evidence_id"])
         volume_node.evidence_ids.append(summary["evidence_id"])
     for volume_id, summaries in summaries_by_volume.items():
@@ -765,9 +794,20 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
 
 def _compose_collectors(side, api_result, records, evidence, snapshot):
     client = _CombinedClient(side, api_result, records, evidence)
+    collector_schema = getattr(snapshot, "tables", snapshot)
+    nova_client = _SchemaBoundCombinedClient(client, NOVA_DB_SCHEMAS)
+    neutron_client = _SchemaBoundCombinedClient(client, {
+        table: "neutron" for table in (
+            set(NEUTRON_CORE_TABLES)
+            | {table for family in NEUTRON_OPTIONAL_TABLE_FAMILIES.values() for table in family}
+        )
+    })
+    cinder_client = _SchemaBoundCombinedClient(client, {
+        table: "cinder" for table in set(CINDER_CORE_TABLES) | set(CINDER_OPTIONAL_TABLES)
+    })
     results = []
     if side == "source":
-        nova = NovaCollector(client, side).collect(api_result.get("rehome_host", ""))
+        nova = NovaCollector(nova_client, side).collect(api_result.get("rehome_host", ""))
         results.append(nova)
         port_ids = _dependency_ids(nova, "port")
         volume_ids = _dependency_ids(nova, "volume")
@@ -792,8 +832,8 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
             api_result.get("target_virsh_argv", ["virsh"]),
             api_result.get("target_qemu_argv", ["qemu-system-x86_64"]),
         ))
-    results.append(NeutronCollector(client, side, snapshot).collect(port_ids))
-    cinder = CinderCollector(client, side, snapshot).collect(volume_ids)
+    results.append(NeutronCollector(neutron_client, side, collector_schema).collect(port_ids))
+    cinder = CinderCollector(cinder_client, side, collector_schema).collect(volume_ids)
     _bind_cinder_connection_summaries(
         cinder, api_result.get("cinder_connection_summaries", [])
     )
@@ -914,7 +954,7 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
         elif identity in cached:
             add({"evidence_id":identity,"kind":"openstack-json","side":side,"service":service,"command":cached[identity]})
         else:
-            raise ValueError("collector evidence is absent from acquired closure")
+            raise ValueError(f"collector evidence is absent from acquired closure: {identity}")
     return [by_id[key] for key in sorted(by_id)]
 
 
@@ -1305,7 +1345,7 @@ def _expand_live_api_roots(roots, acquire, side, *, need_glance_catalog=False):
                 extend("attachments", _deep_payload_ids(payload, "attachment_id", "attachments"))
                 extend("groups", _deep_payload_ids(payload, "group_id", "consistencygroup_id"))
                 extend("group_snapshots", _deep_payload_ids(payload, "group_snapshot_id"))
-                extend("barbican_secrets", _payload_ids(payload, "encryption_key_id", "encryption_key_uuid", "secret_id", "key_id"))
+                extend("encryption_keys", _payload_ids(payload, "encryption_key_id", "encryption_key_uuid", "secret_id", "key_id"))
             elif category == "attachments":
                 payload = acquire(["volume", "attachment", "show", identity, "-f", "json"], f"cinder-{side}-attachment-show-{identity}")
                 extend("volumes", _deep_payload_ids(payload, "volume_id"))
@@ -1313,7 +1353,7 @@ def _expand_live_api_roots(roots, acquire, side, *, need_glance_catalog=False):
             elif category == "volume_types":
                 payload = acquire(["volume", "type", "show", identity, "-f", "json"], f"cinder-{side}-volume-type-show-{identity}")
                 extend("qos_specs", _deep_payload_ids(payload, "qos_specs_id", "qos_spec_id"))
-                extend("barbican_secrets", _deep_payload_ids(payload, "key_id", "secret_id"))
+                extend("encryption_keys", _deep_payload_ids(payload, "key_id", "secret_id"))
             elif category == "qos_specs":
                 payload = acquire(["volume", "qos", "show", identity, "-f", "json"], f"cinder-{side}-qos-show-{identity}")
             elif category == "snapshots":
@@ -1326,7 +1366,7 @@ def _expand_live_api_roots(roots, acquire, side, *, need_glance_catalog=False):
             elif category == "group_snapshots":
                 payload = acquire(["volume", "group", "snapshot", "show", identity, "-f", "json"], f"cinder-{side}-group-snapshot-show-{identity}")
                 extend("groups", _deep_payload_ids(payload, "group_id"))
-            elif category == "barbican_secrets":
+            elif category == "encryption_keys":
                 payload = acquire(["secret", "get", identity, "-f", "json"], f"cinder-{side}-secret-get-{identity}")
             elif category == "images":
                 payload = acquire(["image", "show", identity, "-f", "json"], f"glance-{side}-image-show-{identity}")
@@ -1381,7 +1421,7 @@ def _api_phase(args):
             "groups": [], "group_snapshots": [], "images": [], "projects": [],
             "services": [], "compute_nodes": [], "cells": [],
             "flavors": [], "allocations": [], "attachments": [],
-            "barbican_secrets": [], "image_members": [], "glance_stores": [],
+            "encryption_keys": [], "image_members": [], "glance_stores": [],
         }
         if args.root_manifest is not None:
             manifest = _read_protected_json(args.root_manifest)
