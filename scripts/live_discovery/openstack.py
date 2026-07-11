@@ -4,7 +4,7 @@ import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .contract import CheckResult, CollectorResult, ResourceNode
-from .runner import ProbeFailed
+from .runner import CommandEvidence, ProbeFailed
 
 
 CANONICAL_RELEASE = "2025.1"
@@ -14,7 +14,6 @@ ONLINE_MIGRATION_EVIDENCE_FUTURE_TOLERANCE = timedelta(minutes=5)
 ONLINE_MIGRATION_SERVICES = ("nova", "cinder")
 ONLINE_MIGRATION_ARTIFACT_FIELDS = (
     "evidence_id",
-    "command",
     "timestamp",
     "returncode",
 )
@@ -29,12 +28,23 @@ def _has_output_format(arguments: Sequence[str]) -> bool:
     )
 
 
-def _invalid_json_failure(evidence) -> ProbeFailed:
-    failure = ProbeFailed(evidence)
-    failure.reason = "invalid-json"
-    failure.args = (
-        f"probe {evidence.evidence_id!r} failed: invalid-json",
+def _sanitized_probe_failure(
+    evidence: object,
+    reason: Optional[str] = None,
+) -> ProbeFailed:
+    sanitized = CommandEvidence(
+        evidence_id=str(getattr(evidence, "evidence_id", "unknown")),
+        argv=["[REDACTED]"],
+        returncode=int(getattr(evidence, "returncode", -1)),
+        stdout="[REDACTED]",
+        stderr="[REDACTED]",
     )
+    failure = ProbeFailed(sanitized)
+    if reason is not None:
+        failure.reason = reason
+        failure.args = (
+            f"probe {sanitized.evidence_id!r} failed: {reason}",
+        )
     return failure
 
 
@@ -95,6 +105,9 @@ def _sanitized_online_migration_evidence(
             for field in ONLINE_MIGRATION_ARTIFACT_FIELDS
             if field in artifact
         }
+        expected_command = [f"{service}-manage", "db", "online_data_migrations"]
+        if artifact.get("command") == expected_command:
+            sanitized[service]["command"] = expected_command
     return sanitized
 
 
@@ -173,11 +186,21 @@ class OpenStackClient:
             self.cloud,
             *arguments,
         ]
-        evidence = self.runner.run(argv, evidence_id)
+        command_failure = None
+        try:
+            evidence = self.runner.run(argv, evidence_id)
+        except ProbeFailed as error:
+            command_failure = _sanitized_probe_failure(error.evidence)
+        if command_failure is not None:
+            raise command_failure from None
+
+        parse_failure = None
         try:
             payload = json.loads(evidence.stdout)
-        except (json.JSONDecodeError, TypeError) as error:
-            raise _invalid_json_failure(evidence) from error
+        except (json.JSONDecodeError, TypeError):
+            parse_failure = _sanitized_probe_failure(evidence, "invalid-json")
+        if parse_failure is not None:
+            raise parse_failure from None
         return payload, _sanitized_json_evidence(evidence)
 
 

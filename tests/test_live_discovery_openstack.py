@@ -84,7 +84,13 @@ class OpenStackClientTests(unittest.TestCase):
     def test_client_wraps_invalid_json_as_probe_failure(self):
         class InvalidJsonRunner:
             def run(self, argv, evidence_id, sensitive_stdout=False):
-                return CommandEvidence(evidence_id, list(argv), 0, "not-json", "")
+                return CommandEvidence(
+                    evidence_id,
+                    [*argv, "invalid-json-argv-secret"],
+                    0,
+                    "invalid-json-stdout-secret",
+                    "invalid-json-stderr-secret",
+                )
 
         client = OpenStackClient(
             InvalidJsonRunner(),
@@ -98,14 +104,23 @@ class OpenStackClientTests(unittest.TestCase):
 
         self.assertEqual("invalid-json", raised.exception.reason)
         self.assertIsInstance(raised.exception.evidence, CommandEvidence)
+        serialized = str(raised.exception.evidence.to_dict())
+        self.assertNotIn("invalid-json-argv-secret", serialized)
+        self.assertNotIn("invalid-json-stdout-secret", serialized)
+        self.assertNotIn("invalid-json-stderr-secret", serialized)
+        self.assertEqual(["[REDACTED]"], raised.exception.evidence.argv)
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stdout)
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stderr)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
-    def test_client_propagates_command_probe_failure(self):
+    def test_client_sanitizes_command_probe_failure(self):
         failure_evidence = CommandEvidence(
             "failed-command",
-            ["openstack", "server", "list"],
+            ["openstack", "server", "show", "failure-argv-secret"],
             2,
-            "",
-            "permission denied",
+            "failure-stdout-secret",
+            "failure-stderr-secret",
         )
 
         class FailingRunner:
@@ -122,7 +137,16 @@ class OpenStackClientTests(unittest.TestCase):
         with self.assertRaises(ProbeFailed) as raised:
             client.json(["server", "list"], "failed-command", required=False)
 
-        self.assertIs(failure_evidence, raised.exception.evidence)
+        self.assertIsNot(failure_evidence, raised.exception.evidence)
+        serialized = str(raised.exception.evidence.to_dict())
+        self.assertNotIn("failure-argv-secret", serialized)
+        self.assertNotIn("failure-stdout-secret", serialized)
+        self.assertNotIn("failure-stderr-secret", serialized)
+        self.assertEqual(["[REDACTED]"], raised.exception.evidence.argv)
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stdout)
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stderr)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_client_sanitizes_raw_stdout_and_stderr_from_evidence(self):
         class SecretEvidenceRunner:
@@ -389,6 +413,25 @@ class TargetProfileTests(unittest.TestCase):
             "unknown-secret-password",
         ):
             self.assertNotIn(secret, serialized)
+
+    def test_profile_omits_secret_bearing_invalid_command(self):
+        outputs = self.fresh_manage_outputs()
+        outputs["online_migration_evidence"]["nova"]["command"].append(
+            "--password=command-secret"
+        )
+
+        result = self.collect(outputs)
+
+        artifact = result.nodes[0].facts["online_migration_evidence"]["nova"]
+        self.assertNotIn("command", artifact)
+        self.assertNotIn("command-secret", json.dumps(result.to_dict()))
+        check = next(
+            item
+            for item in result.checks
+            if item.check_id == "target.nova.online-data-migrations"
+        )
+        self.assertEqual("UNKNOWN", check.status)
+        self.assertEqual("nova online migration evidence command invalid", check.reason)
 
 
 if __name__ == "__main__":
