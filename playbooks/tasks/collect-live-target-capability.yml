@@ -106,10 +106,10 @@
           '--out', hostvars['localhost'].live_discovery_frozen_protected_dir + '/target-capability-input.json'] +
          (['--online-migration-evidence', hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local]
           if hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local | length > 0 else []) }}
+    stdin: "{{ hostvars['localhost'].live_discovery_target_capability_records | to_json }}"
+    stdin_add_newline: false
   delegate_to: localhost
   register: live_discovery_target_capability_build
-  stdin: "{{ hostvars['localhost'].live_discovery_target_capability_records | to_json }}"
-  stdin_add_newline: false
   changed_when: false
   failed_when: false
   no_log: true

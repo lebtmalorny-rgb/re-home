@@ -40,4 +40,3 @@
       - "{{ live_discovery_run_owner_token }}"
   changed_when: true
   no_log: true
-

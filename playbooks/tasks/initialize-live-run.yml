@@ -2,17 +2,17 @@
   ansible.builtin.set_fact:
     live_discovery_protected_input_manifest:
       - {key: phase-hmac.key, path: "{{ live_discovery_phase_hmac_key_file_local }}", type: hmac, required: true}
-    - {key: source-probe-config.json, path: "{{ live_discovery_source_probe_config_file_local }}", type: probe, required: true}
-    - {key: target-probe-config.json, path: "{{ live_discovery_target_probe_config_file_local }}", type: probe, required: true}
+      - {key: source-probe-config.json, path: "{{ live_discovery_source_probe_config_file_local }}", type: probe, required: true}
+      - {key: target-probe-config.json, path: "{{ live_discovery_target_probe_config_file_local }}", type: probe, required: true}
       - {key: source-glance-token, path: "{{ live_discovery_source_glance_token_file_local }}", type: token, required: true}
       - {key: target-glance-token, path: "{{ live_discovery_target_glance_token_file_local }}", type: token, required: true}
       - {key: source-clouds.yaml, path: "{{ source_clouds_file_local }}", type: clouds, required: true}
       - {key: target-clouds.yaml, path: "{{ target_clouds_file_local }}", type: clouds, required: true}
       - {key: source-kolla-passwords.yml, path: "{{ live_discovery_source_kolla_passwords_file_local }}", type: passwords, required: true}
       - {key: target-kolla-passwords.yml, path: "{{ live_discovery_target_kolla_passwords_file_local }}", type: passwords, required: true}
-    - {key: source-cinder-sensitive-evidence.json, path: "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
-    - {key: target-cinder-sensitive-evidence.json, path: "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
-    - {key: target-online-migration-evidence.json, path: "{{ live_discovery_target_online_migration_evidence_file_local }}", type: migration, required: false}
+      - {key: source-cinder-sensitive-evidence.json, path: "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
+      - {key: target-cinder-sensitive-evidence.json, path: "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}", type: cinder, required: false}
+      - {key: target-online-migration-evidence.json, path: "{{ live_discovery_target_online_migration_evidence_file_local }}", type: migration, required: false}
   no_log: true
 
 - name: Live discovery | validate and freeze every protected input from one fd

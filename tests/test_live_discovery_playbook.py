@@ -36,6 +36,28 @@ def _task11_text():
     )
 
 
+def _dynamic_task_paths():
+    pattern = re.compile(r"(?:ansible\.builtin\.)?(?:include|import)_tasks:\s*([^\s#]+)")
+    pending = [PLAYBOOK]
+    discovered = []
+    seen = set()
+    while pending:
+        owner = pending.pop()
+        for raw in pattern.findall(owner.read_text(encoding="utf-8")):
+            if "{{" in raw:
+                raise AssertionError(f"dynamic task path cannot be statically verified: {raw}")
+            candidate = (owner.parent / raw).resolve()
+            if not candidate.is_file():
+                # Playbook references use paths relative to playbooks/, while
+                # nested task includes are relative to their own directory.
+                candidate = (ROOT / "playbooks" / raw).resolve()
+            if candidate not in seen:
+                seen.add(candidate)
+                discovered.append(candidate)
+                pending.append(candidate)
+    return sorted(discovered)
+
+
 def _top_level_play_names(text):
     return re.findall(r"(?m)^- name: (.+)$", text)
 
@@ -58,6 +80,39 @@ def _walk(value):
 
 
 class LiveDiscoveryPlaybookTests(unittest.TestCase):
+    def test_every_dynamic_task_include_parses_independently(self):
+        paths = _dynamic_task_paths()
+        self.assertGreaterEqual(len(paths), 8)
+        if yaml is not None:
+            for path in paths:
+                with self.subTest(parser="yaml", path=path.name):
+                    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+                    self.assertIsInstance(payload, list)
+        if shutil.which("ansible-playbook"):
+            with tempfile.TemporaryDirectory() as temporary:
+                harness = Path(temporary) / "parse-task-includes.yml"
+                imports = "\n".join(
+                    f"    - name: Parse {path.name}\n"
+                    f"      ansible.builtin.import_tasks: {json.dumps(str(path))}"
+                    for path in paths
+                )
+                harness.write_text(
+                    "---\n- name: Parse every Task 11 include\n"
+                    "  hosts: localhost\n  gather_facts: false\n  tasks:\n"
+                    f"{imports}\n",
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    ["ansible-playbook", "-i", "localhost,", str(harness), "--syntax-check"],
+                    cwd=ROOT,
+                    env={**os.environ, "ANSIBLE_LOCAL_TEMP": temporary},
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_playbook_has_exactly_seven_ordered_plays(self):
         names = [play["name"] for play in _yaml_documents(PLAYBOOK)]
         self.assertEqual(len(names), 7)
