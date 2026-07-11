@@ -109,6 +109,269 @@ def classify_mutation(argv: Sequence[object]) -> Optional[str]:
     return None
 
 
+@dataclass(frozen=True)
+class _SqlToken:
+    kind: str
+    value: str
+
+
+_SQL_RESERVED_WORDS = {
+    "AND", "AS", "ASC", "BY", "DESC", "FALSE", "FROM", "IN", "IS",
+    "LIKE", "NOT", "NULL", "OR", "ORDER", "SELECT", "TRUE", "WHERE",
+}
+
+
+def _malformed_sql() -> MutationRejected:
+    return MutationRejected("malformed SELECT statement")
+
+
+def _tokenize_select_sql(statement: str) -> List[_SqlToken]:
+    tokens: List[_SqlToken] = []
+    index = 0
+    while index < len(statement):
+        character = statement[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+            kind = "IDENT" if quote == "`" else "STRING"
+            index += 1
+            start = index
+            closed = False
+            while index < len(statement):
+                current = statement[index]
+                if current == "\\":
+                    index += 2
+                    continue
+                if current == quote:
+                    if index + 1 < len(statement) and statement[index + 1] == quote:
+                        index += 2
+                        continue
+                    closed = True
+                    break
+                index += 1
+            if not closed or (kind == "IDENT" and index == start):
+                raise _malformed_sql()
+            tokens.append(_SqlToken(kind, statement[start:index]))
+            index += 1
+            continue
+        word = re.match(r"[A-Za-z_][A-Za-z0-9_]*", statement[index:])
+        if word:
+            value = word.group(0)
+            tokens.append(_SqlToken("WORD", value))
+            index += len(value)
+            continue
+        number = re.match(r"\d+(?:\.\d+)?", statement[index:])
+        if number:
+            value = number.group(0)
+            tokens.append(_SqlToken("NUMBER", value))
+            index += len(value)
+            continue
+        two_character = statement[index:index + 2]
+        if two_character in {"!=", "<=", ">=", "<>"}:
+            tokens.append(_SqlToken("OP", two_character))
+            index += 2
+            continue
+        if character in "=<>+-/":
+            tokens.append(_SqlToken("OP", character))
+            index += 1
+            continue
+        if character in "(),.*;":
+            tokens.append(_SqlToken("SYMBOL", character))
+            index += 1
+            continue
+        raise _malformed_sql()
+    return tokens
+
+
+class _SelectParser:
+    """Parse scalar SELECT or SELECT-list FROM table [WHERE] [ORDER BY]."""
+
+    def __init__(self, tokens: Sequence[_SqlToken]) -> None:
+        self.tokens = list(tokens)
+        self.index = 0
+
+    def parse(self) -> None:
+        self._expect_keyword("SELECT")
+        item_kinds = [self._parse_select_item()]
+        while self._accept_symbol(","):
+            item_kinds.append(self._parse_select_item())
+
+        if self._accept_keyword("FROM"):
+            self._parse_table_reference()
+            if self._accept_keyword("WHERE"):
+                self._parse_predicate()
+            if self._accept_keyword("ORDER"):
+                self._expect_keyword("BY")
+                self._parse_order_list()
+        elif len(item_kinds) != 1 or item_kinds[0] not in {
+            "function", "group", "literal",
+        }:
+            raise _malformed_sql()
+
+        if self._peek() is not None:
+            raise _malformed_sql()
+
+    def _peek(self) -> Optional[_SqlToken]:
+        if self.index >= len(self.tokens):
+            return None
+        return self.tokens[self.index]
+
+    def _advance(self) -> _SqlToken:
+        token = self._peek()
+        if token is None:
+            raise _malformed_sql()
+        self.index += 1
+        return token
+
+    def _is_keyword(self, token: Optional[_SqlToken], keyword: str) -> bool:
+        return (
+            token is not None
+            and token.kind == "WORD"
+            and token.value.upper() == keyword
+        )
+
+    def _accept_keyword(self, keyword: str) -> bool:
+        if not self._is_keyword(self._peek(), keyword):
+            return False
+        self.index += 1
+        return True
+
+    def _expect_keyword(self, keyword: str) -> None:
+        if not self._accept_keyword(keyword):
+            raise _malformed_sql()
+
+    def _accept_symbol(self, value: str) -> bool:
+        token = self._peek()
+        if token is None or token.kind != "SYMBOL" or token.value != value:
+            return False
+        self.index += 1
+        return True
+
+    def _expect_symbol(self, value: str) -> None:
+        if not self._accept_symbol(value):
+            raise _malformed_sql()
+
+    def _parse_identifier(self) -> None:
+        token = self._peek()
+        if token is None:
+            raise _malformed_sql()
+        if token.kind == "IDENT" or (
+            token.kind == "WORD"
+            and token.value.upper() not in _SQL_RESERVED_WORDS
+        ):
+            self.index += 1
+            return
+        raise _malformed_sql()
+
+    def _parse_select_item(self) -> str:
+        if self._accept_symbol("*"):
+            kind = "star"
+        else:
+            kind = self._parse_expression()
+        if self._accept_keyword("AS"):
+            self._parse_identifier()
+        return kind
+
+    def _parse_expression(self) -> str:
+        token = self._peek()
+        if token is None:
+            raise _malformed_sql()
+        if token.kind == "OP" and token.value in {"+", "-"}:
+            self._advance()
+            return self._parse_expression()
+        if (
+            token.kind in {"NUMBER", "STRING"}
+            or self._is_keyword(token, "NULL")
+            or self._is_keyword(token, "TRUE")
+            or self._is_keyword(token, "FALSE")
+        ):
+            self._advance()
+            return "literal"
+        if self._accept_symbol("("):
+            self._parse_expression()
+            self._expect_symbol(")")
+            return "group"
+        if token.kind not in {"IDENT", "WORD"}:
+            raise _malformed_sql()
+
+        self._parse_identifier()
+        if self._accept_symbol("("):
+            if self._accept_symbol(")"):
+                return "function"
+            if self._accept_symbol("*"):
+                self._expect_symbol(")")
+                return "function"
+            self._parse_expression()
+            while self._accept_symbol(","):
+                self._parse_expression()
+            self._expect_symbol(")")
+            return "function"
+        while self._accept_symbol("."):
+            self._parse_identifier()
+        return "column"
+
+    def _parse_table_reference(self) -> None:
+        self._parse_identifier()
+        if self._accept_symbol("."):
+            self._parse_identifier()
+
+    def _parse_predicate(self) -> None:
+        self._parse_and_predicate()
+        while self._accept_keyword("OR"):
+            self._parse_and_predicate()
+
+    def _parse_and_predicate(self) -> None:
+        self._parse_comparison()
+        while self._accept_keyword("AND"):
+            self._parse_comparison()
+
+    def _parse_comparison(self) -> None:
+        if self._accept_symbol("("):
+            self._parse_predicate()
+            self._expect_symbol(")")
+            return
+
+        self._parse_expression()
+        token = self._peek()
+        if token is not None and token.kind == "OP" and token.value in {
+            "=", "!=", "<", "<=", "<>", ">", ">=",
+        }:
+            self._advance()
+            self._parse_expression()
+            return
+        if self._accept_keyword("LIKE"):
+            self._parse_expression()
+            return
+        if self._accept_keyword("IS"):
+            self._accept_keyword("NOT")
+            self._expect_keyword("NULL")
+            return
+
+        self._accept_keyword("NOT")
+        if self._accept_keyword("IN"):
+            self._expect_symbol("(")
+            self._parse_expression()
+            while self._accept_symbol(","):
+                self._parse_expression()
+            self._expect_symbol(")")
+            return
+        raise _malformed_sql()
+
+    def _parse_order_list(self) -> None:
+        self._parse_order_item()
+        while self._accept_symbol(","):
+            self._parse_order_item()
+
+    def _parse_order_item(self) -> None:
+        self._parse_identifier()
+        while self._accept_symbol("."):
+            self._parse_identifier()
+        if not self._accept_keyword("ASC"):
+            self._accept_keyword("DESC")
+
+
 def validate_select_only_sql(sql: str) -> str:
     statement = sql.strip()
     if any(marker in statement for marker in ("--", "#", "/*", "*/")):
@@ -116,69 +379,14 @@ def validate_select_only_sql(sql: str) -> str:
     for pattern, label in _FORBIDDEN_SQL:
         if re.search(pattern, statement, flags=re.IGNORECASE):
             raise MutationRejected(f"SQL token {label} is not allowed")
-    semicolons = []
-    structural_sql = []
-    quote = None
-    parentheses = 0
-    index = 0
-    while index < len(statement):
-        character = statement[index]
-        if quote is not None:
-            structural_sql.append(" ")
-            if character == "\\":
-                if index + 1 < len(statement):
-                    structural_sql.append(" ")
-                index += 2
-                continue
-            if character == quote:
-                if index + 1 < len(statement) and statement[index + 1] == quote:
-                    structural_sql.append(" ")
-                    index += 2
-                    continue
-                quote = None
-        elif character in {"'", '"', "`"}:
-            structural_sql.append("x")
-            quote = character
-        elif character == "(":
-            structural_sql.append(character)
-            parentheses += 1
-        elif character == ")":
-            structural_sql.append(character)
-            parentheses -= 1
-            if parentheses < 0:
-                raise MutationRejected("malformed SELECT statement")
-        elif character == ";":
-            structural_sql.append(character)
-            semicolons.append(index)
-        else:
-            structural_sql.append(character)
-        index += 1
-    if quote is not None or parentheses != 0:
-        raise MutationRejected("malformed SELECT statement")
-    if semicolons != [len(statement) - 1] or not re.fullmatch(
-        r"SELECT\b[\s\S]*;", statement, flags=re.IGNORECASE
-    ):
+    tokens = _tokenize_select_sql(statement)
+    semicolons = [
+        index for index, token in enumerate(tokens)
+        if token.kind == "SYMBOL" and token.value == ";"
+    ]
+    if semicolons != [len(tokens) - 1]:
         raise MutationRejected("run_sql accepts one SELECT statement ending with ';'")
-    body = "".join(structural_sql[:-1]).rstrip()
-    incomplete_tail = re.search(
-        r"(?:\bFROM|\bWHERE|\bIN|,)\s*$", body, flags=re.IGNORECASE
-    )
-    incomplete_parentheses = re.search(
-        r"(?:\bSELECT|\bFROM|\bWHERE|\bIN)\s*\(\s*\)|\(\s*,|,\s*\)",
-        body,
-        flags=re.IGNORECASE,
-    )
-    incomplete_separators = re.search(
-        r"\bSELECT\s*,|,\s*,", body, flags=re.IGNORECASE
-    )
-    if (
-        re.fullmatch(r"SELECT\s*", body, flags=re.IGNORECASE)
-        or re.match(r"SELECT\s+FROM\b", body, flags=re.IGNORECASE)
-        or incomplete_tail
-        or incomplete_parentheses
-        or incomplete_separators
-    ):
-        raise MutationRejected("malformed SELECT statement")
+    _SelectParser(tokens[:-1]).parse()
     return statement
 
 
