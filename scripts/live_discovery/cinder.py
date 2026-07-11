@@ -372,12 +372,9 @@ def _connection_summary(
 ) -> Dict[str, Any]:
     payload = _parse_mapping(value) or {}
     driver = _field(payload, "driver_volume_type", "driver_type")
-    driver_type = (
-        driver
-        if isinstance(driver, str)
-        and driver in _SUPPORTED_ATTACHMENT_DRIVERS
-        else None
-    )
+    driver_type = None
+    if isinstance(driver, str) and driver in _SUPPORTED_ATTACHMENT_DRIVERS:
+        driver_type = "nfs" if driver == "file" else driver
     data = _field(payload, "data")
     data = data if isinstance(data, Mapping) else {}
     target_count = 0

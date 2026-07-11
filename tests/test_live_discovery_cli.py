@@ -632,6 +632,28 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             self.assertEqual("READY",report["verdict"])
             normal="\n".join(path.read_text(encoding="utf-8") for path in assembled_out.rglob("*") if path.is_file() and "sensitive" not in path.parts)
             self.assertNotIn("driver_volume_type",normal); self.assertNotIn("10.0.0.10",normal)
+            file_root=root/"file-source"; file_root.mkdir()
+            file_manifest=deepcopy(root_manifest); file_manifest["side"]="source"
+            file_roots=file_root/"roots.json"; file_roots.write_text(json.dumps(file_manifest),encoding="utf-8"); file_roots.chmod(0o600)
+            file_path=f"/srv/cinder/volume-{ids['volume']}"
+            file_probe={"schema_version":"openstack-rehome-probe-config/v1alpha1","storage":[{"volume_id":ids["volume"],"scope":"source-compute","kind":"file","backend_id":"rbd-backend","resource":{"path":file_path,"allowed_roots":["/srv/cinder"],"expected_size":1024**3}}],"glance":{"endpoint_url":"https://glance.example","token_env":"LIVE_DISCOVERY_GLANCE_TOKEN","images":[{"image_id":ids["image"],"expected_size":1024,"required":True,"store_ids":["rbd"]}],"store_capabilities":[{"store_id":"rbd","backend_type":"rbd"}]}}
+            file_probe_path=file_root/"probe.json"; file_probe_path.write_text(json.dumps(file_probe),encoding="utf-8"); file_probe_path.chmod(0o600)
+            file_api=file_root/"api"
+            file_api_args=type("Args",(),{"fixture":None,"rehome_host":host,"cloud":"cloud","clouds_file":Path("/clouds.yaml"),"container":"toolbox","side":"source","information_schema":schema,"root_manifest":file_roots,"probe_config":file_probe_path,"capability_config":None,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_PHASE_KEY","out":file_api})()
+            _api_phase(file_api_args)
+            file_plan=json.loads((file_api/"db-query-plan.json").read_text())["queries"]
+            file_db=file_root/"db"; write_db(file_plan,file_db)
+            file_entries=[{"evidence_id":f"cinder-source-file-{attachment_id}","volume_id":ids["volume"],"attachment_id":attachment_id,"backend_kind":"file","backend_id":"rbd-backend","resource_identity":file_path,"connector":{"host":host,"attachment_id":attachment_id,"volume_id":ids["volume"]},"connection_info":{"driver_volume_type":"file","data":{"path":file_path}}} for attachment_id in (ids["attachment"],ids["attachment2"])]
+            file_sensitive=file_root/"cinder-sensitive.json"; file_sensitive.write_text(json.dumps({"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":file_entries}),encoding="utf-8"); file_sensitive.chmod(0o600)
+            file_out=file_root/"combined"
+            file_combine=type("Args",(),{"api_result":file_api/"api-result.json","side":"source","fixture_phase":False,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_PHASE_KEY","cinder_sensitive_evidence":file_sensitive,"db_jsonl_dir":file_db,"information_schema":schema,"schema_policy":policy,"out":file_out})()
+            control._combine_phase(file_combine)
+            file_bundle=json.loads((file_out/"control-result.json").read_text())
+            file_cinder=next(item for item in file_bundle["collectors"] if item["service"]=="cinder")
+            self.assertEqual([],file_cinder["blockers"]); self.assertEqual([],file_cinder["unknowns"])
+            file_attachments=[item for item in file_cinder["nodes"] if item["kind"]=="volume_attachment"]
+            self.assertTrue(file_attachments and all(item["facts"]["connection_summary"]["driver_type"]=="nfs" for item in file_attachments))
+            self.assertTrue(any(item["check_id"].startswith("cinder.storage.") and item["status"]=="PASS" for item in file_cinder["checks"]))
     def test_task7_and_task8_probe_results_are_typed_and_handed_to_collectors(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
         image_id = "44444444-4444-4444-4444-444444444444"

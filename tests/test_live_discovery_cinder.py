@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery"
 
-from live_discovery.cinder import CinderCollector
+from live_discovery.cinder import CinderCollector, _connection_summary
 
 
 class ProbeError(RuntimeError):
@@ -107,6 +107,19 @@ class CinderCollectorTests(unittest.TestCase):
         cls.source_fixture = json.loads(
             (FIXTURES / "cinder-source.json").read_text(encoding="utf-8")
         )
+
+    def test_connection_summary_canonicalizes_only_file_driver_to_nfs(self):
+        connector={"host":"compute-1"}
+        cases=(
+            ("file",{"path":"/srv/cinder/volume-1"},"nfs"),
+            ("nfs",{"path":"/srv/cinder/volume-1"},"nfs"),
+            ("rbd",{"name":"volumes/volume-1","hosts":["10.0.0.10"]},"rbd"),
+            ("lvm",{"device_path":"/dev/cinder/volume-1"},"lvm"),
+        )
+        for driver,data,expected in cases:
+            with self.subTest(driver=driver):
+                summary=_connection_summary({"driver_volume_type":driver,"data":data},connector)
+                self.assertEqual(expected,summary["driver_type"])
 
     def test_encrypted_volume_requires_complete_dependency_graph(self):
         result, _ = collect_from_fixture(self.source_fixture)
