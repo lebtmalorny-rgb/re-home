@@ -6,9 +6,13 @@ from typing import Any, Dict, List, Optional, Sequence
 
 
 MUTATING_TOKENS = {
-    "create", "delete", "set", "unset", "update", "sync", "migrate",
-    "heal", "rebind", "stop", "start", "restart", "enable", "disable",
-    "attach", "detach", "upload", "save", "import", "purge", "archive",
+    "activate", "add", "archive", "attach", "clear", "create", "deactivate",
+    "define", "delete", "destroy", "detach", "disable", "enable", "evacuate",
+    "heal", "import", "managedsave", "map", "migrate", "pause", "promote",
+    "purge", "rebind", "reboot", "rebuild", "remove", "rescue", "resize",
+    "restart", "resume", "save", "set", "shelve", "shutdown", "start", "stop",
+    "suspend", "sync", "unmap", "unpause", "unrescue", "unshelve", "unset",
+    "update", "upgrade", "upload",
 }
 
 READ_ONLY_EXECUTABLES = {
@@ -48,6 +52,11 @@ _FORBIDDEN_SQL = (
     (r"\bINTO\s+OUTFILE\b", "INTO OUTFILE"),
     (r"\bINTO\s+DUMPFILE\b", "INTO DUMPFILE"),
     (r"\bLOAD_FILE\b", "LOAD_FILE"),
+)
+_MUTATING_COMPOUND_TOKEN = re.compile(
+    r"(?:^|[-_])(?:activate|add|clear|create|deactivate|delete|destroy|insert|"
+    r"map|mod|mutate|remove|set|unmap|update)(?:$|[-_])",
+    flags=re.IGNORECASE,
 )
 
 
@@ -101,8 +110,18 @@ def classify_mutation(argv: Sequence[object]) -> Optional[str]:
     if lowered and lowered[0] in {"mysql", "mariadb"}:
         return "mysql requires run_sql"
     if lowered:
+        command_index = next(
+            (
+                index
+                for index, token in enumerate(lowered[1:], start=1)
+                if token != "--" and not token.startswith("-")
+            ),
+            None,
+        )
         for index, token in enumerate(lowered[1:], start=1):
-            if token in MUTATING_TOKENS:
+            if token in MUTATING_TOKENS or (
+                index == command_index and _MUTATING_COMPOUND_TOKEN.search(token)
+            ):
                 if lowered[0] == "openstack":
                     return " ".join(lowered[1:3])
                 start = max(1, index - 1)
