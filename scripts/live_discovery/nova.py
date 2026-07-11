@@ -47,6 +47,12 @@ _SAFE_FLAVOR_FIELDS = (
     "properties",
 )
 
+_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SENSITIVE_EVIDENCE_ID = re.compile(
+    r"password|passwd|token|secret|credential|connector|chap",
+    flags=re.IGNORECASE,
+)
+
 
 def _field(payload: object, *names: str) -> Any:
     if not isinstance(payload, Mapping):
@@ -96,24 +102,28 @@ def _reference_id(value: object) -> Optional[str]:
     return None
 
 
-def _network_port_ids(value: object) -> Tuple[List[str], List[object]]:
+def _network_port_ids(value: object) -> Tuple[List[str], List[object], bool]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return [], []
+            return [], [], False
     if not isinstance(value, list):
-        return [], []
+        return [], [], False
     identifiers = []
     invalid = []
     for item in value:
+        if not isinstance(item, Mapping):
+            return [], [], False
         identifier = _field(item, "id", "port_id")
+        if identifier in (None, ""):
+            return [], [], False
         canonical = _canonical_uuid(identifier)
         if canonical is not None:
             identifiers.append(canonical)
-        elif identifier not in (None, ""):
+        else:
             invalid.append(identifier)
-    return list(dict.fromkeys(identifiers)), invalid
+    return list(dict.fromkeys(identifiers)), invalid, True
 
 
 class NovaCollector:
@@ -297,7 +307,8 @@ class NovaCollector:
         result: CollectorResult,
     ) -> List[Mapping[str, Any]]:
         source = getattr(self.client, "db_records", None)
-        records = source(table) if callable(source) else None
+        uses_db_records = callable(source)
+        records = source(table) if uses_db_records else None
         evidence = None
         if records is None:
             facts = getattr(self.client, "db_facts", None)
@@ -305,11 +316,8 @@ class NovaCollector:
                 records = facts.get(table)
         if isinstance(records, tuple) and len(records) == 2:
             records, evidence = records
-        if evidence is not None:
-            if isinstance(evidence, Mapping):
-                result.evidence.append(deepcopy(dict(evidence)))
-            elif isinstance(evidence, list):
-                result.evidence.extend(deepcopy(evidence))
+        if uses_db_records:
+            self._append_db_evidence(table, evidence, result)
         if records is None:
             result.blockers.append(f"DB facts missing: {table}")
             return []
@@ -332,6 +340,33 @@ class NovaCollector:
             row = record["row"]
             rows.append(deepcopy(dict(row)))
         return rows
+
+    def _append_db_evidence(
+        self,
+        table: str,
+        evidence: object,
+        result: CollectorResult,
+    ) -> None:
+        evidence_id = (
+            evidence.get("evidence_id")
+            if isinstance(evidence, Mapping)
+            else None
+        )
+        if (
+            not isinstance(evidence_id, str)
+            or not _EVIDENCE_ID.fullmatch(evidence_id)
+            or _SENSITIVE_EVIDENCE_ID.search(evidence_id)
+        ):
+            result.blockers.append(f"DB evidence invalid: {table}")
+            return
+        result.evidence.append(
+            {
+                "evidence_id": evidence_id,
+                "kind": "db-jsonl",
+                "schema": DB_SCHEMAS[table],
+                "table": table,
+            }
+        )
 
     def _json(
         self,
@@ -438,12 +473,15 @@ class NovaCollector:
         add_edge,
     ) -> Optional[ResourceNode]:
         api_host = _field(hypervisor, "hypervisor_hostname", "host")
+        api_identity = _field(hypervisor, "id", "uuid")
         if not isinstance(hypervisor, Mapping):
             result.blockers.append("invalid hypervisor show payload")
         elif api_host != rehome_host:
             result.blockers.append(
                 f"hypervisor host mismatch: expected {rehome_host} got {api_host}"
             )
+        if api_identity in (None, ""):
+            result.blockers.append(f"hypervisor identity missing: {rehome_host}")
         service_id = service.get("id") if service else None
         canonical = [
             row
@@ -469,6 +507,28 @@ class NovaCollector:
                 f"compute node UUID invalid: {rehome_host} got {raw_identifier!r}"
             )
             return None
+        if api_identity not in (None, ""):
+            if (
+                isinstance(api_identity, int)
+                and not isinstance(api_identity, bool)
+            ) or (isinstance(api_identity, str) and api_identity.isdigit()):
+                if int(api_identity) != row.get("id"):
+                    result.blockers.append(
+                        f"hypervisor identity mismatch: {rehome_host} API "
+                        f"{api_identity} DB {row.get('id')}"
+                    )
+            else:
+                canonical_api_identity = _canonical_uuid(api_identity)
+                if canonical_api_identity is None:
+                    result.blockers.append(
+                        f"hypervisor identity invalid: {rehome_host} got "
+                        f"{api_identity!r}"
+                    )
+                elif canonical_api_identity != identifier:
+                    result.blockers.append(
+                        f"hypervisor identity mismatch: {rehome_host} API "
+                        f"{canonical_api_identity} DB {identifier}"
+                    )
         facts = {
             key: deepcopy(row.get(key))
             for key in (
@@ -477,6 +537,7 @@ class NovaCollector:
         }
         facts["status"] = _field(hypervisor, "status")
         facts["state"] = _field(hypervisor, "state")
+        facts["api_identity"] = api_identity
         node = add_node(
             "compute_node",
             identifier,
@@ -671,8 +732,23 @@ class NovaCollector:
             if row.get("instance_uuid") == instance_uuid
         ]
         ports = []
-        for cache in info_caches:
-            cache_ports, invalid_ports = _network_port_ids(cache.get("network_info"))
+        if not info_caches:
+            result.blockers.append(f"instance info cache missing: {instance_uuid}")
+        elif len(info_caches) > 1:
+            result.blockers.append(f"instance info cache duplicate: {instance_uuid}")
+        elif _is_deleted(info_caches[0]):
+            result.blockers.append(f"instance info cache deleted: {instance_uuid}")
+
+        active_caches = [cache for cache in info_caches if not _is_deleted(cache)]
+        for cache in active_caches:
+            cache_ports, invalid_ports, valid_shape = _network_port_ids(
+                cache.get("network_info")
+            )
+            if not valid_shape:
+                result.blockers.append(
+                    f"instance info cache malformed: {instance_uuid}"
+                )
+                continue
             ports.extend(cache_ports)
             result.blockers.extend(
                 f"port UUID invalid: {instance_uuid} got {value!r}"

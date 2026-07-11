@@ -44,6 +44,19 @@ class FixtureClient:
         return deepcopy(self.responses[key]), {"id": evidence_id}
 
 
+class DbRecordsFixtureClient(FixtureClient):
+    def __init__(self, fixture, evidence_by_table):
+        super().__init__(fixture)
+        self.evidence_by_table = deepcopy(evidence_by_table)
+
+    def db_records(self, table):
+        evidence = self.evidence_by_table.get(
+            table,
+            {"evidence_id": f"db-{table}"},
+        )
+        return deepcopy(self.db_facts[table]), deepcopy(evidence)
+
+
 def collect_from_fixture(fixture, rehome_host, side):
     client = FixtureClient(fixture)
     return NovaCollector(client, side).collect(rehome_host)
@@ -251,6 +264,68 @@ class NovaCollectorTests(unittest.TestCase):
         )
         self.assertNotIn("port:not-a-uuid", {edge.target for edge in result.edges})
 
+    def test_missing_instance_info_cache_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["instance_info_caches"] = []
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "instance info cache missing: 11111111-1111-1111-1111-111111111111",
+            result.blockers,
+        )
+
+    def test_duplicate_instance_info_cache_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["instance_info_caches"].append(
+            deepcopy(fixture["instance_info_caches"][0])
+        )
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "instance info cache duplicate: 11111111-1111-1111-1111-111111111111",
+            result.blockers,
+        )
+
+    def test_deleted_instance_info_cache_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["instance_info_caches"][0]["row"]["deleted"] = 1
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "instance info cache deleted: 11111111-1111-1111-1111-111111111111",
+            result.blockers,
+        )
+
+    def test_malformed_instance_info_cache_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["instance_info_caches"][0]["row"]["network_info"] = "{not-json"
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "instance info cache malformed: "
+            "11111111-1111-1111-1111-111111111111",
+            result.blockers,
+        )
+
+    def test_valid_empty_network_info_is_zero_ports_without_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["instance_info_caches"][0]["row"]["network_info"] = "[]"
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertFalse(
+            [item for item in result.blockers if "instance info cache" in item]
+        )
+        instance = next(node for node in result.nodes if node.kind == "instance")
+        self.assertEqual([], instance.facts["port_ids"])
+        self.assertFalse(
+            [edge for edge in result.edges if edge.target.startswith("port:")]
+        )
+
     def test_invalid_canonical_service_uuid_is_blocker(self):
         fixture = deepcopy(self.fixture)
         fixture["services"][0]["row"]["uuid"] = "not-a-uuid"
@@ -275,6 +350,53 @@ class NovaCollectorTests(unittest.TestCase):
         )
         self.assertFalse([node for node in result.nodes if node.kind == "compute_node"])
 
+    def test_missing_hypervisor_api_identity_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        del fixture["openstack"][2]["payload"]["id"]
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn("hypervisor identity missing: compute-023", result.blockers)
+
+    def test_numeric_hypervisor_api_identity_mismatch_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["openstack"][2]["payload"]["id"] = 999
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "hypervisor identity mismatch: compute-023 API 999 DB 7",
+            result.blockers,
+        )
+
+    def test_hypervisor_uuid_identity_matches_compute_node(self):
+        fixture = deepcopy(self.fixture)
+        fixture["openstack"][2]["payload"]["id"] = (
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertFalse(
+            [item for item in result.blockers if "hypervisor identity" in item]
+        )
+        self.assertTrue([node for node in result.nodes if node.kind == "compute_node"])
+
+    def test_hypervisor_uuid_identity_mismatch_is_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["openstack"][2]["payload"]["id"] = (
+            "99999999-9999-9999-9999-999999999999"
+        )
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        self.assertIn(
+            "hypervisor identity mismatch: compute-023 API "
+            "99999999-9999-9999-9999-999999999999 DB "
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            result.blockers,
+        )
+
     def test_invalid_placement_provider_uuid_is_blocker(self):
         fixture = deepcopy(self.fixture)
         fixture["openstack"][3]["payload"][0]["uuid"] = "not-a-uuid"
@@ -288,6 +410,68 @@ class NovaCollectorTests(unittest.TestCase):
         self.assertFalse(
             [node for node in result.nodes if node.kind == "placement_provider"]
         )
+
+    def test_malformed_db_records_evidence_mapping_is_blocker(self):
+        client = DbRecordsFixtureClient(
+            self.fixture,
+            {"instances": {"returncode": 0}},
+        )
+
+        result = NovaCollector(client, "source").collect("compute-023")
+
+        self.assertIn("DB evidence invalid: instances", result.blockers)
+        self.assertNotIn("returncode", str(result.evidence))
+
+    def test_list_db_records_evidence_is_blocker(self):
+        client = DbRecordsFixtureClient(
+            self.fixture,
+            {"instances": [{"evidence_id": "db-instances"}]},
+        )
+
+        result = NovaCollector(client, "source").collect("compute-023")
+
+        self.assertIn("DB evidence invalid: instances", result.blockers)
+        self.assertNotIn("db-instances", str(result.evidence))
+
+    def test_secret_bearing_db_records_evidence_is_canonicalized(self):
+        secret = "db-password-secret"
+        client = DbRecordsFixtureClient(
+            self.fixture,
+            {
+                "instances": {
+                    "evidence_id": "db-instances",
+                    "argv": ["mysql", f"--password={secret}"],
+                    "stdout": secret,
+                    "arbitrary": {"token": secret},
+                }
+            },
+        )
+
+        result = NovaCollector(client, "source").collect("compute-023")
+
+        serialized = str(result.to_dict())
+        self.assertNotIn(secret, serialized)
+        self.assertIn(
+            {
+                "evidence_id": "db-instances",
+                "kind": "db-jsonl",
+                "schema": "nova",
+                "table": "instances",
+            },
+            result.evidence,
+        )
+
+    def test_secret_bearing_db_evidence_id_is_rejected(self):
+        evidence_id = "db-password-secret"
+        client = DbRecordsFixtureClient(
+            self.fixture,
+            {"instances": {"evidence_id": evidence_id}},
+        )
+
+        result = NovaCollector(client, "source").collect("compute-023")
+
+        self.assertIn("DB evidence invalid: instances", result.blockers)
+        self.assertNotIn(evidence_id, str(result.evidence))
 
     def test_target_fixture_collects_host_identity_without_instances(self):
         fixture = json.loads(
