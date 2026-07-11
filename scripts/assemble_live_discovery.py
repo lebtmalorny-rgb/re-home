@@ -74,22 +74,15 @@ def _collector(payload):
 def _bundle(path: Path):
     payload = _read_json(path)
     if isinstance(payload, dict) and payload.get("schema_version") == "openstack-rehome-live-discovery/v1alpha1":
-        refs = sorted({
-            evidence_id
-            for item in [*payload.get("nodes", []), *payload.get("checks", [])]
-            for evidence_id in item.get("evidence_ids", [])
-        })
+        if not isinstance(payload.get("evidence"), list) or not payload["evidence"]:
+            raise ValueError("raw runtime evidence is missing")
         empty_bundle = {
             "schema_version": BUNDLE_VERSION,
             "collectors": [payload],
             "checks": [],
             "schema_capabilities": {},
             "uuid_filters": {"source": {}, "target": {}},
-            "evidence_index": [{
-                "evidence_id": evidence_id, "kind": "runtime-command",
-                "side": payload["side"], "service": payload["service"],
-                "command": ["runtime-collector", evidence_id],
-            } for evidence_id in refs],
+            "evidence_index": payload["evidence"],
             "sensitive_evidence": {},
         }
         return [_collector(payload)], [], empty_bundle
@@ -135,6 +128,7 @@ def _validate_evidence_entry(entry):
         "db-jsonl": common | {"schema", "table", "filters"},
         "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "scope", "expected_size", "observed_size", "status"},
         "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+        "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity"},
     }
     if not isinstance(entry, dict) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
         raise ValueError("evidence index entry schema is invalid")
@@ -152,6 +146,9 @@ def _validate_evidence_entry(entry):
     elif entry["kind"] == "glance-range":
         if entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]:
             raise ValueError("Glance evidence is invalid")
+    elif entry["kind"] == "cinder-connection":
+        if not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity")):
+            raise ValueError("Cinder connection evidence is invalid")
 
 
 def _validate_evidence_closure(collectors, checks, bundle):

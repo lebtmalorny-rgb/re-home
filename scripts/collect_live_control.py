@@ -7,13 +7,14 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
 import sys
 import tempfile
 import uuid
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -169,14 +170,16 @@ def _canonical(value):
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _phase_binding(api_result, uuid_filters, query_plan, *, key):
+def _phase_binding(api_result, uuid_filters, query_plan, *, key, trust_domain="live"):
     if not isinstance(key, bytes) or len(key) < 16:
         raise ValueError("phase trust anchor is invalid")
-    return hmac.new(key, _canonical({
+    if trust_domain not in {"live", "fixture"}:
+        raise ValueError("phase trust domain is invalid")
+    return hmac.new(key, (f"openstack-rehome-phase:{trust_domain}:v1\n" + _canonical({
         "api_result": api_result,
         "uuid_filters": uuid_filters,
         "db_query_plan": query_plan,
-    }).encode("utf-8"), hashlib.sha256).hexdigest()
+    })).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _root_filter_values(api_result):
@@ -312,7 +315,25 @@ def _load_phase_key(args, *, fixture=False):
     return key
 
 
-def _execute_probe_config(config, runner, *, opener=None, token_loader=_load_protected_token):
+def _endpoint_origin(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+            return None
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    default = 443 if parsed.scheme == "https" else 80
+    suffix = "" if port in {None, default} else f":{port}"
+    return f"{parsed.scheme}://{parsed.hostname.lower()}{suffix}"
+
+
+def _execute_probe_config(
+    config, runner, *, opener=None, token_loader=_load_protected_token,
+    catalog_origin=None, image_store_ids=None,
+):
     if not isinstance(config, dict) or set(config) != {"schema_version", "storage", "glance"} or config.get("schema_version") != "openstack-rehome-probe-config/v1alpha1":
         raise ValueError("probe configuration envelope is invalid")
     if not isinstance(config["storage"], list) or len(config["storage"]) > 4096:
@@ -352,6 +373,12 @@ def _execute_probe_config(config, runner, *, opener=None, token_loader=_load_pro
         {"endpoint_url", "token_env", "images", "store_capabilities"},
     ):
         raise ValueError("Glance probe configuration is invalid")
+    trusted_origin = _endpoint_origin(catalog_origin)
+    configured_origin = _endpoint_origin(glance["endpoint_url"])
+    if trusted_origin is None or configured_origin != trusted_origin:
+        raise ValueError("Glance endpoint differs from service catalog")
+    if not isinstance(image_store_ids, dict):
+        raise ValueError("Glance image store closure is missing")
     images = glance["images"]
     stores = glance["store_capabilities"]
     if not isinstance(images, list) or len(images) > 4096 or not isinstance(stores, list) or len(stores) > 4096:
@@ -371,24 +398,34 @@ def _execute_probe_config(config, runner, *, opener=None, token_loader=_load_pro
     image_results = []
     try:
         for item in images:
-            if not isinstance(item, dict) or set(item) != {"image_id", "expected_size", "required"}:
+            if not isinstance(item, dict) or set(item) != {"image_id", "expected_size", "required", "store_ids"}:
                 raise ValueError("Glance image probe row is invalid")
             image_id = _canonical_uuid(item["image_id"])
-            if image_id is None or not isinstance(item["required"], bool):
+            stores_for_image = item.get("store_ids")
+            trusted_stores = image_store_ids.get(image_id) if image_id is not None else None
+            if (
+                image_id is None or not isinstance(item["required"], bool)
+                or not isinstance(stores_for_image, list) or not stores_for_image
+                or not all(isinstance(value, str) and _SAFE_ROOT.fullmatch(value) for value in stores_for_image)
+                or not isinstance(trusted_stores, list)
+                or sorted(stores_for_image) != sorted(trusted_stores)
+            ):
                 raise ValueError("Glance image probe identity is invalid")
+            if not set(stores_for_image).issubset({store["store_id"] for store in normalized_stores}):
+                raise ValueError("Glance image store capability is missing")
             check = probe_image_data(
                 f"{glance['endpoint_url'].rstrip('/')}/v2/images/{image_id}/file",
                 token, item["expected_size"], opener=opener,
                 endpoint_url=glance["endpoint_url"], image_id=image_id,
                 required=item["required"],
             )
-            endpoint_origin = glance["endpoint_url"].rstrip("/")
+            endpoint_origin = trusted_origin
             image_results.append({
                 "image_id": image_id, "endpoint_origin": endpoint_origin,
                 "expected_size": item["expected_size"],
                 "observed_size": item["expected_size"] if check.status == "PASS" else None,
                 "required": item["required"],
-                "store_ids": sorted(store["store_id"] for store in normalized_stores),
+                "store_ids": sorted(stores_for_image),
                 "evidence_id": f"glance-range:{image_id}",
                 "status": check.status, "reason": check.reason,
             })
@@ -408,6 +445,7 @@ class _CombinedClient:
         self.side = side
         self._api_result = deepcopy(api_result)
         self._api = {}
+        self.cache_misses = []
         for item in api_result.get("openstack", []):
             if not isinstance(item, dict) or set(item) != {"command", "payload", "evidence"} or not isinstance(item["command"], list):
                 raise ValueError("cached OpenStack response is invalid")
@@ -424,6 +462,8 @@ class _CombinedClient:
         del evidence_id, required
         key = tuple(command)
         if key not in self._api:
+            if key not in self.cache_misses:
+                self.cache_misses.append(key)
             return None, {"id": "cached-openstack-response-missing"}
         return deepcopy(self._api[key])
 
@@ -491,13 +531,17 @@ class _CombinedClient:
             item.get("store_id") for item in capabilities
             if isinstance(item, dict) and isinstance(item.get("store_id"), str)
         ) if isinstance(capabilities, list) else []
+        trusted_store_ids = self._api_result.get("image_store_ids", {}).get(image_id, [])
+        trusted_origin = self._api_result.get("glance_catalog_origin")
         matches = [
             item for item in values
             if isinstance(item, dict) and item.get("image_id") == image_id
             and item.get("expected_size") == expected_size
             and item.get("observed_size") == expected_size
             and item.get("required") is required
-            and item.get("store_ids") == capability_store_ids
+            and item.get("store_ids") == sorted(trusted_store_ids)
+            and set(item.get("store_ids", [])).issubset(set(capability_store_ids))
+            and item.get("endpoint_origin") == trusted_origin
         ]
         expected_keys = {"image_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "evidence_id", "status", "reason"}
         if len(matches) != 1 or set(matches[0]) != expected_keys or not matches[0]["endpoint_origin"] or not matches[0]["store_ids"]:
@@ -576,11 +620,16 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
             resource_identity = item["resource_identity"]
             evidence_id = item["evidence_id"]
             cinder_backend_id = volume_nodes[0].facts.get("storage_backend_id", volume_nodes[0].facts.get("backend_id")) if len(volume_nodes) == 1 else None
+            cinder_backend_kind = volume_nodes[0].facts.get("backend_kind") if len(volume_nodes) == 1 else None
+            cinder_resource_identity = volume_nodes[0].facts.get("resource_identity") if len(volume_nodes) == 1 else None
+            connection_evidence_id = volume_nodes[0].facts.get("connection_evidence_id") if len(volume_nodes) == 1 else None
             bound = (
                 isinstance(identity, str) and identity
                 and isinstance(resource_identity, str) and resource_identity
                 and isinstance(evidence_id, str) and evidence_id
                 and cinder_backend_id == identity
+                and cinder_backend_kind == kind
+                and cinder_resource_identity == resource_identity
                 and isinstance(item["expected_size"], int)
                 and expected_bytes is not None
                 and item["expected_size"] == expected_bytes
@@ -605,7 +654,7 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
             identity_hash = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
             result.checks.append(CheckResult(
                 f"cinder.storage.{volume_id}.{scope}.{kind}.{identity_hash}", status, reason,
-                [f"volume:{volume_id}"], [evidence_id],
+                [f"volume:{volume_id}"], [value for value in (evidence_id, connection_evidence_id) if isinstance(value, str)],
             ))
             if status == "BLOCKED" and reason not in result.blockers:
                 result.blockers.append(reason)
@@ -656,6 +705,18 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
         ))
     results.append(NeutronCollector(client, side, snapshot).collect(port_ids))
     cinder = CinderCollector(client, side, snapshot).collect(volume_ids)
+    connection_summaries = api_result.get("cinder_connection_summaries", {})
+    if not isinstance(connection_summaries, dict):
+        raise ValueError("Cinder connection summaries are invalid")
+    for node in cinder.nodes:
+        summary = connection_summaries.get(node.id) if node.kind == "volume" else None
+        if isinstance(summary, dict):
+            node.facts.update({
+                "backend_kind": summary["backend_kind"],
+                "resource_identity": summary["resource_identity"],
+                "connection_evidence_id": summary["evidence_id"],
+            })
+            node.evidence_ids.append(summary["evidence_id"])
     _integrate_storage_readiness(cinder, volume_ids, api_result)
     results.append(cinder)
     requirements = {
@@ -669,7 +730,7 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
         for image_id in image_ids
     }
     results.append(GlanceCollector(client, side).collect(requirements))
-    return [result.to_dict() for result in results]
+    return [result.to_dict() for result in results], [list(command) for command in client.cache_misses]
 
 
 def _build_evidence_index(side, collectors, api_result, db_evidence):
@@ -697,6 +758,30 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
         else:
             by_id[entry["evidence_id"]] = entry
 
+    for entry in api_result.get("capability_evidence", []):
+        common = {"evidence_id", "kind", "side", "service", "command"}
+        if (
+            not isinstance(entry, dict) or set(entry) != common
+            or entry.get("kind") not in {"openstack-json", "runtime-command"}
+            or entry.get("side") != side
+            or not all(isinstance(entry.get(key), str) and entry[key] for key in ("evidence_id", "service"))
+            or not isinstance(entry.get("command"), list) or not entry["command"]
+            or not all(isinstance(value, str) and value for value in entry["command"])
+        ):
+            raise ValueError("capability evidence is invalid")
+        add(deepcopy(entry))
+
+    for volume_id, summary in api_result.get("cinder_connection_summaries", {}).items():
+        expected = {"evidence_id", "attachment_id", "backend_kind", "backend_id", "resource_identity"}
+        if not isinstance(summary, dict) or set(summary) != expected or _canonical_uuid(volume_id) is None:
+            raise ValueError("Cinder connection summary is invalid")
+        add({
+            "evidence_id": summary["evidence_id"], "kind": "cinder-connection",
+            "side": side, "service": "cinder", "volume_id": volume_id,
+            "attachment_id": summary["attachment_id"], "backend_kind": summary["backend_kind"],
+            "backend_id": summary["backend_id"], "resource_identity": summary["resource_identity"],
+        })
+
     cached = {}
     for item in api_result.get("openstack", []):
         evidence = item.get("evidence", {}) if isinstance(item, dict) else {}
@@ -710,6 +795,16 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
     glance = {item.get("evidence_id"): item for item in api_result.get("glance_data_probe_results", []) if isinstance(item, dict)}
     references = {}
     for collector in collectors:
+        for entry in collector.get("evidence", []):
+            if (
+                isinstance(entry, dict)
+                and set(entry) == {"evidence_id", "kind", "side", "service", "command"}
+                and entry.get("kind") in {"openstack-json", "runtime-command"}
+                and entry.get("side") == side
+                and entry.get("service") == collector.get("service")
+                and isinstance(entry.get("command"), list) and entry["command"]
+            ):
+                add(deepcopy(entry))
         provenance = (collector["side"], collector["service"])
         for item in [*collector["nodes"], *collector["checks"]]:
             for identity in item["evidence_ids"]:
@@ -733,10 +828,6 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
                  "observed_size":item["observed_size"],"required":item["required"],"store_ids":deepcopy(item["store_ids"]),"status":item["status"]})
         elif identity in cached:
             add({"evidence_id":identity,"kind":"openstack-json","side":side,"service":service,"command":cached[identity]})
-        elif service == "runtime-capabilities":
-            add({"evidence_id":identity,"kind":"runtime-command","side":side,"service":service,"command":["cached-runtime-capability", identity]})
-        elif service in {"target-profile", "glance"}:
-            add({"evidence_id":identity,"kind":"openstack-json","side":side,"service":service,"command":["cached-capability-input", identity]})
         else:
             raise ValueError("collector evidence is absent from acquired closure")
     return [by_id[key] for key in sorted(by_id)]
@@ -760,6 +851,66 @@ def _read_protected_json(path):
         return json.loads(_read_owned_file(path, _MAX_FILE, "protected JSON").decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("protected JSON is invalid") from error
+
+
+def _load_cinder_sensitive_evidence(path, side):
+    payload = _read_protected_json(path)
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "side", "entries"}
+        or payload.get("schema_version") != "openstack-rehome-cinder-sensitive-evidence/v1alpha1"
+        or payload.get("side") != side
+        or not isinstance(payload.get("entries"), list)
+        or not payload["entries"]
+        or len(payload["entries"]) > 4096
+    ):
+        raise ValueError("Cinder sensitive evidence envelope is invalid")
+    summaries = {}
+    sensitive = {}
+    expected = {"evidence_id", "volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "connector", "connection_info"}
+    for entry in payload["entries"]:
+        if not isinstance(entry, dict) or set(entry) != expected:
+            raise ValueError("Cinder sensitive evidence row is invalid")
+        volume_id = _canonical_uuid(entry["volume_id"])
+        attachment_id = _canonical_uuid(entry["attachment_id"])
+        evidence_id = entry["evidence_id"]
+        backend_kind = entry["backend_kind"].lower() if isinstance(entry["backend_kind"], str) else ""
+        backend_id = entry["backend_id"]
+        resource_identity = entry["resource_identity"]
+        if backend_kind == "file":
+            backend_kind = "nfs"
+        valid_resource = False
+        if isinstance(resource_identity, str) and 0 < len(resource_identity) <= 1024 and "\x00" not in resource_identity:
+            if backend_kind == "nfs":
+                parsed = PurePosixPath(resource_identity)
+                valid_resource = resource_identity.startswith("/") and str(parsed) == resource_identity and ".." not in parsed.parts
+            elif backend_kind in {"rbd", "lvm"}:
+                parts = resource_identity.split("/")
+                valid_resource = len(parts) == 2 and all(_SAFE_ROOT.fullmatch(part) for part in parts)
+            else:
+                valid_resource = _SAFE_ROOT.fullmatch(resource_identity) is not None
+        connection_info = entry["connection_info"]
+        connector = entry["connector"]
+        driver_type = connection_info.get("driver_volume_type") if isinstance(connection_info, dict) else None
+        if (
+            volume_id is None or attachment_id is None
+            or not isinstance(evidence_id, str) or _SAFE_ROOT.fullmatch(evidence_id) is None
+            or not backend_kind or _SAFE_ROOT.fullmatch(backend_kind) is None
+            or not isinstance(backend_id, str) or _SAFE_ROOT.fullmatch(backend_id) is None
+            or not valid_resource
+            or not isinstance(connector, dict) or not connector
+            or not isinstance(connection_info, dict) or not connection_info
+            or driver_type not in {backend_kind, "file" if backend_kind == "nfs" else backend_kind}
+            or volume_id in summaries or evidence_id in sensitive
+        ):
+            raise ValueError("Cinder sensitive evidence identity is invalid")
+        summaries[volume_id] = {
+            "evidence_id": evidence_id, "attachment_id": attachment_id,
+            "backend_kind": backend_kind, "backend_id": backend_id,
+            "resource_identity": resource_identity,
+        }
+        sensitive[evidence_id] = deepcopy(entry)
+    return summaries, sensitive
 
 
 def _safe_out(path):
@@ -893,6 +1044,198 @@ def _payload_ids(payload, *keys):
     return sorted(dict.fromkeys(values))
 
 
+def _deep_payload_ids(payload, *keys):
+    wanted = set(keys)
+    found = []
+    stack = [payload]
+    visited = 0
+    while stack:
+        current = stack.pop()
+        visited += 1
+        if visited > 100_000:
+            raise ValueError("API dependency closure exceeds safety bounds")
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in wanted:
+                    candidates = value if isinstance(value, list) else [value]
+                    for candidate in candidates:
+                        if isinstance(candidate, dict):
+                            candidate = candidate.get("id") or candidate.get("uuid") or candidate.get("port_id")
+                        canonical = _canonical_uuid(candidate)
+                        if canonical is not None:
+                            found.append(canonical)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return sorted(set(found))
+
+
+def _deep_named_values(payload, *keys):
+    wanted = set(keys)
+    found = []
+    stack = [payload]
+    visited = 0
+    while stack:
+        current = stack.pop()
+        visited += 1
+        if visited > 100_000:
+            raise ValueError("API named dependency closure exceeds safety bounds")
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in wanted:
+                    candidates = value if isinstance(value, list) else [value]
+                    for candidate in candidates:
+                        if isinstance(candidate, dict):
+                            candidate = candidate.get("store") or candidate.get("id")
+                        if isinstance(candidate, str) and _SAFE_ROOT.fullmatch(candidate):
+                            found.append(candidate)
+                stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return sorted(set(found))
+
+
+def _catalog_public_origin(payload):
+    candidates = []
+    if isinstance(payload, dict):
+        for key in ("public", "publicURL", "url"):
+            if isinstance(payload.get(key), str):
+                candidates.append(payload[key])
+        endpoints = payload.get("endpoints")
+        if isinstance(endpoints, list):
+            candidates.extend(
+                item.get("url") for item in endpoints
+                if isinstance(item, dict)
+                and str(item.get("interface", "public")).lower() == "public"
+                and isinstance(item.get("url"), str)
+            )
+    origins = sorted({_endpoint_origin(value) for value in candidates if _endpoint_origin(value) is not None})
+    if len(origins) > 1:
+        raise ValueError("Glance catalog public origin is ambiguous")
+    return origins[0] if origins else None
+
+
+def _expand_live_api_roots(roots, acquire, side, *, need_glance_catalog=False):
+    processed = {category: set() for category in roots}
+    image_store_ids = {}
+    catalog_origin = None
+
+    def extend(category, values):
+        if category not in roots:
+            raise ValueError("API dependency category is invalid")
+        roots[category].extend(values)
+        roots[category] = sorted(set(roots[category]))
+
+    while True:
+        work = [
+            (category, identity)
+            for category in sorted(roots)
+            for identity in sorted(roots[category])
+            if identity not in processed[category]
+        ]
+        if not work:
+            break
+        for category, identity in work:
+            processed[category].add(identity)
+            payload = None
+            if category == "instances":
+                payload = acquire(["server", "show", identity, "-f", "json"], f"nova-{side}-server-show-{identity}")
+                acquire(["resource", "provider", "allocation", "show", identity, "-f", "json"], f"nova-{side}-placement-allocation-show-{identity}")
+                ports = acquire(["port", "list", "--server", identity, "-f", "json"], f"neutron-{side}-port-list-{identity}")
+                volumes = acquire(["server", "volume", "list", identity, "-f", "json"], f"cinder-{side}-server-volume-list-{identity}")
+                extend("ports", _deep_payload_ids(ports, "id", "ID", "port_id"))
+                extend("volumes", _deep_payload_ids(volumes, "id", "ID", "volume_id"))
+                extend("images", _deep_payload_ids(payload, "image_id", "image"))
+                extend("projects", _deep_payload_ids(payload, "project_id", "tenant_id"))
+                extend("flavors", _deep_payload_ids(payload, "flavor_id", "flavor"))
+            elif category == "flavors":
+                payload = acquire(["flavor", "show", identity, "-f", "json"], f"nova-{side}-flavor-show-{identity}")
+            elif category == "ports":
+                payload = acquire(["port", "show", identity, "-f", "json"], f"neutron-{side}-port-show-{identity}")
+                extend("networks", _deep_payload_ids(payload, "network_id", "floating_network_id"))
+                extend("subnets", _deep_payload_ids(payload, "subnet_id"))
+                extend("security_groups", _deep_payload_ids(payload, "security_group_ids", "security_groups"))
+                extend("qos_policies", _deep_payload_ids(payload, "qos_policy_id"))
+                extend("trunks", _deep_payload_ids(payload, "trunk_id"))
+            elif category == "networks":
+                payload = acquire(["network", "show", identity, "-f", "json"], f"neutron-{side}-network-show-{identity}")
+                extend("subnets", _deep_payload_ids(payload, "subnet_ids", "subnets"))
+                extend("qos_policies", _deep_payload_ids(payload, "qos_policy_id"))
+            elif category == "subnets":
+                payload = acquire(["subnet", "show", identity, "-f", "json"], f"neutron-{side}-subnet-show-{identity}")
+                extend("networks", _deep_payload_ids(payload, "network_id"))
+            elif category == "security_groups":
+                payload = acquire(["security", "group", "show", identity, "-f", "json"], f"neutron-{side}-security-group-show-{identity}")
+                extend("security_groups", _deep_payload_ids(payload, "remote_group_id"))
+                extend("address_groups", _deep_payload_ids(payload, "remote_address_group_id"))
+            elif category == "qos_policies":
+                payload = acquire(["network", "qos", "policy", "show", identity, "-f", "json"], f"neutron-{side}-qos-policy-show-{identity}")
+            elif category == "trunks":
+                payload = acquire(["network", "trunk", "show", identity, "-f", "json"], f"neutron-{side}-trunk-show-{identity}")
+                extend("ports", _deep_payload_ids(payload, "port_id", "parent_port_id"))
+            elif category == "floating_ips":
+                payload = acquire(["floating", "ip", "show", identity, "-f", "json"], f"neutron-{side}-floating-ip-show-{identity}")
+                extend("ports", _deep_payload_ids(payload, "port_id", "fixed_port_id"))
+                extend("networks", _deep_payload_ids(payload, "floating_network_id"))
+                extend("routers", _deep_payload_ids(payload, "router_id"))
+                extend("qos_policies", _deep_payload_ids(payload, "qos_policy_id"))
+            elif category == "routers":
+                payload = acquire(["router", "show", identity, "-f", "json"], f"neutron-{side}-router-show-{identity}")
+                extend("ports", _deep_payload_ids(payload, "port_id"))
+                extend("networks", _deep_payload_ids(payload, "network_id"))
+            elif category == "address_groups":
+                payload = acquire(["address", "group", "show", identity, "-f", "json"], f"neutron-{side}-address-group-show-{identity}")
+            elif category == "volumes":
+                payload = acquire(["volume", "show", identity, "-f", "json"], f"cinder-{side}-volume-show-{identity}")
+                extend("volume_types", _deep_payload_ids(payload, "volume_type_id", "type_id"))
+                extend("cinder_services", _deep_payload_ids(payload, "service_uuid"))
+                extend("snapshots", _deep_payload_ids(payload, "snapshot_id"))
+                extend("volumes", _deep_payload_ids(payload, "source_volid", "source_volume_id"))
+                extend("attachments", _deep_payload_ids(payload, "attachment_id", "attachments"))
+                extend("groups", _deep_payload_ids(payload, "group_id", "consistencygroup_id"))
+                extend("group_snapshots", _deep_payload_ids(payload, "group_snapshot_id"))
+            elif category == "attachments":
+                payload = acquire(["volume", "attachment", "show", identity, "-f", "json"], f"cinder-{side}-attachment-show-{identity}")
+                extend("volumes", _deep_payload_ids(payload, "volume_id"))
+                extend("instances", _deep_payload_ids(payload, "server_id", "instance_uuid"))
+            elif category == "volume_types":
+                payload = acquire(["volume", "type", "show", identity, "-f", "json"], f"cinder-{side}-volume-type-show-{identity}")
+                extend("qos_specs", _deep_payload_ids(payload, "qos_specs_id", "qos_spec_id"))
+                extend("barbican_secrets", _deep_payload_ids(payload, "key_id", "secret_id"))
+            elif category == "qos_specs":
+                payload = acquire(["volume", "qos", "show", identity, "-f", "json"], f"cinder-{side}-qos-show-{identity}")
+            elif category == "snapshots":
+                payload = acquire(["volume", "snapshot", "show", identity, "-f", "json"], f"cinder-{side}-snapshot-show-{identity}")
+                extend("volumes", _deep_payload_ids(payload, "volume_id"))
+                extend("group_snapshots", _deep_payload_ids(payload, "group_snapshot_id"))
+            elif category == "groups":
+                payload = acquire(["volume", "group", "show", identity, "-f", "json"], f"cinder-{side}-group-show-{identity}")
+                extend("volume_types", _deep_payload_ids(payload, "volume_types", "volume_type_id"))
+            elif category == "group_snapshots":
+                payload = acquire(["volume", "group", "snapshot", "show", identity, "-f", "json"], f"cinder-{side}-group-snapshot-show-{identity}")
+                extend("groups", _deep_payload_ids(payload, "group_id"))
+            elif category == "barbican_secrets":
+                payload = acquire(["secret", "get", identity, "-f", "json"], f"cinder-{side}-secret-get-{identity}")
+            elif category == "images":
+                payload = acquire(["image", "show", identity, "-f", "json"], f"glance-{side}-image-show-{identity}")
+                members = acquire(["image", "member", "list", identity, "-f", "json"], f"glance-{side}-image-member-list-{identity}")
+                stores = _deep_named_values(payload, "store", "stores")
+                image_store_ids[identity] = stores
+                extend("glance_stores", stores)
+                member_ids = _deep_payload_ids(members, "member_id", "project_id", "tenant_id")
+                extend("image_members", member_ids)
+                extend("projects", member_ids)
+
+    if roots["volumes"] or roots["cinder_services"]:
+        acquire(["volume", "service", "list", "--long", "-f", "json"], f"cinder-{side}-volume-service-list")
+    if roots["images"] or need_glance_catalog:
+        stores = acquire(["image", "stores", "info", "-f", "json"], f"glance-{side}-stores-info")
+        extend("glance_stores", _deep_named_values(stores, "id", "store"))
+        catalog = acquire(["catalog", "show", "glance", "-f", "json"], f"glance-{side}-catalog-show")
+        catalog_origin = _catalog_public_origin(catalog)
+    return catalog_origin, {key: sorted(value) for key, value in sorted(image_store_ids.items())}
+
+
 def _api_phase(args):
     fixture_mode = args.fixture is not None
     if not fixture_mode:
@@ -929,7 +1272,7 @@ def _api_phase(args):
             "barbican_secrets": [], "image_members": [], "glance_stores": [],
         }
         if args.root_manifest is not None:
-            manifest = _read_json(args.root_manifest)
+            manifest = _read_protected_json(args.root_manifest)
             if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "side", "roots"} or manifest.get("schema_version") != "openstack-rehome-root-manifest/v1alpha1" or manifest.get("side") != args.side or not isinstance(manifest["roots"], dict):
                 raise ValueError("root manifest is invalid")
             _root_filter_values({"roots": manifest["roots"]})
@@ -938,91 +1281,27 @@ def _api_phase(args):
                     raise ValueError("root manifest category is invalid")
                 roots[category].extend(values)
         roots = {key: sorted(dict.fromkeys(values)) for key, values in roots.items()}
-        instance_ids = roots["instances"]
         service_command = ["compute", "service", "list", "--host", args.rehome_host, "-f", "json"]
         services = acquire(service_command, f"nova-{args.side}-compute-service-list-{args.rehome_host}")
-        roots["services"] = _payload_ids(services, "uuid", "UUID")
+        roots["services"] = _deep_payload_ids(services, "uuid", "UUID")
         hypervisor_command = ["hypervisor", "show", args.rehome_host, "-f", "json"]
         hypervisor = acquire(hypervisor_command, f"nova-{args.side}-hypervisor-show-{args.rehome_host}")
-        roots["compute_nodes"] = _payload_ids(hypervisor, "uuid")
+        roots["compute_nodes"] = _deep_payload_ids(hypervisor, "uuid")
         provider_command = ["resource", "provider", "list", "--name", args.rehome_host, "-f", "json"]
         acquire(provider_command, f"nova-{args.side}-resource-provider-list-{args.rehome_host}")
-        for instance_id in instance_ids:
-            server = acquire(["server", "show", instance_id, "-f", "json"], f"nova-{args.side}-server-show-{instance_id}")
-            roots["images"].extend(_payload_ids(server, "image", "image_id"))
-            roots["projects"].extend(_payload_ids(server, "project_id"))
-            roots["flavors"].extend(_payload_ids(server, "flavor", "flavor_id"))
-            acquire(["resource", "provider", "allocation", "show", instance_id, "-f", "json"], f"nova-{args.side}-placement-allocation-show-{instance_id}")
-            ports = acquire(["port", "list", "--server", instance_id, "-f", "json"], f"neutron-{args.side}-port-list-{instance_id}")
-            roots["ports"].extend(_payload_ids(ports, "id", "ID"))
-            volumes = acquire(["server", "volume", "list", instance_id, "-f", "json"], f"cinder-{args.side}-server-volume-list-{instance_id}")
-            roots["volumes"].extend(_payload_ids(volumes, "id", "ID", "volume_id"))
-        for flavor_id in sorted(set(roots["flavors"])):
-            acquire(["flavor", "show", flavor_id, "-f", "json"], f"nova-{args.side}-flavor-show-{flavor_id}")
-        for port_id in sorted(set(roots["ports"])):
-            port = acquire(["port", "show", port_id, "-f", "json"], f"neutron-{args.side}-port-show-{port_id}")
-            roots["networks"].extend(_payload_ids(port, "network_id"))
-            roots["security_groups"].extend(_payload_ids(port, "security_group_ids", "security_groups"))
-            roots["qos_policies"].extend(_payload_ids(port, "qos_policy_id"))
-            fixed_ips = port.get("fixed_ips", []) if isinstance(port, dict) else []
-            roots["subnets"].extend(_payload_ids(fixed_ips, "subnet_id"))
-        for network_id in sorted(set(roots["networks"])):
-            acquire(["network", "show", network_id, "-f", "json"], f"neutron-{args.side}-network-show-{network_id}")
-        for subnet_id in sorted(set(roots["subnets"])):
-            acquire(["subnet", "show", subnet_id, "-f", "json"], f"neutron-{args.side}-subnet-show-{subnet_id}")
-        for security_group_id in sorted(set(roots["security_groups"])):
-            acquire(["security", "group", "show", security_group_id, "-f", "json"], f"neutron-{args.side}-security-group-show-{security_group_id}")
-        for qos_policy_id in sorted(set(roots["qos_policies"])):
-            acquire(["network", "qos", "policy", "show", qos_policy_id, "-f", "json"], f"neutron-{args.side}-qos-policy-show-{qos_policy_id}")
-        for trunk_id in sorted(set(roots["trunks"])):
-            acquire(["network", "trunk", "show", trunk_id, "-f", "json"], f"neutron-{args.side}-trunk-show-{trunk_id}")
-        for floating_ip_id in sorted(set(roots["floating_ips"])):
-            acquire(["floating", "ip", "show", floating_ip_id, "-f", "json"], f"neutron-{args.side}-floating-ip-show-{floating_ip_id}")
-        for router_id in sorted(set(roots["routers"])):
-            acquire(["router", "show", router_id, "-f", "json"], f"neutron-{args.side}-router-show-{router_id}")
-        for address_group_id in sorted(set(roots["address_groups"])):
-            acquire(["address", "group", "show", address_group_id, "-f", "json"], f"neutron-{args.side}-address-group-show-{address_group_id}")
-        pending_volumes = list(sorted(set(roots["volumes"])))
-        seen_volumes = set()
-        while pending_volumes:
-            volume_id = pending_volumes.pop(0)
-            if volume_id in seen_volumes:
-                continue
-            seen_volumes.add(volume_id)
-            volume = acquire(["volume", "show", volume_id, "-f", "json"], f"cinder-{args.side}-volume-show-{volume_id}")
-            roots["volume_types"].extend(_payload_ids(volume, "volume_type_id", "type_id"))
-            roots["cinder_services"].extend(_payload_ids(volume, "service_uuid"))
-            roots["snapshots"].extend(_payload_ids(volume, "snapshot_id"))
-            discovered_volumes = _payload_ids(volume, "source_volid")
-            roots["volumes"].extend(discovered_volumes)
-            pending_volumes.extend(discovered_volumes)
-            roots["attachments"].extend(_payload_ids(volume, "attachments", "attachment_ids"))
-            roots["groups"].extend(_payload_ids(volume, "group_id", "consistencygroup_id"))
-            roots["group_snapshots"].extend(_payload_ids(volume, "group_snapshot_id"))
-        for attachment_id in sorted(set(roots["attachments"])):
-            acquire(["volume", "attachment", "show", attachment_id, "-f", "json"], f"cinder-{args.side}-attachment-show-{attachment_id}")
-        for type_id in sorted(set(roots["volume_types"])):
-            acquire(["volume", "type", "show", type_id, "-f", "json"], f"cinder-{args.side}-volume-type-show-{type_id}")
-        for snapshot_id in sorted(set(roots["snapshots"])):
-            acquire(["volume", "snapshot", "show", snapshot_id, "-f", "json"], f"cinder-{args.side}-snapshot-show-{snapshot_id}")
-        if roots["volumes"] or roots["cinder_services"]:
-            acquire(["volume", "service", "list", "--long", "-f", "json"], f"cinder-{args.side}-volume-service-list")
-        for secret_id in sorted(set(roots["barbican_secrets"])):
-            acquire(["secret", "get", secret_id, "-f", "json"], f"cinder-{args.side}-secret-get-{secret_id}")
-        if roots["images"]:
-            stores = acquire(["image", "stores", "info", "-f", "json"], f"glance-{args.side}-stores-info")
-            if isinstance(stores, list):
-                roots["glance_stores"].extend(str(item.get("id")) for item in stores if isinstance(item, dict) and isinstance(item.get("id"), str))
-        for image_id in sorted(set(roots["images"])):
-            acquire(["image", "show", image_id, "-f", "json"], f"glance-{args.side}-image-show-{image_id}")
-            acquire(["image", "member", "list", image_id, "-f", "json"], f"glance-{args.side}-image-member-list-{image_id}")
+        catalog_origin, image_store_ids = _expand_live_api_roots(
+            roots, acquire, args.side, need_glance_catalog=args.probe_config is not None
+        )
         roots = {key: sorted(dict.fromkeys(values)) for key, values in roots.items()}
         snapshot = parse_information_schema(args.information_schema)
         api_result = {
-            "rehome_host": args.rehome_host, "instances": instance_ids,
+            "rehome_host": args.rehome_host, "instances": list(roots["instances"]),
             "roots": roots, "available_tables": sorted(snapshot.tables),
             "openstack": cached,
+            "image_store_ids": image_store_ids,
         }
+        if catalog_origin is not None:
+            api_result["glance_catalog_origin"] = catalog_origin
         payload = {
             "schema_version": API_INPUT_VERSION, "side": args.side,
             "api_result": api_result,
@@ -1038,6 +1317,8 @@ def _api_phase(args):
         "glance_store_capabilities", "target_manage_outputs",
         "target_image_inspects", "target_runtime_outputs", "target_virsh_argv",
         "target_qemu_argv", "schema_capabilities",
+        "capability_evidence",
+        "glance_catalog_origin", "image_store_ids",
     }
     if (
         not isinstance(payload["api_result"], dict)
@@ -1050,7 +1331,9 @@ def _api_phase(args):
         raise ValueError("cached collector composition bypass is forbidden")
     if args.probe_config is not None:
         probe_results = _execute_probe_config(
-            _read_protected_json(args.probe_config), ReadOnlyRunner()
+            _read_protected_json(args.probe_config), ReadOnlyRunner(),
+            catalog_origin=payload["api_result"].get("glance_catalog_origin"),
+            image_store_ids=payload["api_result"].get("image_store_ids"),
         )
         for key, value in probe_results.items():
             if key in payload["api_result"]:
@@ -1061,7 +1344,7 @@ def _api_phase(args):
         expected = {
             "schema_version", "target_manage_outputs", "target_image_inspects",
             "target_runtime_outputs", "target_virsh_argv", "target_qemu_argv",
-            "schema_capabilities",
+            "schema_capabilities", "capability_evidence",
         }
         if (
             not isinstance(capability, dict) or set(capability) != expected
@@ -1082,11 +1365,10 @@ def _api_phase(args):
          "table": query["table"], "filters": deepcopy(query["filters"])}
         for query in queries
     ]
-    phase_mode = "fixture" if fixture_mode else "live"
-    api_base = json.loads(render_json({"schema_version": API_RESULT_VERSION, "side": args.side, "phase_mode": phase_mode, "api_result": payload["api_result"]}))
-    filters_base = json.loads(render_json({"schema_version": "openstack-rehome-uuid-filters/v1alpha1", "side": args.side, "phase_mode": phase_mode, "filters": filters}))
-    plan_base = json.loads(render_json({"schema_version": PLAN_VERSION, "side": args.side, "phase_mode": phase_mode, "queries": queries}))
-    binding = _phase_binding(api_base, filters_base, plan_base, key=_load_phase_key(args, fixture=fixture_mode))
+    api_base = json.loads(render_json({"schema_version": API_RESULT_VERSION, "side": args.side, "api_result": payload["api_result"]}))
+    filters_base = json.loads(render_json({"schema_version": "openstack-rehome-uuid-filters/v1alpha1", "side": args.side, "filters": filters}))
+    plan_base = json.loads(render_json({"schema_version": PLAN_VERSION, "side": args.side, "queries": queries}))
+    binding = _phase_binding(api_base, filters_base, plan_base, key=_load_phase_key(args, fixture=fixture_mode), trust_domain="fixture" if fixture_mode else "live")
     api_result = {**api_base, "binding_sha256": binding}
     uuid_filters = {**filters_base, "binding_sha256": binding}
     plan = {**plan_base, "binding_sha256": binding}
@@ -1120,20 +1402,29 @@ def _combine_phase(args):
     api = _read_json(args.api_result)
     filters_document = _read_json(Path(args.api_result).with_name("uuid-filters.json"))
     plan = _read_json(Path(args.api_result).with_name("db-query-plan.json"))
-    if not isinstance(api, dict) or set(api) != {"schema_version", "side", "phase_mode", "api_result", "binding_sha256"} or api.get("schema_version") != API_RESULT_VERSION or api.get("side") != args.side or api.get("phase_mode") not in {"fixture", "live"}:
+    if not isinstance(api, dict) or set(api) != {"schema_version", "side", "api_result", "binding_sha256"} or api.get("schema_version") != API_RESULT_VERSION or api.get("side") != args.side:
         raise ValueError("API result envelope is invalid")
-    if not isinstance(filters_document, dict) or set(filters_document) != {"schema_version", "side", "phase_mode", "filters", "binding_sha256"} or filters_document.get("schema_version") != "openstack-rehome-uuid-filters/v1alpha1" or filters_document.get("side") != args.side or not isinstance(filters_document.get("filters"), list):
+    if not isinstance(filters_document, dict) or set(filters_document) != {"schema_version", "side", "filters", "binding_sha256"} or filters_document.get("schema_version") != "openstack-rehome-uuid-filters/v1alpha1" or filters_document.get("side") != args.side or not isinstance(filters_document.get("filters"), list):
         raise ValueError("UUID filter envelope is invalid")
-    if not isinstance(plan, dict) or set(plan) != {"schema_version", "side", "phase_mode", "queries", "binding_sha256"} or plan.get("schema_version") != PLAN_VERSION or plan.get("side") != args.side or not isinstance(plan["queries"], list) or not plan["queries"] or len(plan["queries"]) > _MAX_QUERIES or {api["phase_mode"], filters_document.get("phase_mode"), plan.get("phase_mode")} != {api["phase_mode"]}:
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "side", "queries", "binding_sha256"} or plan.get("schema_version") != PLAN_VERSION or plan.get("side") != args.side or not isinstance(plan["queries"], list) or not plan["queries"] or len(plan["queries"]) > _MAX_QUERIES:
         raise ValueError("DB query plan is invalid")
-    if api["phase_mode"] == "fixture" and any((getattr(args, "phase_key_file", None), getattr(args, "phase_key_env", None))):
+    fixture_mode = bool(getattr(args, "fixture_phase", False))
+    if fixture_mode and any((getattr(args, "phase_key_file", None), getattr(args, "phase_key_env", None))):
         raise ValueError("fixture phase trust anchor input is forbidden")
     api_base = {key: value for key, value in api.items() if key != "binding_sha256"}
     filters_base = {key: value for key, value in filters_document.items() if key != "binding_sha256"}
     plan_base = {key: value for key, value in plan.items() if key != "binding_sha256"}
-    binding = _phase_binding(api_base, filters_base, plan_base, key=_load_phase_key(args, fixture=api["phase_mode"] == "fixture"))
+    binding = _phase_binding(api_base, filters_base, plan_base, key=_load_phase_key(args, fixture=fixture_mode), trust_domain="fixture" if fixture_mode else "live")
     if {api["binding_sha256"], filters_document["binding_sha256"], plan["binding_sha256"]} != {binding}:
         raise ValueError("API/filter/query phase binding is invalid")
+    sensitive_evidence = {}
+    if getattr(args, "cinder_sensitive_evidence", None) is not None:
+        if fixture_mode:
+            raise ValueError("fixture Cinder sensitive evidence is forbidden")
+        summaries, sensitive_evidence = _load_cinder_sensitive_evidence(
+            args.cinder_sensitive_evidence, args.side
+        )
+        api["api_result"]["cinder_connection_summaries"] = summaries
     planned_filters = [
         {"query_id": query.get("query_id"), "schema": query.get("schema"),
          "table": query.get("table"), "filters": query.get("filters")}
@@ -1218,7 +1509,7 @@ def _combine_phase(args):
     schema_policy = _read_json(args.schema_policy)
     if not isinstance(schema_policy, dict):
         raise ValueError("schema policy is invalid")
-    collectors = _compose_collectors(
+    collectors, cache_misses = _compose_collectors(
         args.side, api["api_result"], records, evidence, snapshot
     )
     evidence_index = _build_evidence_index(args.side, collectors, api["api_result"], evidence)
@@ -1251,11 +1542,15 @@ def _combine_phase(args):
     combined = {
         "schema_version": BUNDLE_VERSION,
         "collectors": collectors,
-        "checks": [],
+        "checks": ([CheckResult(
+            f"control.{args.side}.api-closure", "UNKNOWN",
+            "required API dependency was discovered only after DB acquisition",
+            evidence_ids=[],
+        ).to_dict()] if cache_misses else []),
         "schema_capabilities": capabilities,
         "uuid_filters": side_filters,
         "evidence_index": evidence_index,
-        "sensitive_evidence": {},
+        "sensitive_evidence": sensitive_evidence,
     }
     _write_directory(args.out, {"control-result.json": combined})
 
@@ -1277,13 +1572,15 @@ def main(argv=None):
     parser.add_argument("--probe-config", type=Path)
     parser.add_argument("--root-manifest", type=Path)
     parser.add_argument("--capability-config", type=Path)
+    parser.add_argument("--cinder-sensitive-evidence", type=Path)
+    parser.add_argument("--fixture-phase", action="store_true")
     trust = parser.add_mutually_exclusive_group()
     trust.add_argument("--phase-key-file", type=Path)
     trust.add_argument("--phase-key-env")
     args = parser.parse_args(argv)
     try:
         if args.phase == "api":
-            if any((args.api_result, args.db_jsonl_dir, args.schema_policy)):
+            if any((args.api_result, args.db_jsonl_dir, args.schema_policy, args.fixture_phase, args.cinder_sensitive_evidence)):
                 raise ValueError("combine arguments are forbidden in API phase")
             if args.fixture is not None and any((args.rehome_host, args.cloud, args.clouds_file, args.container, args.information_schema, args.root_manifest, args.probe_config, args.capability_config, args.phase_key_file, args.phase_key_env)):
                 raise ValueError("fixture and live API arguments are mutually exclusive")

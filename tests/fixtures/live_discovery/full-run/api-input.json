@@ -4,6 +4,12 @@
   "api_result": {
     "rehome_host": "compute-023",
     "instances": ["11111111-1111-1111-1111-111111111111"],
+    "openstack": [
+      {"command":["server","list","--all-projects","--host","compute-023","--long","-f","json"],"payload":[],"evidence":{"id":"nova-source-server-list-compute-023"}},
+      {"command":["compute","service","list","--host","compute-023","-f","json"],"payload":[],"evidence":{"id":"nova-source-compute-service-list-compute-023"}},
+      {"command":["hypervisor","show","compute-023","-f","json"],"payload":{},"evidence":{"id":"nova-source-hypervisor-show-compute-023"}},
+      {"command":["resource","provider","list","--name","compute-023","-f","json"],"payload":[],"evidence":{"id":"nova-source-resource-provider-list-compute-023"}}
+    ],
     "available_tables": ["nova_api.host_mappings","nova_api.instance_mappings","nova_api.request_specs","nova.instances","nova.block_device_mapping","nova.instance_info_caches","nova.compute_nodes","nova.services"],
     "roots": {
       "instances": ["11111111-1111-1111-1111-111111111111"],

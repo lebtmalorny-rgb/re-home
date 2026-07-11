@@ -284,10 +284,15 @@ def _run(
     except ProbeFailed as error:
         evidence = error.evidence
         result.blockers.append(f"runtime probe failed: {evidence_id}")
-    persisted_stdout = (
-        _redact_xml_secrets(evidence.stdout) if redact_xml else evidence.stdout
-    )
-    result.evidence.append(_evidence_dict(evidence, stdout=persisted_stdout))
+    if redact_xml:
+        _redact_xml_secrets(evidence.stdout)
+    result.evidence.append({
+        "evidence_id": evidence_id,
+        "kind": "runtime-command",
+        "side": result.side,
+        "service": result.service,
+        "command": [str(value) for value in argv],
+    })
     return evidence.stdout if evidence.returncode == 0 else None
 
 

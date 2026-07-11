@@ -1,5 +1,7 @@
 import json
 import hashlib
+import inspect
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,17 +14,112 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery" / "full-run"
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import collect_live_control as control
 from live_discovery.contract import CheckResult, CollectorResult, ResourceNode
 from collect_live_control import _CombinedClient, _TABLE_ROOT_FILTERS, _api_phase, _collector_table_catalog, _execute_probe_config, _expected_plan_tables, _integrate_storage_readiness, _phase_binding, _read_protected_json, _root_filter_values
 from live_discovery.cinder import CORE_TABLES as CINDER_CORE, OPTIONAL_TABLES as CINDER_OPTIONAL
 from live_discovery.neutron import CORE_TABLES as NEUTRON_CORE, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL
 from live_discovery.nova import DB_SCHEMAS, DB_TABLES
+from live_discovery.schema import SchemaSnapshot
 
 
 class LiveDiscoveryCliTests(unittest.TestCase):
+    def test_fixture_combine_requires_explicit_cli_trust_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = root / "api"
+            created = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","api","--side","source","--fixture",str(FIXTURES/"api-input.json"),"--out",str(api)],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(0, created.returncode)
+            plan = json.loads((api/"db-query-plan.json").read_text())
+            db = root / "db"
+            db.mkdir()
+            for query in plan["queries"]:
+                (db/query["rc_file"]).write_text("0\n",encoding="ascii")
+                (db/query["jsonl_file"]).write_text("",encoding="utf-8")
+            rejected = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--side","source","--api-result",str(api/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"out")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(3, rejected.returncode)
+            with mock.patch.dict("os.environ",{"LIVE_PHASE_KEY":"fixture-only-phase-integrity-anchor-v1"}):
+                downgraded = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--side","source","--phase-key-env","LIVE_PHASE_KEY","--api-result",str(api/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"downgraded")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False,env={**os.environ,"LIVE_PHASE_KEY":"fixture-only-phase-integrity-anchor-v1"})
+            self.assertEqual(3,downgraded.returncode)
+
+    def test_missing_capability_evidence_is_not_fabricated(self):
+        collector = {"side":"target","service":"target-profile","nodes":[{"evidence_ids":["target-profile-real"]}],"checks":[]}
+        with self.assertRaises(ValueError):
+            control._build_evidence_index("target", [collector], {"openstack":[]}, [])
+
+    def test_storage_pass_cannot_cross_backend_kind_or_resource(self):
+        volume_id = "22222222-2222-2222-2222-222222222222"
+        result = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/volume-2"})])
+        api = {"storage_probe_results":[{"volume_id":volume_id,"scope":"source-compute","kind":"nfs","backend_identity":"rbd-backend","resource_identity":"/srv/nfs/volume-2","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage-cross-kind","status":"PASS","reason":"ok"}]}
+        _integrate_storage_readiness(result,[volume_id],api)
+        self.assertEqual("BLOCKED", result.checks[0].status)
+        result2=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/expected"})])
+        api2={"storage_probe_results":[{**api["storage_probe_results"][0],"kind":"rbd","resource_identity":"volumes/attacker"}]}
+        _integrate_storage_readiness(result2,[volume_id],api2)
+        self.assertEqual("BLOCKED",result2.checks[0].status)
+
+    def test_glance_probe_requires_independent_catalog_origin_and_actual_stores(self):
+        parameters = inspect.signature(_execute_probe_config).parameters
+        self.assertIn("catalog_origin", parameters)
+        self.assertIn("image_store_ids", parameters)
+
+    def test_glance_probe_accepts_only_catalog_origin_and_actual_image_stores(self):
+        image_id = "44444444-4444-4444-4444-444444444444"
+        class Response:
+            status=206
+            headers={"Content-Range":"bytes 0-0/1","Content-Length":"1"}
+            def read(self,size): return b"x"
+            def geturl(self): return f"https://glance.example/v2/images/{image_id}/file"
+            def close(self): pass
+        class Opener:
+            def open(self,request,timeout=None): return Response()
+        config={"schema_version":"openstack-rehome-probe-config/v1alpha1","storage":[],"glance":{"endpoint_url":"https://glance.example","token_env":"GLANCE_TEST_TOKEN","images":[{"image_id":image_id,"expected_size":1,"required":True,"store_ids":["real-store"]}],"store_capabilities":[{"store_id":"real-store","backend_type":"rbd"}]}}
+        with mock.patch.dict("os.environ",{"GLANCE_TEST_TOKEN":"ephemeral-token-value"}):
+            result = _execute_probe_config(config,object(),opener=Opener(),catalog_origin="https://glance.example",image_store_ids={image_id:["real-store"]})
+        self.assertEqual("PASS", result["glance_data_probe_results"][0]["status"])
+        attacker = json.loads(json.dumps(config))
+        attacker["glance"]["endpoint_url"] = "https://attacker.example"
+        with mock.patch.dict("os.environ",{"GLANCE_TEST_TOKEN":"ephemeral-token-value"}), self.assertRaises(ValueError):
+            _execute_probe_config(attacker,object(),opener=Opener(),catalog_origin="https://glance.example",image_store_ids={image_id:["real-store"]})
+        store_attacker=json.loads(json.dumps(config))
+        store_attacker["glance"]["images"][0]["store_ids"]=["fake-store"]
+        with mock.patch.dict("os.environ",{"GLANCE_TEST_TOKEN":"ephemeral-token-value"}), self.assertRaises(ValueError):
+            _execute_probe_config(store_attacker,object(),opener=Opener(),catalog_origin="https://glance.example",image_store_ids={image_id:["real-store"]})
+
+    def test_root_manifest_requires_protected_single_fd_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "roots.json"
+            manifest.write_text(json.dumps({"schema_version":"openstack-rehome-root-manifest/v1alpha1","side":"source","roots":{}}),encoding="utf-8")
+            args = type("Args",(),{"fixture":None,"rehome_host":"compute-023","cloud":"cloud","clouds_file":Path("/clouds.yaml"),"container":"toolbox","side":"source","information_schema":FIXTURES/"control-information-schema.tsv","root_manifest":manifest,"probe_config":None,"capability_config":None,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_TEST_KEY","out":root/"out"})()
+            class Client:
+                def __init__(self,*args): pass
+                def json(self,command,evidence_id): return [], {"id":evidence_id}
+            with mock.patch("live_discovery.openstack.OpenStackClient",Client), mock.patch.dict("os.environ",{"LIVE_DISCOVERY_TEST_KEY":"test-phase-anchor-at-least-sixteen"}), self.assertRaises(ValueError):
+                _api_phase(args)
+
+    def test_protected_cinder_connection_evidence_loader_is_available(self):
+        self.assertTrue(hasattr(control, "_load_cinder_sensitive_evidence"))
+
+    def test_cinder_connection_evidence_is_mode_checked_and_raw_only_in_sensitive_output(self):
+        volume_id="22222222-2222-2222-2222-222222222222"
+        attachment_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        payload={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":[{"evidence_id":"cinder-sensitive-attachment","volume_id":volume_id,"attachment_id":attachment_id,"backend_kind":"rbd","backend_id":"rbd-backend","resource_identity":"volumes/volume-2","connector":{"host":"compute-023","auth_password":"connector-secret"},"connection_info":{"driver_volume_type":"rbd","secret_uuid":"connection-secret"}}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"cinder-sensitive.json"
+            path.write_text(json.dumps(payload),encoding="utf-8")
+            path.chmod(0o600)
+            summaries,sensitive=control._load_cinder_sensitive_evidence(path,"source")
+            self.assertEqual("rbd",summaries[volume_id]["backend_kind"])
+            self.assertNotIn("connector-secret",json.dumps(summaries))
+            self.assertIn("connector-secret",json.dumps(sensitive))
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                control._load_cinder_sensitive_evidence(path,"source")
+
     def test_root_manifest_is_merged_before_recursive_api_closure(self):
         ids = {name: f"{index:08d}-1111-4111-8111-{index:012d}" for index, name in enumerate((
-            "instance","port","network","subnet","security_group","qos","trunk","floating","router","address_group","volume","type","attachment","snapshot","secret","image","flavor"
+            "instance","port","child_port","network","subnet","security_group","qos","trunk","floating","router","address_group","volume","type","attachment","snapshot","secret","image","flavor"
         ), start=1)}
         roots = {
             "instances":[ids["instance"]],"ports":[ids["port"]],"networks":[ids["network"]],"subnets":[ids["subnet"]],
@@ -43,6 +140,8 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     payload = {"id":ids["instance"],"flavor":{"id":ids["flavor"]},"image":{"id":ids["image"]}}
                 elif command[:2] == ["volume","show"]:
                     payload = {"id":ids["volume"],"volume_type_id":ids["type"],"snapshot_id":ids["snapshot"],"attachments":[{"id":ids["attachment"]}]}
+                elif command[:3] == ["network","trunk","show"]:
+                    payload = {"id":ids["trunk"],"sub_ports":[{"port_id":ids["child_port"]}]}
                 else:
                     payload = {"id": command[-4] if len(command) > 4 else ids["instance"]}
                 return payload, {"id":evidence_id}
@@ -50,6 +149,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             root = Path(temporary)
             manifest = root / "roots.json"
             manifest.write_text(json.dumps({"schema_version":"openstack-rehome-root-manifest/v1alpha1","side":"source","roots":roots}),encoding="utf-8")
+            manifest.chmod(0o600)
             schema = root / "information-schema.tsv"
             lines = ["SERVICE:all", "SECTION:COLUMNS"]
             for identity in sorted(set().union(*_collector_table_catalog().values())):
@@ -63,6 +163,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 _api_phase(args)
         expected = [
             ("server","show",ids["instance"]),("flavor","show",ids["flavor"]),("port","show",ids["port"]),
+            ("port","show",ids["child_port"]),
             ("network","show",ids["network"]),("subnet","show",ids["subnet"]),("network","trunk","show",ids["trunk"]),
             ("router","show",ids["router"]),("floating","ip","show",ids["floating"]),("volume","attachment","show",ids["attachment"]),
             ("volume","type","show",ids["type"]),("volume","snapshot","show",ids["snapshot"]),("secret","get",ids["secret"]),
@@ -139,6 +240,8 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     payload = []
                 elif command[:3] == ["image", "stores", "info"] or command[:2] == ["image", "member"]:
                     payload = []
+                elif command[:3] == ["catalog", "show", "glance"]:
+                    payload = {"public":"https://glance.example"}
                 elif command[:2] == ["image", "show"]:
                     payload = {"id":"44444444-4444-4444-4444-444444444444"}
                 else:
@@ -170,12 +273,25 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         }
         expected = _expected_plan_tables("source", roots, set().union(*catalog.values()))
         self.assertEqual(set().union(*catalog.values()), expected)
+
+    def test_target_live_like_all_collectors_have_zero_cache_misses_and_real_evidence(self):
+        manage=json.loads((ROOT/"tests/fixtures/live_discovery/openstack-command-results.json").read_text())["manage_outputs"]
+        api={"openstack":[],"roots":{"ports":[],"volumes":[],"images":[],"projects":[]},"target_manage_outputs":manage,"target_image_inspects":{},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}]}
+        collectors,misses=control._compose_collectors("target",api,[],[],SchemaSnapshot(tables={}))
+        self.assertEqual([],misses)
+        self.assertEqual({"target-profile","runtime-capabilities","neutron","cinder","glance"},{item["service"] for item in collectors})
+        index=control._build_evidence_index("target",collectors,api,[])
+        identities={item["evidence_id"] for item in index}
+        self.assertIn("runtime-target-virsh-version",identities)
+        self.assertIn("nova-online-data-migrations",identities)
     def test_task7_and_task8_probe_results_are_typed_and_handed_to_collectors(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
         image_id = "44444444-4444-4444-4444-444444444444"
         api_result = {
             "openstack": [],
             "glance_store_capabilities": [{"store_id": "store-1", "backend_type": "rbd"}],
+            "glance_catalog_origin":"https://glance.example",
+            "image_store_ids":{image_id:["store-1"]},
             "glance_data_probe_results": [{"image_id": image_id, "endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status": "PASS", "reason": "Glance image data byte is readable"}],
             "storage_probe_results": [
                 {"volume_id": volume_id, "scope": "source-compute", "kind": "nfs", "backend_identity":"rbd-backend","resource_identity":"/srv/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:nfs", "status": "PASS", "reason": "backing object is readable with expected size"},
@@ -189,15 +305,15 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         self.assertEqual("rbd", capabilities[0]["backend_type"])
         self.assertEqual("glance-source-store-capabilities", evidence["evidence_id"])
         self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
-        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source", {"size":1,"storage_backend_id":"rbd-backend"})])
+        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source", {"size":1,"storage_backend_id":"rbd-backend","backend_kind":"nfs","resource_identity":"/srv/volume"})])
         _integrate_storage_readiness(cinder, [volume_id], api_result)
         self.assertTrue(all(any(f".{kind}." in check.check_id for check in cinder.checks) for kind in {"nfs", "rbd", "lvm", "vendor-san"}))
-        self.assertIn("storage driver is unsupported", cinder.unknowns)
+        self.assertIn("backing object probe is not bound to Cinder size and backend", cinder.blockers)
 
     def test_image_pass_cannot_be_reused_for_different_size_or_requirement(self):
         image_id = "44444444-4444-4444-4444-444444444444"
         result = {"image_id":image_id,"endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status":"PASS","reason":"ok"}
-        client = _CombinedClient("source", {"openstack":[],"glance_store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}],"glance_data_probe_results":[result]}, [], [])
+        client = _CombinedClient("source", {"openstack":[],"glance_catalog_origin":"https://glance.example","image_store_ids":{image_id:["store-1"]},"glance_store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}],"glance_data_probe_results":[result]}, [], [])
         self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
         self.assertEqual("UNKNOWN", client.probe_image_data(image_id, 2, True).status)
         self.assertEqual("UNKNOWN", client.probe_image_data(image_id, 1, False).status)
@@ -239,10 +355,10 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 {"volume_id":volume_id,"scope":"target-storage","kind":"lvm","backend_id":"rbd-backend","resource":{"vg":"cinder-volumes","allowed_vgs":["cinder-volumes"],"lv":"volume-1","expected_size":1}},
                 {"volume_id":volume_id,"scope":"target-storage","kind":"vendor-san","backend_id":"rbd-backend","resource":{"expected_size":1}}
             ],
-            "glance": {"endpoint_url":"https://glance.example","token_file":"/secure/token","images":[{"image_id":image_id,"expected_size":1,"required":True}],"store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}]}
+            "glance": {"endpoint_url":"https://glance.example","token_file":"/secure/token","images":[{"image_id":image_id,"expected_size":1,"required":True,"store_ids":["store-1"]}],"store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}]}
         }
         opener = Opener()
-        results = _execute_probe_config(config, Runner(), opener=opener, token_loader=lambda path: "ephemeral-token-value")
+        results = _execute_probe_config(config, Runner(), opener=opener, token_loader=lambda path: "ephemeral-token-value", catalog_origin="https://glance.example", image_store_ids={image_id:["store-1"]})
         self.assertEqual(["PASS", "PASS", "PASS", "UNKNOWN"], [item["status"] for item in results["storage_probe_results"]])
         self.assertEqual("PASS", results["glance_data_probe_results"][0]["status"])
         self.assertEqual("ephemeral-token-value", opener.authorization)
@@ -260,6 +376,27 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     self.assertEqual(code, proc.returncode, proc.stderr)
                     self.assertTrue((out / "readiness-report.md").is_file())
                     self.assertEqual(code, json.loads((out / "readiness-report.json").read_text())["exit_code"])
+
+    def test_realistic_source_target_fixtures_have_canonical_cross_service_closure(self):
+        source=json.loads((FIXTURES/"ready/source-control.json").read_text())
+        target=json.loads((FIXTURES/"ready/target-control.json").read_text())
+        expected_source={"instance","port","network","volume","volume_attachment","storage_backend","image","image_member","glance_store"}
+        source_nodes=[node for collector in source["collectors"] for node in collector["nodes"]]
+        target_nodes=[node for collector in target["collectors"] for node in collector["nodes"]]
+        self.assertTrue(expected_source.issubset({node["kind"] for node in source_nodes}))
+        self.assertTrue({"port","network","volume","volume_attachment","storage_backend","image","image_member","glance_store"}.issubset({node["kind"] for node in target_nodes}))
+        canonical_kinds={"instance","port","network","volume","image"}
+        for node in [*source_nodes,*target_nodes]:
+            if node["kind"] in canonical_kinds:
+                self.assertEqual(node["id"],str(__import__("uuid").UUID(node["id"])))
+        required_edges=[edge for bundle in (source,target) for collector in bundle["collectors"] for edge in collector["edges"] if edge["required"]]
+        self.assertTrue(any(edge["source"].startswith("instance:") and edge["target"].startswith("port:") for edge in required_edges))
+        self.assertTrue(any(edge["source"].startswith("instance:") and edge["target"].startswith("volume:") for edge in required_edges))
+        self.assertTrue(any(edge["source"].startswith("volume:") and edge["target"].startswith("storage_backend:") for edge in required_edges))
+        self.assertTrue(any(edge["source"].startswith("volume:") and edge["target"].startswith("volume_attachment:") for edge in required_edges))
+        self.assertTrue(any(edge["source"].startswith("image:") and edge["target"].startswith("glance_store:") for edge in required_edges))
+        self.assertTrue(any(edge["source"].startswith("image:") and edge["target"].startswith("image_member:") for edge in required_edges))
+        self.assertTrue(source["evidence_index"] and target["evidence_index"])
 
     def test_assembler_rejects_missing_or_wrong_service_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -303,7 +440,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             self.assertEqual(0, proc.returncode, proc.stderr)
             db = root / "db"
             db.mkdir()
-            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(FIXTURES / "control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(FIXTURES / "control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, combine.returncode)
             self.assertNotIn("Traceback", combine.stderr)
 
@@ -341,7 +478,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 (api_dir/name).write_text(json.dumps(document),encoding="utf-8")
             db = root / "db"
             db.mkdir()
-            proc = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--side","source","--api-result",str(api_dir/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"combined")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            proc = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--fixture-phase","--side","source","--api-result",str(api_dir/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"combined")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
             self.assertEqual(3, proc.returncode)
 
     def test_combine_rejects_query_plan_sql_tampering(self):
@@ -359,7 +496,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             db.mkdir()
             (db / query["rc_file"]).write_text("0\n", encoding="ascii")
             (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}) + "\n", encoding="utf-8")
-            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(FIXTURES / "control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(FIXTURES / "control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, combine.returncode)
 
     def test_combine_rejects_api_filter_and_binding_substitution(self):
@@ -388,7 +525,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 for query in plan["queries"]:
                     (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                     (db / query["jsonl_file"]).write_text("", encoding="utf-8")
-                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api_dir / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api_dir / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertNotEqual(0, combine.returncode)
 
     def test_combine_rejects_extra_or_missing_selected_columns(self):
@@ -409,7 +546,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 db.mkdir()
                 (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                 (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": row}) + "\n", encoding="utf-8")
-                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertNotEqual(0, combine.returncode)
 
     def test_api_fixture_cannot_bypass_composition_with_cached_collectors(self):
@@ -434,7 +571,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             (db / query["rc_file"]).write_text("0\n", encoding="ascii")
             (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}) + "\n", encoding="utf-8")
             (db / "unplanned.jsonl").write_text("{}\n", encoding="utf-8")
-            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, combine.returncode)
 
     def test_combine_accepts_exact_jsonl_envelope_and_writes_assembler_bundle(self):
@@ -453,11 +590,25 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                 (db / query["jsonl_file"]).write_text(json.dumps({"_schema": query["schema"], "_table": query["table"], "row": row}) + "\n", encoding="utf-8")
             out = root / "combined"
-            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(out)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(out)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertEqual(0, combine.returncode, combine.stderr)
             bundle = json.loads((out / "control-result.json").read_text())
             self.assertEqual("openstack-rehome-control-bundle/v1alpha1", bundle["schema_version"])
             self.assertTrue(bundle["collectors"])
+            self.assertEqual([], bundle["checks"], "source live-like fixture must have zero API cache misses")
+            self.assertFalse(any("cached" in reason for collector in bundle["collectors"] for reason in [*collector["unknowns"],*collector["blockers"]]))
+            missing_fixture=json.loads((FIXTURES/"api-input.json").read_text())
+            missing_fixture["api_result"]["openstack"]=missing_fixture["api_result"]["openstack"][1:]
+            missing_path=root/"missing-fixture.json"
+            missing_path.write_text(json.dumps(missing_fixture),encoding="utf-8")
+            missing_api=root/"missing-api"
+            recreate=subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","api","--side","source","--fixture",str(missing_path),"--out",str(missing_api)],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(0,recreate.returncode,recreate.stderr)
+            missing_out=root/"missing-combined"
+            missing_combine=subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--fixture-phase","--side","source","--api-result",str(missing_api/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(ROOT/"tests/fixtures/live_discovery/full-run/control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(missing_out)],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(0,missing_combine.returncode,missing_combine.stderr)
+            missing_bundle=json.loads((missing_out/"control-result.json").read_text())
+            self.assertEqual("UNKNOWN",missing_bundle["checks"][0]["status"])
             self.assertEqual({"source", "target"}, set(bundle["uuid_filters"]))
 
     def test_combine_rejects_nonzero_malformed_and_provenance_mismatch(self):
@@ -473,7 +624,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 (db / query["rc_file"]).write_text("9\n" if mode == "nonzero" else "0\n", encoding="ascii")
                 record = {"_schema": "wrong" if mode == "provenance" else "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}
                 (db / query["jsonl_file"]).write_text("not-json\n" if mode == "malformed" else json.dumps(record) + "\n", encoding="utf-8")
-                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertNotEqual(0, combine.returncode)
                 self.assertNotIn("Traceback", combine.stderr)
 
@@ -516,7 +667,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             self.assertEqual("openstack-rehome-directional-schema-mapping/v1alpha1", mapping["schema_version"])
             self.assertEqual("COMMON_COMPATIBLE", mapping["tables"]["nova.instances"][0]["classification"])
 
-    def test_live_assembler_accepts_raw_runtime_collector_artifact(self):
+    def test_live_assembler_rejects_raw_runtime_without_real_typed_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "source.json").write_text((FIXTURES / "ready/source-control.json").read_text(), encoding="utf-8")
@@ -525,8 +676,8 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             (root / "runtime.json").write_text(json.dumps(runtime), encoding="utf-8")
             out = root / "out"
             proc = subprocess.run([sys.executable, "scripts/assemble_live_discovery.py", "--source-control", str(root / "source.json"), "--target-control", str(root / "target.json"), "--runtime", str(root / "runtime.json"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out-dir", str(out)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            self.assertEqual(0, proc.returncode, proc.stderr)
-            self.assertTrue((out / "resource-graph.json").is_file())
+            self.assertEqual(3, proc.returncode)
+            self.assertFalse((out / "resource-graph.json").exists())
 
     def test_assembler_rejects_swapped_mixed_and_wrong_runtime_roles(self):
         with tempfile.TemporaryDirectory() as temporary:

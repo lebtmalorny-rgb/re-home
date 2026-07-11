@@ -140,7 +140,7 @@ class RuntimeCollectorTests(unittest.TestCase):
         serialized = json.dumps(result.to_dict())
         self.assertNotIn("libvirt-secret-value", serialized)
         self.assertNotIn("secret-uuid", serialized)
-        self.assertIn("[REDACTED]", serialized)
+        self.assertTrue(all(set(item) == {"evidence_id","kind","side","service","command"} for item in result.evidence))
 
     def test_dumpxml_graphics_password_and_auth_values_are_redacted(self):
         class CredentialXmlRunner(FixtureRuntimeRunner):
@@ -164,7 +164,7 @@ class RuntimeCollectorTests(unittest.TestCase):
             "chap-password",
         ):
             self.assertNotIn(sensitive, serialized)
-        self.assertIn("[REDACTED]", serialized)
+        self.assertTrue(all("stdout" not in item for item in result.evidence))
 
     def test_runtime_issues_only_prescribed_read_only_commands(self):
         runner = FixtureRuntimeRunner(self.fixture)

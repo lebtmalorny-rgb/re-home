@@ -309,6 +309,7 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             "db-jsonl": common | {"schema", "table", "filters"},
             "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "scope", "expected_size", "observed_size", "status"},
             "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+            "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity"},
         }
         if not isinstance(entry, Mapping) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
             raise ValueError("evidence index entry schema is invalid")
@@ -322,6 +323,8 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             raise ValueError("storage evidence is invalid")
         if entry["kind"] == "glance-range" and (entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]):
             raise ValueError("Glance evidence is invalid")
+        if entry["kind"] == "cinder-connection" and not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity")):
+            raise ValueError("Cinder connection evidence is invalid")
     if not isinstance(evidence["sensitive"], Mapping):
         raise ValueError("sensitive evidence schema is invalid")
     _validate_sensitive(evidence["sensitive"])
