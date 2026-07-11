@@ -1,0 +1,15 @@
+{
+  "side": "target",
+  "schema_tables": ["volumes", "volume_attachment", "volume_types", "volume_type_extra_specs", "services", "encryption", "snapshots", "volume_metadata"],
+  "openstack": [],
+  "tables": {
+    "volumes": [],
+    "volume_attachment": [],
+    "volume_types": [],
+    "volume_type_extra_specs": [],
+    "services": [],
+    "encryption": [],
+    "snapshots": [],
+    "volume_metadata": []
+  }
+}
