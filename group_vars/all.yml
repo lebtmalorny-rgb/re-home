@@ -192,7 +192,9 @@ live_discovery_db_service_credentials:
   cinder: {user: cinder, password_key: cinder_database_password}
 # Authoritative typed backend map. Empty means storage readiness is UNKNOWN.
 # Every configured entry must declare kind, per-side delegate, allowed scopes
-# and a supported probe template. Vendor templates remain explicit UNKNOWN.
+# and a probe template. NFS/file, RBD and LVM have read-only size probes;
+# iSCSI, Fibre Channel and other vendor kinds remain explicit UNKNOWN until a
+# dedicated non-mutating template is implemented.
 live_discovery_storage_backends: {}
 live_discovery_target_virsh_command: "virsh"
 live_discovery_target_qemu_command: "qemu-system-x86_64"
@@ -213,6 +215,7 @@ live_discovery_source_probe_config_file_local: ""
 live_discovery_target_probe_config_file_local: ""
 live_discovery_source_cinder_sensitive_evidence_file_local: ""
 live_discovery_target_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_online_migration_evidence_file_local: ""
 live_discovery_source_glance_token_file_local: ""
 live_discovery_target_glance_token_file_local: ""
 

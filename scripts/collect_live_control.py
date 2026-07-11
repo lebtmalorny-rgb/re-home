@@ -26,7 +26,7 @@ from live_discovery.neutron import NeutronCollector, CORE_TABLES as NEUTRON_CORE
 from live_discovery.nova import NovaCollector, DB_SCHEMAS as NOVA_DB_SCHEMAS, DB_TABLES as NOVA_DB_TABLES
 from live_discovery.openstack import collect_target_profile
 from live_discovery.render import render_json
-from live_discovery.runner import ReadOnlyRunner, validate_select_only_sql
+from live_discovery.runner import CommandEvidence, ProbeFailed, ReadOnlyRunner, validate_select_only_sql
 from live_discovery.runtime import collect_target_capabilities
 from live_discovery.schema import parse_information_schema
 from live_discovery.storage import probe_storage, _parse_size as _storage_parse_size
@@ -670,14 +670,24 @@ class _CachedCapabilityRunner:
         self.side = "target"
 
     def run(self, argv, evidence_id, sensitive_stdout=False):
-        del argv, sensitive_stdout
-        if evidence_id not in self.outputs or not isinstance(self.outputs[evidence_id], str):
+        del sensitive_stdout
+        value = self.outputs.get(evidence_id)
+        if isinstance(value, str):
+            # Retain fixture compatibility. Live orchestration always supplies
+            # the rc-bearing record shape below.
+            return CommandEvidence(evidence_id, [str(item) for item in argv], 0, value, "")
+        expected = {"evidence_id", "command", "returncode", "stdout", "stderr"}
+        if not isinstance(value, dict) or set(value) != expected:
             raise RuntimeError("cached target capability output is missing")
-        return type("Evidence", (), {
-            "stdout": self.outputs[evidence_id], "stderr": "", "returncode": 0,
-            "evidence_id": evidence_id,
-            "to_dict": lambda instance: {"evidence_id": instance.evidence_id},
-        })()
+        if value["evidence_id"] != evidence_id or value["command"] != [str(item) for item in argv]:
+            raise RuntimeError("cached target capability identity conflicts")
+        evidence = CommandEvidence(
+            evidence_id, deepcopy(value["command"]), value["returncode"],
+            value["stdout"], value["stderr"],
+        )
+        if evidence.returncode != 0:
+            raise ProbeFailed(evidence)
+        return evidence
 
 
 def _dependency_ids(result, kind):
@@ -1530,7 +1540,7 @@ def _api_phase(args):
         "glance_store_capabilities", "target_manage_outputs",
         "target_image_inspects", "target_runtime_outputs", "target_virsh_argv",
         "target_qemu_argv", "schema_capabilities",
-        "capability_evidence",
+        "capability_evidence", "probe_statuses",
         "glance_catalog_origin", "image_store_ids",
     }
     if (
@@ -1554,17 +1564,19 @@ def _api_phase(args):
             payload["api_result"][key] = value
     if args.capability_config is not None:
         capability = _read_protected_json(args.capability_config)
-        expected = {
+        required = {
             "schema_version", "target_manage_outputs", "target_image_inspects",
             "target_runtime_outputs", "target_virsh_argv", "target_qemu_argv",
             "schema_capabilities", "capability_evidence",
         }
+        allowed = required | {"probe_statuses"}
         if (
-            not isinstance(capability, dict) or set(capability) != expected
+            not isinstance(capability, dict) or not required.issubset(capability)
+            or not set(capability).issubset(allowed)
             or capability.get("schema_version") != "openstack-rehome-target-capability-input/v1alpha1"
         ):
             raise ValueError("target capability input is invalid")
-        for key in expected - {"schema_version"}:
+        for key in set(capability) - {"schema_version"}:
             if key in payload["api_result"]:
                 raise ValueError("target capability identity is duplicated")
             payload["api_result"][key] = deepcopy(capability[key])

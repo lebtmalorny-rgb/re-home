@@ -64,7 +64,10 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         for path in (PLAYBOOK, SCHEMA_TASKS, DB_TASKS):
             for mapping in _walk(_yaml_documents(path)):
                 if "ansible.builtin.command" in mapping:
-                    if mapping.get("name") == "Live discovery | acquire exclusive local run directory":
+                    if mapping.get("name") in {
+                        "Live discovery | acquire exclusive local run directory",
+                        "Live discovery | acquire persistent sibling run owner lock",
+                    }:
                         self.assertIs(mapping.get("changed_when"), True)
                     else:
                         self.assertIs(
@@ -243,7 +246,8 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
 
     def test_unknown_or_blocked_assembler_exit_fails_play(self):
         text = PLAYBOOK.read_text(encoding="utf-8")
-        self.assertIn("failed_when: live_discovery_assemble.rc not in [0]", text)
+        self.assertIn("live_discovery_assemble.rc in [0]", text)
+        self.assertIn("cleanup-live-run-owner.yml", text)
         self.assertIn("live_discovery_fail_on_not_ready", text)
 
     def test_generic_defaults_fail_closed_and_lab_is_backend_extensible(self):
@@ -280,10 +284,60 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
             self.assertEqual(0, first.returncode)
             self.assertNotEqual(0, second.returncode)
 
+    def test_sibling_owner_survives_atomic_artifact_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = root / ".control" / "owners" / "fixed-run"
+            owner.mkdir(parents=True)
+            (owner / "run-owner.json").write_text('{"status":"running"}', encoding="utf-8")
+            output = root / "fixed-run"
+            output.mkdir()
+            staging = root / ".fixed-run.staging"
+            staging.mkdir()
+            backup = root / ".fixed-run.backup"
+            os.replace(output, backup)
+            os.replace(staging, output)
+            self.assertTrue((owner / "run-owner.json").is_file())
+            second = subprocess.run(
+                ["mkdir", "--", str(owner)], check=False,
+                stderr=subprocess.DEVNULL,
+            )
+            self.assertNotEqual(0, second.returncode)
+
     def test_source_profile_probes_are_not_silently_discarded(self):
         text = PLAYBOOK.read_text(encoding="utf-8")
         self.assertNotIn("live_discovery_source_profile_probes", text)
         self.assertNotIn("live_discovery_source_image_inspects", text)
+
+    def test_target_profile_is_derived_from_live_rc_bearing_records(self):
+        text = PLAYBOOK.read_text(encoding="utf-8")
+        self.assertNotIn('release: "2025.1"', text)
+        self.assertNotIn("distribution: vanilla", text)
+        self.assertIn("capability_input.py", text)
+        self.assertIn("item.rc", text)
+        self.assertIn("item.stderr", text)
+        self.assertIn("live_discovery_target_online_migration_evidence_file_local", text)
+        self.assertNotIn("online_data_migrations", text)
+
+    def test_run_identity_enablement_and_sibling_owner_lock_are_explicit(self):
+        text = PLAYBOOK.read_text(encoding="utf-8")
+        self.assertIn("live_discovery_frozen_source.enabled", text)
+        self.assertIn("live_discovery_frozen_target.enabled", text)
+        self.assertIn("live_discovery_frozen_target.run_id", text)
+        self.assertIn("live_discovery_run_owner_dir", text)
+        self.assertIn("live_discovery_run_owner_token", text)
+        self.assertIn("completed.json", text)
+        self.assertIn("delegate_facts: true", text)
+        owner_tasks = (ROOT / "playbooks/tasks/verify-live-run-owner.yml").read_text(encoding="utf-8")
+        self.assertIn("live_discovery_frozen_run_id == hostvars['localhost'].live_discovery_frozen_run_id", owner_tasks)
+
+    def test_protected_inputs_are_frozen_before_any_later_use(self):
+        text = PLAYBOOK.read_text(encoding="utf-8")
+        self.assertIn("live_discovery_frozen_protected_dir", text)
+        self.assertIn("ansible.builtin.slurp", text)
+        self.assertIn("live_discovery_frozen_protected_paths", text)
+        self.assertNotIn("lookup('file', live_discovery_source_probe_config_file_local)", text)
+        self.assertNotIn("lookup('file', live_discovery_target_probe_config_file_local)", text)
 
 
 if __name__ == "__main__":

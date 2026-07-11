@@ -123,7 +123,8 @@ OVS dataplane и storage helpers.
   данным живых source/target кластеров перед переносом узла. SQL dump не
   является источником данных; Masakari/DRS не собираются.
 - **Что читает:** OpenStack API, UUID-scoped `SELECT` из Nova/Neutron/Cinder,
-  `information_schema`, версии и container image digests, libvirt/QEMU,
+  `information_schema`, согласованные release labels/tags и container image
+  digests, libvirt/QEMU,
   OVS/OVN, Cinder backing storage и один байт Glance image data.
 - **Порядок:** первые controller plays формируют API/schema/DB evidence;
   compute plays собирают runtime и реальные target capabilities; шестой play
@@ -132,16 +133,21 @@ OVS dataplane и storage helpers.
   вызывает локальный assembler.
 - **Что меняет:** только run-local каталоги и artifacts. Все probe/version/
   inspect/DB команды имеют `changed_when: false`; SQL валидируется как
-  SELECT-only. Credentials, HMAC key, Glance token, probe/capability configs и
-  raw Cinder evidence имеют режим `0600` внутри каталогов `0700` и удаляются в
-  `always`.
+  SELECT-only. Credentials, HMAC key, Glance token, probe/capability configs,
+  raw Cinder evidence и опциональное timestamped evidence уже выполненных
+  Nova/Cinder online migrations имеют режим `0600`. Входные байты один раз
+  фиксируются под sibling owner-lock `.control/owners/<run-id>`; caller paths
+  после этого повторно не читаются. Сам playbook online migrations не запускает.
 - **Artifacts:**
   `{{ local_artifact_dir }}/live-discovery/<run-id>/readiness-report.json` и
   companion JSON/YAML/Markdown evidence artifacts.
 - **Guard:** inventory roles должны быть singleton; run ID и protected inputs
   проверяются до построения путей; generic storage backend остаётся пустым и
-  даёт `UNKNOWN`, пока не задан read-only профиль. Поддерживаются профили NFS,
-  RBD, LVM и явно описанный vendor backend. Exit code assembler, отличный от
+  даёт `UNKNOWN`, пока не задан read-only профиль. NFS не является обязательным:
+  read-only size probes реализованы для NFS/file, RBD и LVM; iSCSI, Fibre
+  Channel и иные Cinder/vendor drivers сохраняются в типизированном evidence,
+  но без явно реализованного безопасного probe template дают `UNKNOWN`. Exit
+  code assembler, отличный от
   `0` (`UNKNOWN`/`BLOCKED`), завершает playbook ошибкой.
 
 ### `03-backup-databases.yml`
