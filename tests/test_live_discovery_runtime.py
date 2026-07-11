@@ -62,6 +62,35 @@ class RuntimeCollectorTests(unittest.TestCase):
             result.blockers,
         )
 
+    def test_cinder_volume_backend_name_normalizes_to_canonical_uuid(self):
+        fixture = deepcopy(self.fixture)
+        volume_uuid = "22222222-2222-2222-2222-222222222222"
+        fixture["domains"][0]["disks"][0]["source"] = (
+            f"cinder-volumes/volume-{volume_uuid}"
+        )
+        fixture["domains"][0]["disks"][0]["serial"] = volume_uuid
+
+        result = collect_from_fixture(fixture)
+
+        targets = {edge.target for edge in result.edges}
+        self.assertIn(f"volume:{volume_uuid}", targets)
+        self.assertNotIn(f"volume:volume-{volume_uuid}", targets)
+
+    def test_truncated_tap_name_does_not_invent_port_id(self):
+        fixture = deepcopy(self.fixture)
+        fixture["domains"][0]["interfaces"][0]["target"] = "tap33333333-33"
+        fixture["ovs_interfaces"][0]["name"] = "tap33333333-33"
+        fixture["ovs_interfaces"][0]["external_ids"] = {}
+        fixture["ovs_ports"][0]["name"] = "tap33333333-33"
+
+        result = collect_from_fixture(fixture)
+
+        self.assertIn(
+            "unmapped runtime interface: instance-0000002a/tap33333333-33",
+            result.blockers,
+        )
+        self.assertNotIn("port:33333333-33", {edge.target for edge in result.edges})
+
     def test_source_machine_type_missing_on_target_is_blocker(self):
         checks = compare_machine_types(
             ["pc-i440fx-rhel7.6.0"],
@@ -133,6 +162,70 @@ class RuntimeCollectorTests(unittest.TestCase):
         checks = compare_runtime_to_nova(runtime, nova)
 
         self.assertEqual(["BLOCKED"], [item.status for item in checks])
+
+    def test_shutoff_nova_instance_does_not_require_running_domain(self):
+        runtime = CollectorResult(service="runtime", side="source")
+        nova = CollectorResult(service="nova", side="source")
+        nova.nodes.append(
+            ResourceNode(
+                "instance",
+                "11111111-1111-1111-1111-111111111111",
+                "source",
+                {"status": "SHUTOFF"},
+            )
+        )
+
+        checks = compare_runtime_to_nova(runtime, nova)
+
+        self.assertEqual([], checks)
+
+    def test_malformed_successful_dataplane_output_is_blocker(self):
+        class MalformedOvsRunner(FixtureRuntimeRunner):
+            def _stdout(self, argv):
+                if argv == ["ovs-vsctl", "--format=json", "list", "Interface"]:
+                    return "not-json"
+                return super()._stdout(argv)
+
+        result = collect_runtime(MalformedOvsRunner(self.fixture), ["virsh"], "ovs")
+
+        self.assertIn("invalid OVS Interface output", result.blockers)
+
+    def test_malformed_successful_dataplane_row_is_blocker(self):
+        class MalformedOvsRowRunner(FixtureRuntimeRunner):
+            def _stdout(self, argv):
+                if argv == ["ovs-vsctl", "--format=json", "list", "Interface"]:
+                    return '{"headings":["name","external_ids"],"data":[["tap-only"]]}'
+                return super()._stdout(argv)
+
+        result = collect_runtime(MalformedOvsRowRunner(self.fixture), ["virsh"], "ovs")
+
+        self.assertIn("invalid OVS Interface output", result.blockers)
+
+    def test_blank_successful_domain_disk_output_is_blocker(self):
+        class BlankDiskRunner(FixtureRuntimeRunner):
+            def _stdout(self, argv):
+                if len(argv) >= 3 and argv[-3] == "domblklist":
+                    return ""
+                return super()._stdout(argv)
+
+        result = collect_runtime(BlankDiskRunner(self.fixture), ["virsh"], "ovs")
+
+        self.assertIn(
+            "invalid domain disk list: instance-0000002a",
+            result.blockers,
+        )
+
+    def test_ovn_non_port_binding_is_not_mapped_to_neutron_port(self):
+        fixture = deepcopy(self.fixture)
+        fixture["network_backend"] = "ovn"
+        fixture["ovn_bindings"] = [{"logical_port": "cr-lrp-router-1"}]
+
+        result = collect_from_fixture(fixture)
+
+        self.assertNotIn(
+            "port:cr-lrp-router-1",
+            {edge.target for edge in result.edges},
+        )
 
     def test_target_device_name_maps_port_without_ovs_external_ids(self):
         fixture = deepcopy(self.fixture)

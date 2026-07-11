@@ -2,6 +2,7 @@ from copy import deepcopy
 import json
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import uuid
 import xml.etree.ElementTree as ET
 
 from .contract import CheckResult, CollectorResult, DependencyEdge, ResourceNode
@@ -25,21 +26,21 @@ def _ovs_atom(value: object) -> object:
     return value
 
 
-def _parse_ovs_table(stdout: str) -> List[Dict[str, object]]:
+def _parse_ovs_table(stdout: str) -> Optional[List[Dict[str, object]]]:
     try:
         payload = json.loads(stdout)
     except (TypeError, json.JSONDecodeError):
-        return []
+        return None
     if not isinstance(payload, Mapping):
-        return []
+        return None
     headings = payload.get("headings")
     data = payload.get("data")
     if not isinstance(headings, list) or not isinstance(data, list):
-        return []
+        return None
     rows = []
     for values in data:
         if not isinstance(values, list) or len(values) != len(headings):
-            continue
+            return None
         rows.append(
             {
                 str(key): _ovs_atom(value)
@@ -79,20 +80,43 @@ def _volume_id(source: object, serial: object = None) -> Optional[str]:
     for candidate in (serial, source):
         if not isinstance(candidate, str):
             continue
+        canonical = _canonical_uuid(candidate)
+        if canonical:
+            return canonical
         match = _VOLUME_ID.search(f"/{candidate}/")
         if match:
-            return match.group(1)
+            backend_name = match.group(1)
+            return _canonical_uuid(backend_name.removeprefix("volume-")) or backend_name
+    return None
+
+
+def _canonical_uuid(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _port_reference(value: object) -> Optional[str]:
+    canonical = _canonical_uuid(value)
+    if canonical:
+        return canonical
+    if isinstance(value, str) and re.fullmatch(r"port-[0-9]+", value):
+        return value
     return None
 
 
 def _port_id(target: str, external_ids: Mapping[str, object]) -> Optional[str]:
     for key in ("iface-id", "neutron:port_id", "port_id"):
         value = external_ids.get(key)
-        if isinstance(value, str) and value:
-            return value
+        normalized = _port_reference(value)
+        if normalized:
+            return normalized
     for prefix in _PORT_PREFIXES:
         if target.startswith(prefix) and len(target) > len(prefix):
-            return target[len(prefix):].lstrip("-_")
+            return _port_reference(target[len(prefix):].lstrip("-_"))
     return None
 
 
@@ -164,14 +188,22 @@ def _parse_dominfo(stdout: str) -> Dict[str, str]:
     return facts
 
 
-def _parse_domblklist(stdout: str) -> List[Dict[str, Optional[str]]]:
+def _parse_domblklist(stdout: str) -> Optional[List[Dict[str, Optional[str]]]]:
     rows = []
+    header = False
+    separator = False
     for line in stdout.splitlines():
+        if line.lower().split() == ["type", "device", "target", "source"]:
+            header = True
+            continue
+        if line.strip() and set(line.strip()) == {"-"}:
+            separator = True
+            continue
         values = line.split(None, 3)
-        if len(values) != 4 or values[0].lower() in {"type", "----"}:
+        if not values:
             continue
-        if set(values[0]) == {"-"}:
-            continue
+        if len(values) != 4:
+            return None
         rows.append(
             {
                 "type": values[0],
@@ -180,17 +212,25 @@ def _parse_domblklist(stdout: str) -> List[Dict[str, Optional[str]]]:
                 "source": None if values[3] == "-" else values[3],
             }
         )
-    return rows
+    return rows if header and separator else None
 
 
-def _parse_domiflist(stdout: str) -> List[Dict[str, Optional[str]]]:
+def _parse_domiflist(stdout: str) -> Optional[List[Dict[str, Optional[str]]]]:
     rows = []
+    header = False
+    separator = False
     for line in stdout.splitlines():
+        if line.lower().split() == ["interface", "type", "source", "model", "mac"]:
+            header = True
+            continue
+        if line.strip() and set(line.strip()) == {"-"}:
+            separator = True
+            continue
         values = line.split()
-        if len(values) < 5 or values[0].lower() == "interface":
+        if not values:
             continue
-        if set(values[0]) == {"-"}:
-            continue
+        if len(values) < 5:
+            return None
         rows.append(
             {
                 "target": values[0],
@@ -200,7 +240,7 @@ def _parse_domiflist(stdout: str) -> List[Dict[str, Optional[str]]]:
                 "mac": values[4],
             }
         )
-    return rows
+    return rows if header and separator else None
 
 
 def _run(
@@ -252,11 +292,17 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
             f"runtime-{side}-ovs-port-list",
             result,
         )
-        for row in _parse_ovs_table(interface_stdout or ""):
+        interface_rows = _parse_ovs_table(interface_stdout or "")
+        port_rows = _parse_ovs_table(port_stdout or "")
+        if interface_stdout is not None and interface_rows is None:
+            result.blockers.append("invalid OVS Interface output")
+        if port_stdout is not None and port_rows is None:
+            result.blockers.append("invalid OVS Port output")
+        for row in interface_rows or []:
             name = row.get("name")
             if isinstance(name, str):
                 ovs_interfaces[name] = row
-        ovs_ports = _parse_ovs_table(port_stdout or "")
+        ovs_ports = port_rows or []
     elif network_backend == "ovn":
         binding_stdout = _run(
             runner,
@@ -264,7 +310,10 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
             f"runtime-{side}-ovn-port-binding-list",
             result,
         )
-        ovn_bindings = _parse_ovs_table(binding_stdout or "")
+        binding_rows = _parse_ovs_table(binding_stdout or "")
+        if binding_stdout is not None and binding_rows is None:
+            result.blockers.append("invalid OVN Port_Binding output")
+        ovn_bindings = binding_rows or []
     else:
         result.unknowns.append(f"unsupported network backend: {network_backend}")
 
@@ -310,6 +359,8 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
             result.blockers.append(f"invalid domain XML: {domain_name}")
             continue
         info = _parse_dominfo(dominfo or "")
+        if dominfo is not None and not info.get("state"):
+            result.blockers.append(f"invalid domain info: {domain_name}")
         domain = ResourceNode(
             "libvirt_domain",
             domain_name,
@@ -323,7 +374,10 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
         )
         result.nodes.append(domain)
         xml_disks = xml_facts.get("disks", {})
-        for disk in _parse_domblklist(block_list or ""):
+        parsed_disks = _parse_domblklist(block_list or "")
+        if block_list is not None and parsed_disks is None:
+            result.blockers.append(f"invalid domain disk list: {domain_name}")
+        for disk in parsed_disks or []:
             target = disk["target"]
             if not target:
                 continue
@@ -351,7 +405,10 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
                     f"unmapped runtime disk: {domain_name}/{target}"
                 )
 
-        for interface in _parse_domiflist(interface_list or ""):
+        parsed_interfaces = _parse_domiflist(interface_list or "")
+        if interface_list is not None and parsed_interfaces is None:
+            result.blockers.append(f"invalid domain interface list: {domain_name}")
+        for interface in parsed_interfaces or []:
             target = interface.get("target")
             if not target:
                 continue
@@ -395,7 +452,9 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
             continue
         node = ResourceNode("ovn_binding", logical_port, side, deepcopy(dict(row)))
         result.nodes.append(node)
-        add_edge(node.key, f"port:{logical_port}", "maps_to_port")
+        port_id = _port_reference(logical_port)
+        if port_id:
+            add_edge(node.key, f"port:{port_id}", "maps_to_port")
     return result
 
 
@@ -447,8 +506,13 @@ def compare_runtime_to_nova(
     runtime_result: CollectorResult,
     nova_result: CollectorResult,
 ) -> List[CheckResult]:
-    nova_instances = {
-        node.id for node in nova_result.nodes if node.kind == "instance"
+    instance_nodes = [node for node in nova_result.nodes if node.kind == "instance"]
+    nova_instances = {node.id for node in instance_nodes}
+    running_nova_instances = {
+        node.id
+        for node in instance_nodes
+        if not isinstance(node.facts.get("status"), str)
+        or node.facts.get("status", "").upper() == "ACTIVE"
     }
     checks = []
     runtime_instance_ids = set()
@@ -472,7 +536,7 @@ def compare_runtime_to_nova(
                 + ([f"instance:{instance_uuid}"] if present else []),
             )
         )
-    for instance_uuid in sorted(nova_instances - runtime_instance_ids):
+    for instance_uuid in sorted(running_nova_instances - runtime_instance_ids):
         checks.append(
             CheckResult(
                 f"runtime.nova-instance.{instance_uuid}",
