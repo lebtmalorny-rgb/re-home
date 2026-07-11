@@ -12,7 +12,13 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery"
 from live_discovery.contract import (
     CheckResult, CollectorResult, DependencyEdge, ResourceNode,
 )
-from live_discovery.neutron import NeutronCollector, compare_neutron_results
+from live_discovery.neutron import (
+    CORE_TABLES,
+    OPTIONAL_TABLE_FAMILIES,
+    _TABLE_REQUIRED_ID_GROUPS,
+    NeutronCollector,
+    compare_neutron_results,
+)
 
 
 class FixtureClient:
@@ -553,6 +559,144 @@ class NeutronCollectorTests(unittest.TestCase):
                     result.blockers,
                 )
                 self.assertNotIn(sentinel, serialized)
+
+    def test_required_active_dependency_uuids_block_missing_null_and_empty(self):
+        cases = (
+            ("core-port", "ports", "network_id", None),
+            ("core-subnet", "ipallocations", "subnet_id", None),
+            ("segment", "networksegments", "id", None),
+            ("binding-level", "ml2_port_binding_levels", "segment_id", None),
+            (
+                "security-group", "securitygroupportbindings",
+                "security_group_id", None,
+            ),
+            ("qos", "qos_port_policy_bindings", "policy_id", None),
+            ("trunk", "trunks", "id", None),
+            (
+                "subport", "subports", "trunk_id",
+                {
+                    "port_id": UUID_ALIASES["port-1"],
+                    "segmentation_type": "vlan", "segmentation_id": 42,
+                },
+            ),
+            ("router", "routerports", "router_id", None),
+            ("floating-ip", "floatingips", "floating_network_id", None),
+            ("port-forwarding", "portforwardings", "floatingip_id", None),
+            (
+                "rbac", "addressgrouprbacs", "target_project",
+                {
+                    "id": "00000000-0000-0000-0000-000000000015",
+                    "object_id": UUID_ALIASES["address-group-1"],
+                    "action": "access_as_shared",
+                },
+            ),
+        )
+        for family, table, field, seed in cases:
+            for mode in ("missing", "null", "empty"):
+                with self.subTest(
+                    family=family, table=table, field=field, mode=mode
+                ):
+                    fixture = canonical_uuid_fixture(self.source_fixture)
+                    if seed is None:
+                        row = fixture["tables"][table][0]
+                    else:
+                        row = deepcopy(seed)
+                        fixture["tables"][table].append(row)
+                    if mode == "missing":
+                        row.pop(field, None)
+                    elif mode == "null":
+                        row[field] = None
+                    else:
+                        row[field] = ""
+
+                    result = NeutronCollector(
+                        FixtureClient(fixture),
+                        "source",
+                        schema_from_fixture(fixture),
+                    ).collect([UUID_ALIASES["port-1"]])
+
+                    self.assertIn(
+                        f"Neutron dependency UUID missing: {table}.{field}",
+                        result.blockers,
+                    )
+
+    def test_genuinely_optional_dependency_uuids_may_be_absent(self):
+        cases = (
+            ("ports", "device_id"),
+            ("subnets", "subnetpool_id"),
+            ("securitygrouprules", "remote_group_id"),
+            ("securitygrouprules", "remote_address_group_id"),
+            ("floatingips", "fixed_port_id"),
+            ("floatingips", "router_id"),
+            ("qos_policies", "project_id"),
+        )
+        for table, field in cases:
+            for mode in ("missing", "null", "empty"):
+                with self.subTest(table=table, field=field, mode=mode):
+                    fixture = canonical_uuid_fixture(self.source_fixture)
+                    row = fixture["tables"][table][0]
+                    if mode == "missing":
+                        row.pop(field, None)
+                    elif mode == "null":
+                        row[field] = None
+                    else:
+                        row[field] = ""
+                    if table == "ports" and field == "device_id":
+                        api = fixture["openstack"][0]["payload"]
+                        if mode == "missing":
+                            api.pop(field, None)
+                        else:
+                            api[field] = row[field]
+
+                    result = NeutronCollector(
+                        FixtureClient(fixture),
+                        "source",
+                        schema_from_fixture(fixture),
+                    ).collect([UUID_ALIASES["port-1"]])
+
+                    self.assertNotIn(
+                        f"Neutron dependency UUID missing: {table}.{field}",
+                        result.blockers,
+                    )
+                    self.assertNotIn(
+                        f"Neutron dependency UUID invalid: {table}.{field}",
+                        result.blockers,
+                    )
+
+    def test_requiredness_matrix_covers_every_table_group_and_absence_mode(self):
+        all_tables = set(CORE_TABLES)
+        for family_tables in OPTIONAL_TABLE_FAMILIES.values():
+            all_tables.update(family_tables)
+        self.assertEqual(all_tables, set(_TABLE_REQUIRED_ID_GROUPS))
+
+        valid_uuid = "00000000-0000-0000-0000-000000000099"
+        collector = NeutronCollector(object(), "source", {})
+        for table, groups in _TABLE_REQUIRED_ID_GROUPS.items():
+            for target_group in groups:
+                for mode in ("missing", "null", "empty"):
+                    with self.subTest(
+                        table=table, group=target_group, mode=mode
+                    ):
+                        row = {
+                            group[0]: valid_uuid
+                            for group in groups
+                            if group != target_group
+                        }
+                        if mode == "null":
+                            row[target_group[0]] = None
+                        elif mode == "empty":
+                            row[target_group[0]] = ""
+                        result = CollectorResult(service="neutron", side="source")
+
+                        collector._validate_dependency_ids(table, row, result)
+
+                        self.assertEqual(
+                            [
+                                "Neutron dependency UUID missing: "
+                                f"{table}.{target_group[0]}"
+                            ],
+                            result.blockers,
+                        )
 
     def test_missing_qos_policy_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)

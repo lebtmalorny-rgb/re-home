@@ -174,6 +174,41 @@ _TABLE_OPENSTACK_ID_FIELDS = {
         "id", "object_id", "address_group_id", "target_project", "project_id",
     ),
 }
+_TABLE_REQUIRED_ID_GROUPS = {
+    "ports": (("id", "port_id"), ("network_id",)),
+    "ipallocations": (("port_id",), ("network_id",), ("subnet_id",)),
+    "networks": (("id",),),
+    "subnets": (("id",), ("network_id",)),
+    "networksegments": (("id", "segment_id"), ("network_id",)),
+    "ml2_port_bindings": (("port_id",),),
+    "ml2_distributed_port_bindings": (("port_id",),),
+    "ml2_port_binding_levels": (("port_id",), ("segment_id",)),
+    "securitygroups": (("id",),),
+    "securitygrouprules": (("id",), ("security_group_id",)),
+    "securitygroupportbindings": (("port_id",), ("security_group_id",)),
+    "allowedaddresspairs": (("port_id",),),
+    "portdnses": (("port_id",),),
+    "dnsnameservers": (("subnet_id",),),
+    "extradhcpopts": (("port_id",),),
+    "qos_port_policy_bindings": (("port_id",), ("policy_id",)),
+    "qos_network_policy_bindings": (("network_id",), ("policy_id",)),
+    "qos_fip_policy_bindings": (("fip_id",), ("policy_id",)),
+    "qos_policies": (("id",),),
+    "trunks": (("id",), ("port_id",)),
+    "subports": (("trunk_id",), ("port_id",)),
+    "routers": (("id",),),
+    "routerports": (("router_id",), ("port_id",)),
+    "routerroutes": (("router_id",),),
+    "floatingips": (("id",), ("floating_network_id",)),
+    "portforwardings": (
+        ("id",), ("floatingip_id", "floating_ip_id"), ("internal_port_id",),
+    ),
+    "address_groups": (("id",),),
+    "address_associations": (("address_group_id",),),
+    "addressgrouprbacs": (
+        ("id",), ("object_id", "address_group_id"), ("target_project",),
+    ),
+}
 _FIXTURE_POLICY_TOKEN = object()
 
 
@@ -210,6 +245,14 @@ def _openstack_id(
     if allow_fixture_aliases and _RUNTIME_NAME.fullmatch(value):
         return value
     return None
+
+
+def _dependency_id(
+    field: str, value: object, allow_fixture_aliases: bool
+) -> Optional[str]:
+    if field == "target_project" and value == "*":
+        return "*"
+    return _openstack_id(value, allow_fixture_aliases)
 
 
 def _identifier_list(
@@ -1019,11 +1062,28 @@ class NeutronCollector:
             value = row[field]
             if value is None or value == "":
                 continue
-            if field == "target_project" and value == "*":
-                continue
-            if _openstack_id(value, self._allow_fixture_aliases) is not None:
+            if _dependency_id(
+                field, value, self._allow_fixture_aliases
+            ) is not None:
                 continue
             reason = f"Neutron dependency UUID invalid: {table}.{field}"
+            if reason not in result.blockers:
+                result.blockers.append(reason)
+        for fields in _TABLE_REQUIRED_ID_GROUPS.get(table, ()):
+            if any(
+                _dependency_id(
+                    field, row.get(field), self._allow_fixture_aliases
+                )
+                is not None
+                for field in fields
+            ):
+                continue
+            if any(
+                field in row and row[field] not in (None, "")
+                for field in fields
+            ):
+                continue
+            reason = f"Neutron dependency UUID missing: {table}.{fields[0]}"
             if reason not in result.blockers:
                 result.blockers.append(reason)
 
