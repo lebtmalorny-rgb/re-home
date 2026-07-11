@@ -47,13 +47,6 @@ _SAFE_FLAVOR_FIELDS = (
     "properties",
 )
 
-_EVIDENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SENSITIVE_EVIDENCE_ID = re.compile(
-    r"password|passwd|token|secret|credential|connector|chap",
-    flags=re.IGNORECASE,
-)
-
-
 def _field(payload: object, *names: str) -> Any:
     if not isinstance(payload, Mapping):
         return None
@@ -347,21 +340,14 @@ class NovaCollector:
         evidence: object,
         result: CollectorResult,
     ) -> None:
-        evidence_id = (
-            evidence.get("evidence_id")
-            if isinstance(evidence, Mapping)
-            else None
-        )
-        if (
-            not isinstance(evidence_id, str)
-            or not _EVIDENCE_ID.fullmatch(evidence_id)
-            or _SENSITIVE_EVIDENCE_ID.search(evidence_id)
+        if not isinstance(evidence, Mapping) or not isinstance(
+            evidence.get("evidence_id"), str
         ):
             result.blockers.append(f"DB evidence invalid: {table}")
             return
         result.evidence.append(
             {
-                "evidence_id": evidence_id,
+                "evidence_id": f"{self.side}-db:{DB_SCHEMAS[table]}.{table}",
                 "kind": "db-jsonl",
                 "schema": DB_SCHEMAS[table],
                 "table": table,

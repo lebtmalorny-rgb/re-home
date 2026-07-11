@@ -453,7 +453,7 @@ class NovaCollectorTests(unittest.TestCase):
         self.assertNotIn(secret, serialized)
         self.assertIn(
             {
-                "evidence_id": "db-instances",
+                "evidence_id": "source-db:nova.instances",
                 "kind": "db-jsonl",
                 "schema": "nova",
                 "table": "instances",
@@ -461,7 +461,7 @@ class NovaCollectorTests(unittest.TestCase):
             result.evidence,
         )
 
-    def test_secret_bearing_db_evidence_id_is_rejected(self):
+    def test_secret_bearing_db_evidence_id_is_discarded(self):
         evidence_id = "db-password-secret"
         client = DbRecordsFixtureClient(
             self.fixture,
@@ -470,8 +470,30 @@ class NovaCollectorTests(unittest.TestCase):
 
         result = NovaCollector(client, "source").collect("compute-023")
 
-        self.assertIn("DB evidence invalid: instances", result.blockers)
         self.assertNotIn(evidence_id, str(result.evidence))
+        self.assertNotIn("DB evidence invalid: instances", result.blockers)
+        self.assertIn(
+            {
+                "evidence_id": "source-db:nova.instances",
+                "kind": "db-jsonl",
+                "schema": "nova",
+                "table": "instances",
+            },
+            result.evidence,
+        )
+
+    def test_opaque_secret_db_evidence_id_is_discarded(self):
+        opaque_secret = "sk-proj-AbCdEf0123456789"
+        client = DbRecordsFixtureClient(
+            self.fixture,
+            {"instances": {"evidence_id": opaque_secret}},
+        )
+
+        result = NovaCollector(client, "source").collect("compute-023")
+
+        serialized = str(result.to_dict())
+        self.assertNotIn(opaque_secret, serialized)
+        self.assertIn("source-db:nova.instances", serialized)
 
     def test_target_fixture_collects_host_identity_without_instances(self):
         fixture = json.loads(
