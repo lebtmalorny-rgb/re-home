@@ -177,6 +177,30 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         control._bind_cinder_connection_summaries(result,[summary])
         self.assertIn(f"Cinder protected attachment evidence mismatch: {attachment}",result.blockers)
 
+    def test_cinder_post_bind_requires_existing_exact_driver_without_mutation(self):
+        volume="22222222-2222-4222-8222-222222222222"; attachment="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"; backend="rbd-backend"
+        fingerprint=hashlib.sha256(b"rbd:volumes/volume-1").hexdigest()
+        summary={"volume_id":volume,"attachment_id":attachment,"evidence_id":"protected-1","backend_kind":"rbd","backend_id":backend,"resource_identity":"volumes/volume-1","resource_fingerprint":fingerprint}
+        def result_for(connection_summary=Ellipsis):
+            facts={"volume_id":volume}
+            if connection_summary is not Ellipsis: facts["connection_summary"]=deepcopy(connection_summary)
+            return CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume,"source",{"size":1,"storage_backend_id":backend}),ResourceNode("storage_backend",backend,"source"),ResourceNode("volume_attachment",attachment,"source",facts)],edges=[DependencyEdge(f"volume:{volume}",f"volume_attachment:{attachment}","has_attachment",True),DependencyEdge(f"volume:{volume}",f"storage_backend:{backend}","has_backing_backend",True)])
+        for label,connection_summary in (("missing",Ellipsis),("malformed","rbd"),("mismatch",{"driver_type":"lvm"})):
+            with self.subTest(label=label):
+                result=result_for(connection_summary)
+                attachment_node=next(node for node in result.nodes if node.kind=="volume_attachment")
+                before=deepcopy(attachment_node.facts)
+                control._bind_cinder_connection_summaries(result,[summary])
+                self.assertIn(f"Cinder protected attachment evidence mismatch: {attachment}",result.blockers)
+                self.assertEqual(before,attachment_node.facts)
+                self.assertNotIn("protected-1",attachment_node.evidence_ids)
+        exact=result_for({"driver_type":"rbd","target_count":1,"multipath":None})
+        exact_node=next(node for node in exact.nodes if node.kind=="volume_attachment")
+        before=deepcopy(exact_node.facts)
+        control._bind_cinder_connection_summaries(exact,[summary])
+        self.assertEqual([],exact.blockers); self.assertEqual(before,exact_node.facts)
+        self.assertEqual(["protected-1"],exact_node.evidence_ids)
+
     def test_protected_cinder_overlay_is_ephemeral_and_exact(self):
         volume="22222222-2222-4222-8222-222222222222"; attachment="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         stored=[{"_schema":"cinder","_table":"volume_attachment","row":{"id":attachment,"volume_id":volume,"attach_status":"attached"}}]

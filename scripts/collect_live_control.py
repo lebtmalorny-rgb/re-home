@@ -805,8 +805,6 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
         backend_kind = summary.get("backend_kind")
         connection_summary = attachment_node.facts.get("connection_summary") if attachment_node is not None else None
         graph_driver = connection_summary.get("driver_type") if isinstance(connection_summary, dict) else None
-        if graph_driver == "file":
-            graph_driver = "nfs"
         valid = (
             volume_node is not None and attachment_node is not None
             and attachment_node.facts.get("volume_id") == volume_id
@@ -814,7 +812,7 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
             and volume_node.facts.get("storage_backend_id") == backend_id
             and backend_id in backend_nodes
             and (f"volume:{volume_id}", f"storage_backend:{backend_id}") in required_backend_edges
-            and graph_driver in {None, backend_kind}
+            and graph_driver == backend_kind
             and (volume_id, attachment_id) not in bound_pairs
         )
         if not valid:
@@ -822,10 +820,6 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
             continue
         summaries_by_volume.setdefault(volume_id, []).append(summary)
         bound_pairs.add((volume_id, attachment_id))
-        if graph_driver is None:
-            sanitized_summary = deepcopy(connection_summary) if isinstance(connection_summary, dict) else {}
-            sanitized_summary["driver_type"] = backend_kind
-            attachment_node.facts["connection_summary"] = sanitized_summary
         attachment_node.evidence_ids.append(summary["evidence_id"])
         volume_node.evidence_ids.append(summary["evidence_id"])
     for volume_id, summaries in summaries_by_volume.items():
