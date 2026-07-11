@@ -194,6 +194,45 @@ class ImageDataProbeTests(unittest.TestCase):
         response.headers = DuplicateHeaders()
         self.assertEqual("UNKNOWN", probe(RecordingOpener(response)).status)
 
+    def test_header_iteration_stops_at_129_without_materializing(self):
+        class GuardedInfiniteItems:
+            def __init__(self):
+                self.yielded = 0
+
+            def __iter__(self):
+                while True:
+                    self.yielded += 1
+                    if self.yielded > 129:
+                        raise AssertionError("header iterator was over-consumed")
+                    yield f"X-{self.yielded}", "a"
+
+        class StreamingHeaders:
+            def __init__(self):
+                self.items_iterator = GuardedInfiniteItems()
+
+            def items(self):
+                return self.items_iterator
+
+        response = RecordingResponse()
+        response.headers = StreamingHeaders()
+        check = probe(RecordingOpener(response))
+        self.assertEqual("UNKNOWN", check.status)
+        self.assertEqual(129, response.headers.items_iterator.yielded)
+        self.assertTrue(response.closed)
+
+    def test_throwing_header_iterator_is_sanitized_and_response_closed(self):
+        class ThrowingHeaders:
+            def items(self):
+                yield "Content-Range", "bytes 0-0/1024"
+                raise RuntimeError("secret-token https://evil.invalid")
+
+        response = RecordingResponse()
+        response.headers = ThrowingHeaders()
+        check = probe(RecordingOpener(response))
+        self.assertEqual("UNKNOWN", check.status)
+        self.assertNotIn("secret-token", check.reason)
+        self.assertTrue(response.closed)
+
     def test_oversized_or_malformed_headers_fail_closed(self):
         cases = (
             {**{"Content-Range": "bytes 0-0/1024", "Content-Length": "1"}, **{f"X-{i}": "a" for i in range(129)}},

@@ -51,6 +51,9 @@ class FixtureClient:
             [f"image:{image_id}"],
         )
 
+    def glance_store_capabilities(self, evidence_id):
+        return deepcopy(self.fixture.get("store_capabilities")), {"id": evidence_id}
+
 
 class SecretProbeClient(FixtureClient):
     def probe_image_data(self, image_id, expected_size, required):
@@ -59,6 +62,14 @@ class SecretProbeClient(FixtureClient):
             "secret-token", "PASS", "https://user:pass@evil.invalid secret-token",
             ["secret-token"], ["secret-token"],
         )
+
+
+class UnprovenCapabilityClient(FixtureClient):
+    def glance_store_capabilities(self, evidence_id):
+        del evidence_id
+        return deepcopy(self.fixture.get("store_capabilities")), {
+            "id": "secret-token"
+        }
 
 
 def collect_from_fixture(fixture, requirements, failures=None):
@@ -85,6 +96,7 @@ class GlanceCollectorTests(unittest.TestCase):
             "reason": "local_root",
             "bdm_proves_no_local_root": False,
             "runtime_proves_no_local_root": False,
+            "consumer_project_ids": ["project-1", "project-2"],
         }
         value.update(overrides)
         return {"image-1": value}
@@ -133,14 +145,14 @@ class GlanceCollectorTests(unittest.TestCase):
 
     def test_store_inventory_requires_exactly_one_typed_default(self):
         cases = (
-            lambda stores: [item.pop("default", None) for item in stores],
-            lambda stores: stores[1].__setitem__("default", True),
-            lambda stores: stores[0].__setitem__("default", 1),
+            lambda stores: [item.__setitem__("Default", False) for item in stores],
+            lambda stores: stores[1].__setitem__("Default", True),
+            lambda stores: stores[0].__setitem__("Default", 1),
         )
         for mutate in cases:
             with self.subTest(mutate=mutate):
                 fixture = deepcopy(self.source_fixture)
-                mutate(fixture["openstack"][2]["payload"]["stores"])
+                mutate(fixture["openstack"][2]["payload"])
                 result, _ = collect_from_fixture(fixture, self.required())
                 self.assertTrue(result.unknowns)
 
@@ -200,8 +212,8 @@ class GlanceCollectorTests(unittest.TestCase):
             ("duplicate stores", lambda image, stores: image.__setitem__("stores", ["file", "file"])),
             ("missing locations", lambda image, stores: image.pop("locations")),
             ("duplicate locations", lambda image, stores: image["locations"].append(deepcopy(image["locations"][0]))),
-            ("store inventory missing", lambda image, stores: stores.__setitem__("stores", [stores["stores"][0]])),
-            ("store inventory duplicate", lambda image, stores: stores["stores"].append(deepcopy(stores["stores"][0]))),
+            ("store inventory missing", lambda image, stores: stores.__setitem__(slice(None), [stores[0]])),
+            ("store inventory duplicate", lambda image, stores: stores.append(deepcopy(stores[0]))),
         )
         for label, mutate in mutations:
             with self.subTest(label=label):
@@ -248,7 +260,12 @@ class GlanceCollectorTests(unittest.TestCase):
         fixture["openstack"][0]["payload"]["locations"] = [{
             "url": "custom://opaque/image-1", "metadata": {"store": "mystery"}
         }]
-        fixture["openstack"][2]["payload"]["stores"] = [{"id": "mystery"}]
+        fixture["openstack"][2]["payload"] = [{
+            "ID": "mystery", "Default": True
+        }]
+        fixture["store_capabilities"] = [{
+            "store_id": "mystery", "backend_type": "vendor-secret-token"
+        }]
         result, _ = collect_from_fixture(fixture, self.required())
         self.assertTrue(result.unknowns)
         self.assertFalse(any(check.status == "PASS" and "store" in check.check_id for check in result.checks))
@@ -320,6 +337,109 @@ class GlanceCollectorTests(unittest.TestCase):
         dangling = [edge.target for edge in result.edges if edge.required and edge.target not in keys]
         self.assertEqual([], dangling)
 
+    def test_real_osc_store_list_shape_is_case_normalized(self):
+        payload = self.source_fixture["openstack"][2]["payload"]
+        self.assertIsInstance(payload, list)
+        self.assertIn("ID", payload[0])
+        self.assertNotIn("Backend Type", payload[0])
+        result, _ = collect_from_fixture(self.source_fixture, self.required())
+        inventory = next(node for node in result.nodes if node.kind == "glance_store_inventory")
+        self.assertEqual("file", inventory.facts["default_store_id"])
+        self.assertEqual([], result.blockers)
+
+    def test_store_nodes_and_checks_are_globally_unique_for_two_images(self):
+        fixture = deepcopy(self.source_fixture)
+        second_image = deepcopy(fixture["openstack"][0])
+        second_image["command"][2] = "image-2"
+        second_image["payload"]["id"] = "image-2"
+        second_image["payload"]["locations"] = [
+            {"url": "file:///var/lib/glance/images/image-2", "metadata": {"store": "file"}},
+            {"url": "rbd://cluster/pool/image-2/snap", "metadata": {"store": "rbd"}},
+        ]
+        second_members = deepcopy(fixture["openstack"][1])
+        second_members["command"][3] = "image-2"
+        second_members["payload"][0]["image_id"] = "image-2"
+        fixture["openstack"].extend([second_image, second_members])
+        requirements = self.required()
+        requirements["image-2"] = deepcopy(requirements["image-1"])
+        result, _ = collect_from_fixture(fixture, requirements)
+        store_keys = [node.key for node in result.nodes if node.kind == "glance_store"]
+        store_checks = [check.check_id for check in result.checks if ".store." in check.check_id]
+        self.assertEqual(len(store_keys), len(set(store_keys)))
+        self.assertEqual(len(store_checks), len(set(store_checks)))
+        self.assertEqual({"glance_store:file", "glance_store:rbd"}, set(store_keys))
+        self.assertEqual([], result.blockers)
+
+    def test_store_backend_type_must_be_explicit_supported_and_match_scheme(self):
+        cases = (
+            ("absent", lambda fixture: fixture.pop("store_capabilities"), "Glance store backend type unavailable"),
+            ("mismatch", lambda fixture: fixture["store_capabilities"][0].__setitem__("backend_type", "rbd"), "Glance store backend type mismatch"),
+            ("vendor", lambda fixture: fixture["store_capabilities"][0].__setitem__("backend_type", "vendor-secret-token"), "Glance store backend type unsupported"),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                fixture = deepcopy(self.source_fixture)
+                mutate(fixture)
+                result, _ = collect_from_fixture(fixture, self.required())
+                self.assertTrue(any(expected in item for item in result.unknowns))
+                self.assertFalse(any(
+                    check.status == "PASS" and check.check_id.endswith("store.file")
+                    for check in result.checks
+                ))
+                self.assertNotIn("vendor-secret-token", json.dumps(result.to_dict(), sort_keys=True))
+
+    def test_store_backend_capability_requires_sanitized_provenance(self):
+        client = UnprovenCapabilityClient(self.source_fixture)
+        result = GlanceCollector.for_fixture(client, "source").collect(
+            self.required()
+        )
+        serialized = json.dumps(result.to_dict(), sort_keys=True)
+        self.assertTrue(any(
+            "Glance store backend type unavailable" in item
+            for item in result.unknowns
+        ))
+        self.assertFalse(any(
+            check.status == "PASS" and ".store." in check.check_id
+            for check in result.checks
+        ))
+        self.assertNotIn("secret-token", serialized)
+
+    def test_required_image_project_access_matrix(self):
+        cases = (
+            ("owner-private", "private", "project-1", "accepted", False),
+            ("public", "public", "project-3", "accepted", False),
+            ("community", "community", "project-3", "accepted", False),
+            ("shared-accepted", "shared", "project-2", "accepted", False),
+            ("shared-pending", "shared", "project-2", "pending", True),
+            ("shared-rejected", "shared", "project-2", "rejected", True),
+            ("private-wrong-owner", "private", "project-2", "accepted", True),
+            ("shared-missing", "shared", "project-3", "accepted", True),
+        )
+        for label, visibility, consumer, member_status, blocked in cases:
+            with self.subTest(label=label):
+                fixture = deepcopy(self.source_fixture)
+                fixture["openstack"][0]["payload"]["visibility"] = visibility
+                fixture["openstack"][1]["payload"][0]["status"] = member_status
+                requirements = self.required(consumer_project_ids=[consumer])
+                result, _ = collect_from_fixture(fixture, requirements)
+                access_blockers = [item for item in result.blockers if "project access" in item]
+                self.assertEqual(blocked, bool(access_blockers))
+
+    def test_missing_invalid_or_contradictory_consumer_membership_blocks(self):
+        invalid_requirements = self.required()
+        invalid_requirements["image-1"].pop("consumer_project_ids")
+        result, client = collect_from_fixture(self.source_fixture, invalid_requirements)
+        self.assertIn("Glance image requirements invalid", result.blockers)
+        self.assertEqual([], client.commands)
+
+        fixture = deepcopy(self.source_fixture)
+        fixture["openstack"][1]["payload"].append({
+            "image_id": "image-1", "member_id": "project-2", "status": "rejected"
+        })
+        result, _ = collect_from_fixture(fixture, self.required())
+        self.assertTrue(any("member evidence ambiguous" in item for item in result.blockers))
+        self.assertTrue(any("project access" in item for item in result.blockers))
+
     def test_probe_blocked_or_unknown_propagates_fail_closed(self):
         for status, collection in (("BLOCKED", "blockers"), ("UNKNOWN", "unknowns")):
             with self.subTest(status=status):
@@ -368,7 +488,7 @@ class GlanceCollectorTests(unittest.TestCase):
         image["direct_url"] = "https://user:secret@glance.invalid/private"
         image["properties"] = {"auth_token": "secret-token", "safe": "value"}
         image["locations"][0]["url"] = "file:///must-not-serialize-secret-token"
-        fixture["openstack"][2]["payload"]["stores"][0]["description"] = "secret-token"
+        fixture["openstack"][2]["payload"][0]["Description"] = "secret-token"
         result, _ = collect_from_fixture(fixture, self.required())
         serialized = json.dumps(result.to_dict(), sort_keys=True)
         self.assertNotIn("secret-token", serialized)

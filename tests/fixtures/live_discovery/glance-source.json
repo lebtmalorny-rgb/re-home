@@ -34,16 +34,21 @@
     },
     {
       "command": ["image", "stores", "info", "-f", "json"],
-      "payload": {
-        "stores": [
-          {"id": "file", "description": "filesystem store", "default": true},
-          {"id": "rbd", "description": "ceph rbd store"},
-          {"id": "swift", "description": "swift store"},
-          {"id": "s3", "description": "s3 store"},
-          {"id": "vendor_archive", "description": "vendor store"}
-        ]
-      }
+      "payload": [
+        {"ID": "file", "Description": "filesystem store", "Default": true},
+        {"ID": "rbd", "Description": "ceph rbd store", "Default": false},
+        {"ID": "swift", "Description": "swift store", "Default": false},
+        {"ID": "s3", "Description": "s3 store", "Default": false},
+        {"ID": "vendor_archive", "Description": "vendor store", "Default": false}
+      ]
     }
+  ],
+  "store_capabilities": [
+    {"store_id": "file", "backend_type": "file"},
+    {"store_id": "rbd", "backend_type": "rbd"},
+    {"store_id": "swift", "backend_type": "swift"},
+    {"store_id": "s3", "backend_type": "s3"},
+    {"store_id": "vendor_archive", "backend_type": "vendor"}
   ],
   "probe_status": "PASS"
 }

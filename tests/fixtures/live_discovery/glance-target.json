@@ -34,13 +34,15 @@
     },
     {
       "command": ["image", "stores", "info", "-f", "json"],
-      "payload": {
-        "stores": [
-          {"id": "rbd", "description": "ceph rbd store", "default": true},
-          {"id": "swift", "description": "swift store"}
-        ]
-      }
+      "payload": [
+        {"ID": "rbd", "Description": "ceph rbd store", "Default": true},
+        {"ID": "swift", "Description": "swift store", "Default": false}
+      ]
     }
+  ],
+  "store_capabilities": [
+    {"store_id": "rbd", "backend_type": "rbd"},
+    {"store_id": "swift", "backend_type": "swift"}
   ],
   "probe_status": "PASS"
 }

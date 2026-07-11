@@ -35,6 +35,21 @@ _KNOWN_LOCATION_SCHEMES = {
     "file", "filesystem", "rbd", "swift", "swift+http", "swift+https",
     "s3", "s3+http", "s3+https", "http", "https", "cinder",
 }
+_BACKEND_TYPE_ALIASES = {
+    "file": "file", "filesystem": "file",
+    "rbd": "rbd", "ceph": "rbd",
+    "swift": "swift", "s3": "s3",
+    "http": "http", "web-download": "http",
+    "cinder": "cinder",
+}
+_BACKEND_SCHEMES = {
+    "file": {"file", "filesystem"},
+    "rbd": {"rbd"},
+    "swift": {"swift", "swift+http", "swift+https"},
+    "s3": {"s3", "s3+http", "s3+https"},
+    "http": {"http", "https"},
+    "cinder": {"cinder"},
+}
 _DISK_FORMATS = {
     "aki", "ami", "ari", "iso", "ploop", "qcow2", "raw", "vdi",
     "vhd", "vhdx", "vmdk",
@@ -227,6 +242,17 @@ def _sanitize_evidence(evidence: object) -> Optional[Dict[str, str]]:
     return None
 
 
+def _backend_evidence(value: object) -> Dict[str, Optional[str]]:
+    if value is None:
+        return {"backend_type": None, "backend_type_state": "absent"}
+    if isinstance(value, str) and value in _BACKEND_TYPE_ALIASES:
+        return {
+            "backend_type": _BACKEND_TYPE_ALIASES[value],
+            "backend_type_state": "supported",
+        }
+    return {"backend_type": None, "backend_type_state": "unsupported"}
+
+
 class GlanceCollector:
     def __init__(self, client, side: str, *, _fixture_policy=None) -> None:
         if side not in {"source", "target"}:
@@ -256,23 +282,63 @@ class GlanceCollector:
                 item["required"] for item in requirements.values()
             ),
         )
-        enabled_stores, default_store = self._inventory(stores_payload, result)
+        capabilities_payload = None
+        capabilities_evidence = None
+        capability_probe = getattr(
+            self.client, "glance_store_capabilities", None
+        )
+        if callable(capability_probe):
+            try:
+                candidate, raw_evidence = capability_probe(
+                    f"glance-{self.side}-store-capabilities"
+                )
+                sanitized_capability_evidence = _sanitize_evidence(
+                    raw_evidence
+                )
+                if (
+                    _bounded(candidate)
+                    and sanitized_capability_evidence is not None
+                ):
+                    capabilities_payload = deepcopy(candidate)
+                    capabilities_evidence = sanitized_capability_evidence
+            except Exception:
+                capabilities_payload = None
+                capabilities_evidence = None
+        store_inventory, default_store = self._inventory(
+            stores_payload, capabilities_payload, result
+        )
         if stores_evidence:
             result.evidence.append(stores_evidence)
+        if capabilities_evidence:
+            result.evidence.append(capabilities_evidence)
+        inventory_evidence_ids = []
+        for evidence in (stores_evidence, capabilities_evidence):
+            if evidence:
+                inventory_evidence_ids.append(next(iter(evidence.values())))
         inventory_node = ResourceNode(
             "glance_store_inventory", f"{self.side}-enabled-stores", self.side,
             {
-                "enabled_store_ids": sorted(enabled_stores),
+                "enabled_store_ids": sorted(store_inventory),
                 "default_store_id": default_store,
             },
-            [next(iter(stores_evidence.values()))] if stores_evidence else [],
+            inventory_evidence_ids,
         )
         result.nodes.append(inventory_node)
 
+        store_usage: Dict[str, Dict[str, Any]] = {}
         for image_id, requirement in requirements.items():
-            self._collect_image(image_id, requirement, enabled_stores, result)
+            self._collect_image(
+                image_id, requirement, store_inventory, store_usage, result
+            )
+        self._emit_stores(store_inventory, store_usage, result)
 
-        keys = {node.key for node in result.nodes}
+        node_keys = [node.key for node in result.nodes]
+        check_ids = [check.check_id for check in result.checks]
+        if len(node_keys) != len(set(node_keys)):
+            result.blockers.append("Glance graph node keys are not unique")
+        if len(check_ids) != len(set(check_ids)):
+            result.blockers.append("Glance check identifiers are not unique")
+        keys = set(node_keys)
         for edge in result.edges:
             if edge.required and (edge.source not in keys or edge.target not in keys):
                 result.blockers.append("Glance required dependency evidence missing")
@@ -292,12 +358,24 @@ class GlanceCollector:
             reason = raw_requirement.get("reason")
             bdm_proof = raw_requirement.get("bdm_proves_no_local_root", False)
             runtime_proof = raw_requirement.get("runtime_proves_no_local_root", False)
+            raw_consumers = raw_requirement.get("consumer_project_ids")
+            consumers: List[str] = []
+            if raw_consumers is not None:
+                if not isinstance(raw_consumers, list):
+                    return None
+                for raw_consumer in raw_consumers:
+                    consumer = _id(raw_consumer, self._allow_fixture_aliases)
+                    if consumer is None:
+                        return None
+                    consumers.append(consumer)
             if (
                 not isinstance(required, bool)
                 or reason not in _REASONS
                 or not isinstance(bdm_proof, bool)
                 or not isinstance(runtime_proof, bool)
                 or (not required and reason != "volume_image_metadata")
+                or (required and not consumers)
+                or len(consumers) != len(set(consumers))
             ):
                 return None
             result[image_id] = {
@@ -305,6 +383,7 @@ class GlanceCollector:
                 "reason": reason,
                 "bdm_proves_no_local_root": bdm_proof,
                 "runtime_proves_no_local_root": runtime_proof,
+                "consumer_project_ids": consumers,
             }
         return result
 
@@ -329,40 +408,80 @@ class GlanceCollector:
             return None, _sanitize_evidence(evidence)
         return deepcopy(payload), _sanitize_evidence(evidence)
 
-    def _inventory(self, payload, result) -> Tuple[Set[str], Optional[str]]:
-        if not isinstance(payload, Mapping):
+    def _inventory(
+        self, payload, capabilities_payload, result
+    ) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+        if not isinstance(payload, list) or not payload:
             result.unknowns.append("Glance enabled store inventory unavailable")
-            return set(), None
-        raw_stores = payload.get("stores")
-        if not isinstance(raw_stores, list) or not raw_stores:
-            result.unknowns.append("Glance enabled store inventory invalid")
-            return set(), None
-        values: List[str] = []
+            return {}, None
+        capabilities: Dict[str, Dict[str, Optional[str]]] = {}
+        capabilities_invalid = False
+        if capabilities_payload is not None:
+            if not isinstance(capabilities_payload, list):
+                capabilities_invalid = True
+            else:
+                for item in capabilities_payload:
+                    store_id = _safe_name(
+                        _field(item, "store_id", "id")
+                    ) if isinstance(item, Mapping) else None
+                    if store_id is None or store_id in capabilities:
+                        capabilities_invalid = True
+                        continue
+                    capabilities[store_id] = _backend_evidence(
+                        _field(item, "backend_type", "store_type", "driver_type")
+                    )
+        if capabilities_invalid:
+            result.unknowns.append(
+                "Glance store capability evidence ambiguous"
+            )
+            capabilities = {}
+
+        stores: Dict[str, Dict[str, Any]] = {}
         defaults: List[str] = []
-        for item in raw_stores:
+        invalid = False
+        for item in payload:
             store_id = _safe_name(_field(item, "id")) if isinstance(item, Mapping) else None
-            if store_id is None:
-                result.unknowns.append("Glance enabled store inventory invalid")
-                return set(), None
-            values.append(store_id)
-            if "default" in item:
-                is_default = item.get("default")
-                if not isinstance(is_default, bool):
-                    result.unknowns.append("Glance default store evidence invalid")
-                    return set(values), None
-                if is_default:
-                    defaults.append(store_id)
-        if len(set(values)) != len(values):
+            is_default = _field(item, "default") if isinstance(item, Mapping) else None
+            inline_backend_type = _field(
+                item, "backend_type", "store_type", "driver_type"
+            ) if isinstance(item, Mapping) else None
+            if (
+                store_id is None
+                or not isinstance(is_default, bool)
+                or store_id in stores
+            ):
+                invalid = True
+                continue
+            inline = _backend_evidence(inline_backend_type)
+            configured = capabilities.get(store_id, _backend_evidence(None))
+            if inline["backend_type_state"] == "absent":
+                selected = configured
+            elif configured["backend_type_state"] == "absent":
+                selected = inline
+            elif inline == configured:
+                selected = inline
+            else:
+                selected = _backend_evidence("unsupported")
+            stores[store_id] = dict(selected)
+            if is_default:
+                defaults.append(store_id)
+        if invalid:
             result.unknowns.append("Glance enabled store inventory ambiguous")
-            return set(), None
+            return {}, None
+        if any(store_id not in stores for store_id in capabilities):
+            result.unknowns.append(
+                "Glance store capability evidence references unknown store"
+            )
         if len(defaults) != 1:
             result.unknowns.append("Glance default store evidence invalid")
             default = None
         else:
             default = defaults[0]
-        return set(values), default
+        return stores, default
 
-    def _collect_image(self, image_id, requirement, enabled_stores, result):
+    def _collect_image(
+        self, image_id, requirement, store_inventory, store_usage, result
+    ):
         required = requirement["required"]
         proven_historical = (
             not required
@@ -403,20 +522,34 @@ class GlanceCollector:
             return
         facts["required_for_rehome"] = required
         facts["requirement_reason"] = requirement["reason"]
+        facts["consumer_project_ids"] = list(
+            requirement["consumer_project_ids"]
+        )
         image_node = ResourceNode(
             "image", image_id, self.side, facts,
             [next(iter(image_evidence.values()))] if image_evidence else [],
         )
         result.nodes.append(image_node)
 
-        member_nodes = self._members(image_id, members, result)
+        member_nodes, member_statuses = self._members(image_id, members, result)
+        consumer_ids = set(requirement["consumer_project_ids"])
         for member_node in member_nodes:
             if member_evidence:
                 member_node.evidence_ids.append(next(iter(member_evidence.values())))
             result.nodes.append(member_node)
+            member_id = member_node.facts["member_id"]
             result.edges.append(DependencyEdge(
-                image_node.key, member_node.key, "shared_with", required and facts.get("visibility") == "shared"
+                image_node.key, member_node.key, "shared_with",
+                required
+                and facts.get("visibility") == "shared"
+                and member_id in consumer_ids
+                and member_node.facts["status"] == "accepted",
             ))
+        if required:
+            self._check_project_access(
+                image_node, requirement["consumer_project_ids"],
+                member_statuses, result,
+            )
 
         location_keys: Set[Tuple[str, str, str]] = set()
         for index, (store_id, scheme, raw_url) in enumerate(locations):
@@ -446,33 +579,22 @@ class GlanceCollector:
                 scheme for candidate, scheme, _ in location_keys
                 if candidate == store_id
             })
-            store_node = ResourceNode(
-                "glance_store", store_id, self.side,
-                {"enabled": store_id in enabled_stores, "location_schemes": schemes},
+            usage = store_usage.setdefault(
+                store_id,
+                {"schemes": set(), "image_ids": set(), "required": False},
             )
-            result.nodes.append(store_node)
+            usage["schemes"].update(schemes)
+            usage["image_ids"].add(image_id)
+            usage["required"] = usage["required"] or required
             result.edges.append(DependencyEdge(
-                image_node.key, store_node.key, "requires_store", required
+                image_node.key, f"glance_store:{store_id}",
+                "requires_store", required
             ))
-            if store_id not in enabled_stores:
+            status, _ = self._store_readiness(
+                store_id, schemes, store_inventory
+            )
+            if status != "PASS":
                 valid = False
-                (result.blockers if required else result.unknowns).append(
-                    f"Glance referenced store not enabled: {store_id}"
-                )
-            if not schemes or any(scheme not in _KNOWN_LOCATION_SCHEMES for scheme in schemes):
-                valid = False
-                result.unknowns.append(f"Glance store readiness unsupported: {store_id}")
-                result.checks.append(CheckResult(
-                    f"glance.{self.side}.store.{store_id}", "UNKNOWN",
-                    "Glance store backend readiness is unsupported",
-                    [store_node.key],
-                ))
-            elif store_id in enabled_stores:
-                result.checks.append(CheckResult(
-                    f"glance.{self.side}.store.{store_id}", "PASS",
-                    "Glance store is enabled and location metadata is typed",
-                    [store_node.key],
-                ))
 
         if proven_historical:
             result.checks.append(CheckResult(
@@ -512,6 +634,89 @@ class GlanceCollector:
             result.blockers.append(f"Glance required image data blocked: {image_id}")
         elif required and sanitized_check.status == "UNKNOWN":
             result.unknowns.append(f"Glance required image data unknown: {image_id}")
+
+    def _check_project_access(
+        self, image_node, consumer_project_ids, member_statuses, result
+    ) -> None:
+        owner = image_node.facts.get("owner")
+        visibility = image_node.facts.get("visibility")
+        for project_id in consumer_project_ids:
+            statuses = member_statuses.get(project_id, [])
+            accessible = False
+            reason = "Glance image project access denied"
+            if project_id == owner:
+                accessible = True
+                reason = "Glance image project is the owner"
+            elif visibility in {"public", "community"}:
+                accessible = True
+                reason = "Glance image visibility grants project access"
+            elif visibility == "shared" and statuses == ["accepted"]:
+                accessible = True
+                reason = "Glance image has accepted project membership"
+            check = CheckResult(
+                f"glance.{self.side}.image-access.{image_node.id}.{project_id}",
+                "PASS" if accessible else "BLOCKED",
+                reason,
+                [image_node.key],
+            )
+            result.checks.append(check)
+            if not accessible:
+                result.blockers.append(
+                    f"Glance required image project access not proven: {image_node.id}"
+                )
+
+    def _store_readiness(self, store_id, schemes, store_inventory):
+        inventory = store_inventory.get(store_id)
+        if inventory is None:
+            return "BLOCKED", "Glance referenced store not enabled"
+        state = inventory.get("backend_type_state")
+        backend_type = inventory.get("backend_type")
+        if state == "absent":
+            return "UNKNOWN", "Glance store backend type unavailable"
+        if state != "supported" or backend_type not in _BACKEND_SCHEMES:
+            return "UNKNOWN", "Glance store backend type unsupported"
+        if (
+            not schemes
+            or any(scheme not in _KNOWN_LOCATION_SCHEMES for scheme in schemes)
+            or any(scheme not in _BACKEND_SCHEMES[backend_type] for scheme in schemes)
+        ):
+            return "UNKNOWN", "Glance store backend type mismatch"
+        return "PASS", "Glance store backend type and locations are consistent"
+
+    def _emit_stores(self, store_inventory, store_usage, result) -> None:
+        for store_id in sorted(store_usage):
+            usage = store_usage[store_id]
+            schemes = sorted(usage["schemes"])
+            status, reason = self._store_readiness(
+                store_id, schemes, store_inventory
+            )
+            inventory = store_inventory.get(store_id, {})
+            facts = {
+                "enabled": store_id in store_inventory,
+                "location_schemes": schemes,
+                "image_ids": sorted(usage["image_ids"]),
+                "backend_type_evidence": inventory.get(
+                    "backend_type_state", "missing"
+                ),
+            }
+            if inventory.get("backend_type_state") == "supported":
+                facts["backend_type"] = inventory["backend_type"]
+            node = ResourceNode("glance_store", store_id, self.side, facts)
+            result.nodes.append(node)
+            check_status = status
+            if not usage["required"] and status != "PASS":
+                check_status = "WARN"
+            result.checks.append(CheckResult(
+                f"glance.{self.side}.store.{store_id}",
+                check_status,
+                reason,
+                [node.key],
+            ))
+            message = f"{reason}: {store_id}"
+            if usage["required"] and status == "BLOCKED":
+                result.blockers.append(message)
+            elif usage["required"] and status == "UNKNOWN":
+                result.unknowns.append(message)
 
     def _image_facts(self, image_id, image, result):
         valid = True
@@ -633,12 +838,15 @@ class GlanceCollector:
             facts["legacy_checksum"] = checksum
         return facts, store_ids, locations, valid
 
-    def _members(self, image_id, payload, result) -> List[ResourceNode]:
+    def _members(
+        self, image_id, payload, result
+    ) -> Tuple[List[ResourceNode], Dict[str, List[str]]]:
         if not isinstance(payload, list):
             result.unknowns.append(f"Glance image member evidence invalid: {image_id}")
-            return []
+            return [], {}
         nodes: List[ResourceNode] = []
         seen: Set[str] = set()
+        statuses: Dict[str, List[str]] = {}
         for raw in payload:
             if not isinstance(raw, Mapping):
                 result.unknowns.append(f"Glance image member evidence invalid: {image_id}")
@@ -649,6 +857,7 @@ class GlanceCollector:
             if observed_image != image_id or member_id is None or status not in _MEMBER_STATES:
                 result.blockers.append(f"Glance image member evidence inconsistent: {image_id}")
                 continue
+            statuses.setdefault(member_id, []).append(status)
             key = f"{image_id}:{member_id}"
             if key in seen:
                 result.blockers.append(f"Glance image member evidence ambiguous: {image_id}")
@@ -658,4 +867,4 @@ class GlanceCollector:
                 "image_member", key, self.side,
                 {"image_id": image_id, "member_id": member_id, "status": status},
             ))
-        return nodes
+        return nodes, statuses

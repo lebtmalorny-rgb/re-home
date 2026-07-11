@@ -80,32 +80,36 @@ def _valid_target(
 def _headers(response) -> Optional[Mapping[str, str]]:
     raw = getattr(response, "headers", None)
     try:
-        items = list(raw.items())
-    except (AttributeError, TypeError, ValueError, MemoryError):
+        items = iter(raw.items())
+        total = 0
+        normalized = {}
+        count = 0
+        for key, value in items:
+            count += 1
+            if count > _MAX_HEADERS:
+                return None
+            if not isinstance(key, str) or not isinstance(value, str):
+                return None
+            key_bytes = key.encode("utf-8")
+            value_bytes = value.encode("utf-8")
+            total += len(key_bytes) + len(value_bytes)
+            if (
+                len(key_bytes) > 1024
+                or len(value_bytes) > 8192
+                or total > _MAX_HEADER_BYTES
+                or "\r" in key
+                or "\n" in key
+                or "\r" in value
+                or "\n" in value
+            ):
+                return None
+            lowered_key = key.lower()
+            if lowered_key in normalized:
+                return None
+            normalized[lowered_key] = value.strip()
+        return normalized
+    except (Exception, MemoryError, RecursionError):
         return None
-    if len(items) > _MAX_HEADERS:
-        return None
-    total = 0
-    normalized = {}
-    for key, value in items:
-        if not isinstance(key, str) or not isinstance(value, str):
-            return None
-        total += len(key.encode("utf-8")) + len(value.encode("utf-8"))
-        if (
-            len(key.encode("utf-8")) > 1024
-            or len(value.encode("utf-8")) > 8192
-            or total > _MAX_HEADER_BYTES
-            or "\r" in key
-            or "\n" in key
-            or "\r" in value
-            or "\n" in value
-        ):
-            return None
-        lowered_key = key.lower()
-        if lowered_key in normalized:
-            return None
-        normalized[lowered_key] = value.strip()
-    return normalized
 
 
 def _result(image_id: str, status: str, reason: str) -> CheckResult:
