@@ -48,6 +48,17 @@ class LabTopologyDocTests(unittest.TestCase):
         self.assertIn("Fibre Channel", text)
         self.assertIn("[Поток live discovery](live-discovery-data-flow-ru.md)", text)
 
+    def test_play_six_labels_both_delegates_with_cinder_and_glance_probes(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertIn(
+            "source Cinder backing + Glance Range probe — на `os1-compute-02`",
+            text,
+        )
+        self.assertIn(
+            "target Cinder backing + Glance Range probe — на `os2-ctrl-01`",
+            text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

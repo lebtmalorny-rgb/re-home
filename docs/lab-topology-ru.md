@@ -122,8 +122,9 @@ dataplane агент получит "port is not bound".
 - target API/schema/DB — на `target_control`;
 - domain/OVS runtime — на `rehome_compute`;
 - target libvirt/QEMU capability — на `target_reference_compute`;
-- source Cinder probe — на `os1-compute-02`;
-- target Cinder probe — на `os2-ctrl-01` для конкретного lab profile;
+- source Cinder backing + Glance Range probe — на `os1-compute-02`;
+- target Cinder backing + Glance Range probe — на `os2-ctrl-01` для
+  конкретного lab profile;
 - HMAC verification, assembly и artifacts — на Ansible runner.
 
 Подробная схема: [Поток live discovery](live-discovery-data-flow-ru.md).
