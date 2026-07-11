@@ -17,6 +17,24 @@ from live_discovery.contract import (
 from live_discovery.graph import assemble_graph, validate_graph
 
 
+CONNECTION_SENTINELS = (
+    "chap=do-not-serialize",
+    "CHAP-material-do-not-serialize",
+    "connector_value_do-not-serialize",
+    "Connector Value do-not-serialize",
+    "connection_info=do-not-serialize",
+    "connectionInfo=do-not-serialize",
+    "connection data=do-not-serialize",
+    "CONNECTION-DATA=do-not-serialize",
+    "initiator=do-not-serialize",
+    "initiator_iqn=do-not-serialize",
+    "credential-material-do-not-serialize",
+    "auth_token=do-not-serialize",
+    "token-material-do-not-serialize",
+    "pwd=do-not-serialize",
+)
+
+
 def collector(service="nova", side="source", *, nodes=None, edges=None, checks=None):
     return CollectorResult(
         service=service,
@@ -369,6 +387,40 @@ class LiveDiscoveryGraphTests(unittest.TestCase):
                     item["status"] == "BLOCKED"
                     for item in graph["assembly_checks"]
                 ))
+
+    def test_connection_credential_markers_are_constant_and_omitted_everywhere(self):
+        for marker_index, marker in enumerate(CONNECTION_SENTINELS):
+            cases = [
+                collector(nodes=[ResourceNode("instance", marker, "source")]),
+                collector(
+                    nodes=[ResourceNode("instance", "vm-1", "source")],
+                    edges=[DependencyEdge(
+                        "instance:vm-1", f"instance:{marker}", "uses", True,
+                    )],
+                ),
+                collector(checks=[CheckResult(marker, "BLOCKED", "blocked")]),
+                collector(checks=[CheckResult(
+                    "safe", "BLOCKED", "blocked", [marker], [],
+                )]),
+                collector(checks=[CheckResult(
+                    "safe", "BLOCKED", "blocked", [], [marker],
+                )]),
+                collector(nodes=[ResourceNode(
+                    "instance", "vm-1", "source", {"nested": {"value": marker}},
+                )]),
+            ]
+            reason_case = collector()
+            reason_case.blockers.append(marker)
+            cases.append(reason_case)
+            for position_index, result in enumerate(cases):
+                with self.subTest(marker=marker_index, position=position_index):
+                    graph = assemble_graph([result])
+                    serialized = json.dumps(graph, sort_keys=True)
+                    self.assertNotIn("do-not-serialize", serialized)
+                    self.assertTrue(any(
+                        item["status"] == "BLOCKED"
+                        for item in [*graph["assembly_checks"], *graph["checks"]]
+                    ))
 
     def test_unknown_top_level_and_nested_graph_fields_are_blocked(self):
         base = assemble_graph([collector(

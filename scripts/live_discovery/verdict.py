@@ -37,8 +37,10 @@ _BLOCKING_MAPPING_CLASSES = frozenset({
 })
 _SAFE_TEXT = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
 _SENSITIVE_VALUE = re.compile(
-    r"\bsecret[-_]?token\b|\b(?:password|passwd|credential)\b|"
-    r"(?:password|passwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
+    r"\bsecret[-_]?token\b|\b(?:password|passwd|pwd|token|credential)\b|"
+    r"(?:password|passwd|pwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
+    r"chap|connector|initiator|credential|"
+    r"connection[\s_-]*(?:info(?:rmation)?|data)|"
     r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
     r"\bsk-[A-Za-z0-9_-]{8,}\b|"
     r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",

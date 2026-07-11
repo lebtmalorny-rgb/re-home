@@ -13,6 +13,24 @@ from live_discovery.graph import REQUIRED_COLLECTORS, assemble_graph, validate_g
 from live_discovery.verdict import compute_verdict
 
 
+CONNECTION_SENTINELS = (
+    "chap=do-not-serialize",
+    "CHAP-material-do-not-serialize",
+    "connector_value_do-not-serialize",
+    "Connector Value do-not-serialize",
+    "connection_info=do-not-serialize",
+    "connectionInfo=do-not-serialize",
+    "connection data=do-not-serialize",
+    "CONNECTION-DATA=do-not-serialize",
+    "initiator=do-not-serialize",
+    "initiator_iqn=do-not-serialize",
+    "credential-material-do-not-serialize",
+    "auth_token=do-not-serialize",
+    "token-material-do-not-serialize",
+    "pwd=do-not-serialize",
+)
+
+
 def clean_mapping():
     column = {
         "name": "id",
@@ -361,7 +379,7 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
 
         self.assertEqual(left, right)
 
-    def test_secret_bearing_malformed_reasons_are_redacted(self):
+    def test_secret_bearing_malformed_reasons_use_constant_diagnostics(self):
         checks = [
             CheckResult("bad", "BLOCKED", "password=do-not-serialize"),
             CheckResult(
@@ -376,7 +394,33 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
         serialized = json.dumps(verdict, sort_keys=True)
 
         self.assertNotIn("do-not-serialize", serialized)
-        self.assertIn("[REDACTED]", serialized)
+        self.assertIn("readiness check reason is malformed", serialized)
+
+    def test_connection_credential_markers_never_enter_verdict_or_mapping_reasons(self):
+        for marker_index, marker in enumerate(CONNECTION_SENTINELS):
+            reason_verdict = compute_verdict(
+                complete_graph(),
+                [CheckResult(f"reason-{marker_index}", "BLOCKED", marker)],
+                clean_mapping(),
+            )
+            identifier_verdict = compute_verdict(
+                complete_graph(),
+                [CheckResult(
+                    f"id-{marker_index}", "BLOCKED", "blocked",
+                    [marker], [marker],
+                )],
+                clean_mapping(),
+            )
+            mapping = clean_mapping()
+            mapping["blockers"] = [marker]
+            mapping_verdict = compute_verdict(complete_graph(), [], mapping)
+            for position_index, verdict in enumerate((
+                reason_verdict, identifier_verdict, mapping_verdict,
+            )):
+                with self.subTest(marker=marker_index, position=position_index):
+                    serialized = json.dumps(verdict, sort_keys=True)
+                    self.assertNotIn("do-not-serialize", serialized)
+                    self.assertEqual("BLOCKED", verdict["verdict"])
 
 
 if __name__ == "__main__":

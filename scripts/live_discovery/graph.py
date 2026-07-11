@@ -38,12 +38,14 @@ _EXCLUDED_SERVICES = frozenset({"masakari", "drs"})
 _SAFE_IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
 _SENSITIVE_KEY = re.compile(
     r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|credential|"
-    r"connector|connection[_-]?(?:info|data)",
+    r"connector|initiator|connection[\s_-]*(?:info(?:rmation)?|data)",
     flags=re.IGNORECASE,
 )
 _SENSITIVE_VALUE = re.compile(
-    r"(?:password|passwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
-    r"\bsecret[-_]?token\b|\b(?:password|passwd|credential)\b|"
+    r"(?:password|passwd|pwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
+    r"chap|connector|initiator|credential|"
+    r"connection[\s_-]*(?:info(?:rmation)?|data)|"
+    r"\bsecret[-_]?token\b|\b(?:password|passwd|pwd|token|credential)\b|"
     r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
     r"\bsk-[A-Za-z0-9_-]{8,}\b|"
     r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",
@@ -92,7 +94,9 @@ def _safe_reason(value: object, fallback: str) -> str:
         return fallback
     if _SAFE_IDENTIFIER.fullmatch(value) is None:
         return fallback
-    return _SENSITIVE_VALUE.sub("[REDACTED]", value)
+    if _SENSITIVE_VALUE.search(value):
+        return fallback
+    return value
 
 
 def _normalize_tree(value: object) -> object:
