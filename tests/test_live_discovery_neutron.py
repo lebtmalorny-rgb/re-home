@@ -280,7 +280,100 @@ class NeutronCollectorTests(unittest.TestCase):
             "ovs",
         )
 
+        self.assertIn(
+            "source Neutron ports unavailable after identifier validation",
+            result.unknowns,
+        )
+        self.assertIn(
+            "target Neutron resource identifier invalid: port",
+            result.blockers,
+        )
         self.assertNotIn("port-1", json.dumps(result.to_dict()))
+
+    def test_readiness_reports_all_source_ports_discarded(self):
+        source = CollectorResult(service="neutron", side="source")
+        source.nodes.append(
+            ResourceNode(
+                "port", "all-source-port-secret", "source",
+                {"network_id": "all-source-network-secret"},
+            )
+        )
+
+        result = compare_neutron_results(
+            source,
+            CollectorResult(service="neutron", side="target"),
+            CollectorResult(service="runtime", side="source"),
+            CollectorResult(service="runtime", side="target"),
+            "ovs",
+        )
+
+        self.assertIn(
+            "source Neutron ports unavailable after identifier validation",
+            result.unknowns,
+        )
+        self.assertNotIn("all-source-port-secret", json.dumps(result.to_dict()))
+        self.assertNotIn("all-source-network-secret", json.dumps(result.to_dict()))
+
+    def test_readiness_reports_partially_discarded_source_and_target_nodes(self):
+        port_id = UUID_ALIASES["port-1"]
+        network_id = UUID_ALIASES["network-1"]
+        source = CollectorResult(service="neutron", side="source")
+        source.nodes.extend(
+            [
+                ResourceNode(
+                    "port", port_id, "source",
+                    {"api_id": port_id, "network_id": network_id},
+                ),
+                ResourceNode("port", "partial-source-secret", "source"),
+            ]
+        )
+        source.edges.append(
+            DependencyEdge(
+                f"port:{port_id}", f"network:{network_id}",
+                "uses_network", True,
+            )
+        )
+        target = CollectorResult(service="neutron", side="target")
+        target.nodes.extend(
+            [
+                ResourceNode(
+                    "port", port_id, "target",
+                    {"api_id": port_id, "network_id": network_id},
+                ),
+                ResourceNode("port", "partial-target-port-secret", "target"),
+                ResourceNode(
+                    "network", network_id, "target", {"api_id": network_id}
+                ),
+                ResourceNode(
+                    "network", "partial-target-network-secret", "target"
+                ),
+            ]
+        )
+
+        result = compare_neutron_results(
+            source,
+            target,
+            CollectorResult(service="runtime", side="source"),
+            CollectorResult(service="runtime", side="target"),
+            None,
+        )
+        serialized = json.dumps(result.to_dict())
+
+        self.assertIn(
+            "source Neutron resource identifier invalid: port",
+            result.unknowns,
+        )
+        self.assertIn(
+            "target Neutron resource identifier invalid: port",
+            result.blockers,
+        )
+        self.assertIn(
+            "target Neutron resource identifier invalid: network",
+            result.blockers,
+        )
+        self.assertNotIn("partial-source-secret", serialized)
+        self.assertNotIn("partial-target-port-secret", serialized)
+        self.assertNotIn("partial-target-network-secret", serialized)
 
     def test_production_accepts_canonical_uuid_dependency_graph(self):
         fixture = canonical_uuid_fixture(self.source_fixture)
@@ -336,6 +429,93 @@ class NeutronCollectorTests(unittest.TestCase):
         ).collect([UUID_ALIASES["port-1"]])
 
         self.assertNotIn("target-project-id-secret", json.dumps(result.to_dict()))
+
+    def test_active_dependency_families_block_present_invalid_uuids(self):
+        cases = (
+            ("core-port", "ports", "device_id", None),
+            ("core-port-alias", "ports", "port_id", None),
+            ("core-ip", "ipallocations", "subnet_id", None),
+            ("segment", "networksegments", "id", None),
+            ("segment-alias", "networksegments", "segment_id", None),
+            ("binding", "ml2_port_binding_levels", "segment_id", None),
+            (
+                "security-group", "securitygroupportbindings",
+                "security_group_id", None,
+            ),
+            (
+                "security-rule", "securitygrouprules",
+                "remote_address_group_id", None,
+            ),
+            (
+                "security-rule-alias", "securitygrouprules",
+                "address_group_id", None,
+            ),
+            ("qos", "qos_port_policy_bindings", "policy_id", None),
+            ("trunk", "trunks", "id", None),
+            (
+                "subport", "subports", "trunk_id",
+                {
+                    "port_id": UUID_ALIASES["port-1"],
+                    "segmentation_type": "vlan", "segmentation_id": 42,
+                },
+            ),
+            ("router", "routerports", "router_id", None),
+            ("floating-ip", "floatingips", "router_id", None),
+            ("floating-ip-alias", "floatingips", "port_id", None),
+            ("port-forwarding", "portforwardings", "floatingip_id", None),
+            (
+                "rbac", "addressgrouprbacs", "id",
+                {
+                    "object_id": UUID_ALIASES["address-group-1"],
+                    "target_project": "*", "action": "access_as_shared",
+                },
+            ),
+        )
+        for family, table, field, seed in cases:
+            with self.subTest(family=family, table=table, field=field):
+                fixture = canonical_uuid_fixture(self.source_fixture)
+                sentinel = f"{family}-dependency-secret"
+                if seed is None:
+                    row = fixture["tables"][table][0]
+                else:
+                    row = deepcopy(seed)
+                    fixture["tables"][table].append(row)
+                row[field] = sentinel
+
+                result = NeutronCollector(
+                    FixtureClient(fixture), "source", schema_from_fixture(fixture)
+                ).collect([UUID_ALIASES["port-1"]])
+                serialized = json.dumps(result.to_dict())
+
+                self.assertIn(
+                    f"Neutron dependency UUID invalid: {table}.{field}",
+                    result.blockers,
+                )
+                self.assertNotIn(sentinel, serialized)
+
+    def test_active_api_dependency_fields_use_sanitized_table_field_blockers(self):
+        cases = (
+            (0, "ports", "id"),
+            (0, "ports", "network_id"),
+            (0, "ports", "device_id"),
+            (1, "networks", "id"),
+        )
+        for response_index, table, field in cases:
+            with self.subTest(table=table, field=field):
+                fixture = canonical_uuid_fixture(self.source_fixture)
+                sentinel = f"api-{table}-{field}-secret"
+                fixture["openstack"][response_index]["payload"][field] = sentinel
+
+                result = NeutronCollector(
+                    FixtureClient(fixture), "source", schema_from_fixture(fixture)
+                ).collect([UUID_ALIASES["port-1"]])
+                serialized = json.dumps(result.to_dict())
+
+                self.assertIn(
+                    f"Neutron dependency UUID invalid: {table}.{field}",
+                    result.blockers,
+                )
+                self.assertNotIn(sentinel, serialized)
 
     def test_missing_qos_policy_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)

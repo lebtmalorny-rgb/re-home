@@ -129,6 +129,51 @@ _OPENSTACK_ID_FACT_FIELDS = {
     "router_id", "floating_network_id", "floatingip_id", "internal_port_id",
     "object_id", "address_group_id",
 }
+_OPENSTACK_RESOURCE_NODE_KINDS = {
+    "port", "network", "subnet", "segment", "security_group",
+    "qos_policy", "trunk", "router", "floating_ip", "address_group",
+}
+_TABLE_OPENSTACK_ID_FIELDS = {
+    "ports": ("id", "port_id", "network_id", "device_id", "project_id"),
+    "ipallocations": ("port_id", "network_id", "subnet_id"),
+    "networks": ("id", "project_id"),
+    "subnets": ("id", "network_id", "subnetpool_id", "project_id"),
+    "networksegments": ("id", "segment_id", "network_id"),
+    "ml2_port_bindings": ("port_id",),
+    "ml2_distributed_port_bindings": ("port_id",),
+    "ml2_port_binding_levels": ("port_id", "segment_id"),
+    "securitygroups": ("id", "project_id"),
+    "securitygrouprules": (
+        "id", "security_group_id", "project_id", "remote_group_id",
+        "remote_address_group_id", "address_group_id",
+    ),
+    "securitygroupportbindings": ("port_id", "security_group_id"),
+    "allowedaddresspairs": ("port_id",),
+    "portdnses": ("port_id",),
+    "dnsnameservers": ("subnet_id",),
+    "extradhcpopts": ("port_id",),
+    "qos_port_policy_bindings": ("port_id", "policy_id"),
+    "qos_network_policy_bindings": ("network_id", "policy_id"),
+    "qos_fip_policy_bindings": ("fip_id", "policy_id"),
+    "qos_policies": ("id", "project_id"),
+    "trunks": ("id", "port_id", "project_id"),
+    "subports": ("trunk_id", "port_id"),
+    "routers": ("id", "project_id"),
+    "routerports": ("router_id", "port_id"),
+    "routerroutes": ("router_id",),
+    "floatingips": (
+        "id", "fixed_port_id", "port_id", "router_id", "floating_network_id",
+        "project_id",
+    ),
+    "portforwardings": (
+        "id", "floatingip_id", "floating_ip_id", "internal_port_id",
+    ),
+    "address_groups": ("id", "project_id"),
+    "address_associations": ("address_group_id",),
+    "addressgrouprbacs": (
+        "id", "object_id", "address_group_id", "target_project", "project_id",
+    ),
+}
 _FIXTURE_POLICY_TOKEN = object()
 
 
@@ -406,6 +451,7 @@ class NeutronCollector:
                 result,
             )
             api = payload if isinstance(payload, Mapping) else {}
+            self._validate_dependency_ids("ports", api, result)
             api_id = _row_id(api, "id")
             if api_id != port_id:
                 result.blockers.append(f"port API UUID mismatch: {port_id}")
@@ -490,6 +536,7 @@ class NeutronCollector:
                 result,
             )
             api = payload if isinstance(payload, Mapping) else {}
+            self._validate_dependency_ids("networks", api, result)
             matches = [row for row in network_rows if _row_id(row, "id") == network_id]
             if len(matches) != 1:
                 qualifier = "missing" if not matches else "duplicate"
@@ -952,12 +999,33 @@ class NeutronCollector:
             ):
                 result.blockers.append(f"DB row outside filter: {table}[{index}]")
                 continue
+            self._validate_dependency_ids(table, row, result)
             rows.append(
                 _PolicyMapping(
                     deepcopy(dict(row)), self._allow_fixture_aliases
                 )
             )
         return rows
+
+    def _validate_dependency_ids(
+        self,
+        table: str,
+        row: Mapping[str, Any],
+        result: CollectorResult,
+    ) -> None:
+        for field in _TABLE_OPENSTACK_ID_FIELDS.get(table, ()):
+            if field not in row:
+                continue
+            value = row[field]
+            if value is None or value == "":
+                continue
+            if field == "target_project" and value == "*":
+                continue
+            if _openstack_id(value, self._allow_fixture_aliases) is not None:
+                continue
+            reason = f"Neutron dependency UUID invalid: {table}.{field}"
+            if reason not in result.blockers:
+                result.blockers.append(reason)
 
     def _api(
         self,
@@ -1207,6 +1275,16 @@ def _node_map(result: CollectorResult, kind: str) -> Dict[str, ResourceNode]:
     return nodes
 
 
+def _invalid_resource_node_kinds(result: CollectorResult) -> Set[str]:
+    allow_fixture_aliases = _result_allows_fixture_aliases(result)
+    return {
+        node.kind
+        for node in result.nodes
+        if node.kind in _OPENSTACK_RESOURCE_NODE_KINDS
+        and _openstack_id(node.id, allow_fixture_aliases) is None
+    }
+
+
 def _result_row_id(
     result: CollectorResult, row: Mapping[str, Any], *names: str
 ) -> Optional[str]:
@@ -1360,6 +1438,22 @@ def compare_neutron_results(
     ]:
         if unknown not in result.unknowns:
             result.unknowns.append(unknown)
+
+    for kind in sorted(_invalid_resource_node_kinds(source)):
+        reason = f"source Neutron resource identifier invalid: {kind}"
+        if reason not in result.unknowns:
+            result.unknowns.append(reason)
+    for kind in sorted(_invalid_resource_node_kinds(target)):
+        reason = f"target Neutron resource identifier invalid: {kind}"
+        if reason not in result.blockers:
+            result.blockers.append(reason)
+    if (
+        not source_ports
+        and (source.nodes or source.blockers or source.unknowns)
+    ):
+        reason = "source Neutron ports unavailable after identifier validation"
+        if reason not in result.unknowns:
+            result.unknowns.append(reason)
 
     for port_id, source_port in source_ports.items():
         target_port = target_ports.get(port_id)
