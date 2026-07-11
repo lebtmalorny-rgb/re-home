@@ -124,6 +124,32 @@ class OpenStackClientTests(unittest.TestCase):
 
         self.assertIs(failure_evidence, raised.exception.evidence)
 
+    def test_client_sanitizes_raw_stdout_and_stderr_from_evidence(self):
+        class SecretEvidenceRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                return CommandEvidence(
+                    evidence_id,
+                    list(argv),
+                    0,
+                    '{"id":"server-1","secret":"stdout-secret"}',
+                    "stderr-secret",
+                )
+
+        client = OpenStackClient(
+            SecretEvidenceRunner(),
+            "cloud",
+            "toolbox",
+            "/clouds.yaml",
+        )
+
+        payload, evidence = client.json(["server", "show", "server-1"], "secret")
+
+        self.assertEqual("stdout-secret", payload["secret"])
+        self.assertNotIn("stdout-secret", str(evidence))
+        self.assertNotIn("stderr-secret", str(evidence))
+        self.assertEqual("[REDACTED]", evidence["stdout"])
+        self.assertEqual("[REDACTED]", evidence["stderr"])
+
 
 class TargetProfileTests(unittest.TestCase):
     def setUp(self):
@@ -253,6 +279,48 @@ class TargetProfileTests(unittest.TestCase):
             ),
         )
 
+    def test_irrelevant_stale_or_future_nonzero_evidence_is_unknown(self):
+        stale_timestamp = datetime.now(timezone.utc) - timedelta(days=2)
+        future_timestamp = datetime.now(timezone.utc) + timedelta(hours=1)
+        cases = (
+            (
+                "irrelevant",
+                {"command": ["nova-manage", "db", "version"]},
+                "nova online migration evidence command invalid",
+            ),
+            (
+                "stale",
+                {"timestamp": stale_timestamp.isoformat().replace("+00:00", "Z")},
+                "nova online migration evidence stale",
+            ),
+            (
+                "future",
+                {"timestamp": future_timestamp.isoformat().replace("+00:00", "Z")},
+                "nova online migration evidence timestamp is in the future",
+            ),
+        )
+
+        for name, changes, expected_reason in cases:
+            with self.subTest(name=name):
+                outputs = self.fresh_manage_outputs()
+                artifact = outputs["online_migration_evidence"]["nova"]
+                artifact["returncode"] = 1
+                artifact.update(changes)
+
+                result = self.collect(outputs)
+                check = next(
+                    item
+                    for item in result.checks
+                    if item.check_id == "target.nova.online-data-migrations"
+                )
+
+                self.assertEqual("UNKNOWN", check.status)
+                self.assertEqual(expected_reason, check.reason)
+                self.assertNotIn(
+                    "nova online migration evidence returncode is not 0",
+                    result.blockers,
+                )
+
     def test_irrelevant_or_future_online_migration_evidence_is_unknown(self):
         irrelevant = self.fresh_manage_outputs()
         irrelevant["online_migration_evidence"]["nova"]["command"] = [
@@ -286,6 +354,41 @@ class TargetProfileTests(unittest.TestCase):
 
         self.assertIn("target profile fact nova_api_db_version missing", result.unknowns)
         self.assertIn("target container image nova_api missing", result.unknowns)
+
+    def test_profile_allowlists_migration_services_and_artifact_fields(self):
+        outputs = self.fresh_manage_outputs()
+        outputs["online_migration_evidence"]["nova"].update(
+            {
+                "auth_token": "nova-secret-token",
+                "stdout": "nova-secret-stdout",
+                "stderr": "nova-secret-stderr",
+            }
+        )
+        outputs["online_migration_evidence"]["unknown-service"] = {
+            "evidence_id": "unknown-secret-evidence",
+            "command": ["unknown-manage", "db", "online_data_migrations"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "returncode": 0,
+            "password": "unknown-secret-password",
+        }
+
+        result = self.collect(outputs)
+
+        profile_evidence = result.nodes[0].facts["online_migration_evidence"]
+        self.assertEqual({"nova", "cinder"}, set(profile_evidence))
+        self.assertEqual(
+            {"evidence_id", "command", "timestamp", "returncode"},
+            set(profile_evidence["nova"]),
+        )
+        serialized = json.dumps(result.to_dict(), sort_keys=True)
+        for secret in (
+            "nova-secret-token",
+            "nova-secret-stdout",
+            "nova-secret-stderr",
+            "unknown-secret-evidence",
+            "unknown-secret-password",
+        ):
+            self.assertNotIn(secret, serialized)
 
 
 if __name__ == "__main__":

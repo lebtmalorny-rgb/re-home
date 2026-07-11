@@ -11,6 +11,13 @@ CANONICAL_RELEASE = "2025.1"
 CANONICAL_DISTRIBUTION = "vanilla"
 ONLINE_MIGRATION_EVIDENCE_MAX_AGE = timedelta(hours=24)
 ONLINE_MIGRATION_EVIDENCE_FUTURE_TOLERANCE = timedelta(minutes=5)
+ONLINE_MIGRATION_SERVICES = ("nova", "cinder")
+ONLINE_MIGRATION_ARTIFACT_FIELDS = (
+    "evidence_id",
+    "command",
+    "timestamp",
+    "returncode",
+)
 
 
 def _has_output_format(arguments: Sequence[str]) -> bool:
@@ -29,6 +36,20 @@ def _invalid_json_failure(evidence) -> ProbeFailed:
         f"probe {evidence.evidence_id!r} failed: invalid-json",
     )
     return failure
+
+
+def _sanitized_json_evidence(evidence: object) -> Dict[str, Any]:
+    raw = evidence.to_dict()
+    sanitized = {
+        key: deepcopy(raw[key])
+        for key in ("evidence_id", "id", "argv", "returncode")
+        if key in raw
+    }
+    if "stdout" in raw:
+        sanitized["stdout"] = "[REDACTED]"
+    if "stderr" in raw:
+        sanitized["stderr"] = "[REDACTED]"
+    return sanitized
 
 
 def _image_reference(inspect: object) -> Optional[str]:
@@ -59,6 +80,24 @@ def _parse_timestamp(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _sanitized_online_migration_evidence(
+    evidence: object,
+) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(evidence, Mapping):
+        return {}
+    sanitized: Dict[str, Dict[str, Any]] = {}
+    for service in ONLINE_MIGRATION_SERVICES:
+        artifact = evidence.get(service)
+        if not isinstance(artifact, Mapping):
+            continue
+        sanitized[service] = {
+            field: deepcopy(artifact[field])
+            for field in ONLINE_MIGRATION_ARTIFACT_FIELDS
+            if field in artifact
+        }
+    return sanitized
+
+
 def _online_migration_check(
     service: str,
     artifact: object,
@@ -67,14 +106,6 @@ def _online_migration_check(
     check_id = f"target.{service}.online-data-migrations"
     if not isinstance(artifact, Mapping):
         reason = f"{service} online migration evidence missing"
-        return CheckResult(check_id, "UNKNOWN", reason), reason, None
-
-    returncode = artifact.get("returncode")
-    if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0:
-        reason = f"{service} online migration evidence returncode is not 0"
-        return CheckResult(check_id, "BLOCKED", reason), None, reason
-    if not isinstance(returncode, int) or isinstance(returncode, bool):
-        reason = f"{service} online migration evidence returncode missing"
         return CheckResult(check_id, "UNKNOWN", reason), reason, None
 
     expected_command = [f"{service}-manage", "db", "online_data_migrations"]
@@ -91,6 +122,14 @@ def _online_migration_check(
         return CheckResult(check_id, "UNKNOWN", reason), reason, None
     if timestamp - now > ONLINE_MIGRATION_EVIDENCE_FUTURE_TOLERANCE:
         reason = f"{service} online migration evidence timestamp is in the future"
+        return CheckResult(check_id, "UNKNOWN", reason), reason, None
+
+    returncode = artifact.get("returncode")
+    if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0:
+        reason = f"{service} online migration evidence returncode is not 0"
+        return CheckResult(check_id, "BLOCKED", reason), None, reason
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        reason = f"{service} online migration evidence returncode missing"
         return CheckResult(check_id, "UNKNOWN", reason), reason, None
 
     evidence_id = artifact.get("evidence_id")
@@ -139,7 +178,7 @@ class OpenStackClient:
             payload = json.loads(evidence.stdout)
         except (json.JSONDecodeError, TypeError) as error:
             raise _invalid_json_failure(evidence) from error
-        return payload, evidence.to_dict()
+        return payload, _sanitized_json_evidence(evidence)
 
 
 def collect_target_profile(
@@ -150,9 +189,9 @@ def collect_target_profile(
     del client
     result = CollectorResult(service="target-profile", side="target")
     outputs = deepcopy(dict(manage_outputs))
-    online_evidence = outputs.get("online_migration_evidence")
-    if not isinstance(online_evidence, Mapping):
-        online_evidence = {}
+    online_evidence = _sanitized_online_migration_evidence(
+        outputs.get("online_migration_evidence")
+    )
 
     container_images: Dict[str, str] = {}
     container_image_digests: Dict[str, str] = {}
@@ -237,7 +276,7 @@ def collect_target_profile(
             result.blockers.append(reason)
 
     now = datetime.now(timezone.utc)
-    for service in ("nova", "cinder"):
+    for service in ONLINE_MIGRATION_SERVICES:
         check, unknown, blocker = _online_migration_check(
             service,
             online_evidence.get(service),
