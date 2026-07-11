@@ -87,7 +87,7 @@
       "attach_status": "attached",
       "attach_mode": "rw",
       "connection_info": "{\"driver_volume_type\":\"iscsi\",\"data\":{\"target_portals\":[\"10.0.0.10:3260\",\"10.0.0.11:3260\"],\"target_iqns\":[\"iqn.1\",\"iqn.2\"],\"auth_password\":\"chap-secret\",\"multipath\":true}}",
-      "connector": "{\"host\":\"compute-1\",\"auth_token\":\"token-secret\"}",
+      "connector": "{\"host\":\"compute-1\",\"initiator\":\"iqn.connector\",\"auth_token\":\"token-secret\"}",
       "deleted": false
     }],
     "volume_types": [{"id": "type-1", "name": "encrypted-nfs", "is_public": false, "deleted": false}],

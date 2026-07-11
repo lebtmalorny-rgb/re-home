@@ -29,6 +29,15 @@ _SUPPORTED_ATTACHMENT_DRIVERS = {
 }
 _SAFE_NETLOC = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
 _ENCRYPTION_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$")
+_CINDER_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_ATTACHMENT_STATES = {
+    "attached", "attaching", "detached", "reserved",
+    "error_attaching", "error_detaching",
+}
+_ATTACHMENT_MODES = {"rw", "ro"}
+_MAX_JSON_BYTES = 65536
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 4096
 
 _TABLE_ID_FIELDS = {
     "volumes": (
@@ -197,7 +206,10 @@ def _allowlisted(payload: object, fields: Sequence[str]) -> Dict[str, Any]:
         value = _field(payload, field)
         safe = _safe_value(value)
         if safe is not None:
-            result[field] = safe
+            if isinstance(safe, str) and _SENSITIVE.search(safe) is not None:
+                result[field] = "[REDACTED]"
+            else:
+                result[field] = safe
     return result
 
 
@@ -208,7 +220,11 @@ def _safe_key_values(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         value = _field(row, "value")
         if not isinstance(key, str) or not _SAFE_TEXT.fullmatch(key):
             continue
-        safe_value = "[REDACTED]" if _SENSITIVE.search(key) else _safe_value(value)
+        if _SENSITIVE.search(key) is not None or (
+            isinstance(value, str) and _SENSITIVE.search(value) is not None
+        ):
+            continue
+        safe_value = _safe_value(value)
         if safe_value is not None:
             result.append({"key": key, "value": safe_value})
     return result
@@ -218,19 +234,125 @@ def _is_deleted(row: Mapping[str, Any]) -> bool:
     return _field(row, "deleted") not in (None, False, 0, "0", "")
 
 
+def _bounded_structure(value: object) -> bool:
+    stack = [(value, 0)]
+    visited = 0
+    byte_count = 0
+    try:
+        while stack:
+            current, depth = stack.pop()
+            visited += 1
+            if visited > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+                return False
+            if isinstance(current, Mapping):
+                for key, item in current.items():
+                    if not isinstance(key, str):
+                        return False
+                    byte_count += len(key.encode("utf-8"))
+                    if byte_count > _MAX_JSON_BYTES:
+                        return False
+                    stack.append((item, depth + 1))
+            elif isinstance(current, (list, tuple)):
+                for item in current:
+                    stack.append((item, depth + 1))
+            elif current is not None and not isinstance(
+                current, (str, int, float, bool)
+            ):
+                return False
+            elif isinstance(current, str):
+                byte_count += len(current.encode("utf-8"))
+                if byte_count > _MAX_JSON_BYTES:
+                    return False
+        return True
+    except (Exception, MemoryError, RecursionError):
+        return False
+
+
 def _parse_mapping(value: object) -> Optional[Mapping[str, Any]]:
-    if isinstance(value, Mapping):
-        return value
-    if isinstance(value, str):
-        try:
+    try:
+        if isinstance(value, Mapping):
+            if not _bounded_structure(value):
+                return None
+            encoded = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            )
+            if len(encoded.encode("utf-8")) > _MAX_JSON_BYTES:
+                return None
+            parsed = json.loads(encoded)
+        elif isinstance(value, str):
+            if len(value.encode("utf-8")) > _MAX_JSON_BYTES:
+                return None
             parsed = json.loads(value)
-        except json.JSONDecodeError:
+        else:
             return None
-        return parsed if isinstance(parsed, Mapping) else None
+        if not isinstance(parsed, Mapping) or not _bounded_structure(parsed):
+            return None
+        return parsed
+    except (Exception, MemoryError, RecursionError):
+        return None
+
+
+def _attachment_state(value: object) -> Optional[str]:
+    return value if isinstance(value, str) and value in _ATTACHMENT_STATES else None
+
+
+def _attachment_mode(value: object) -> Optional[str]:
+    return value if isinstance(value, str) and value in _ATTACHMENT_MODES else None
+
+
+def _component(value: object) -> Optional[str]:
+    if (
+        isinstance(value, str)
+        and _CINDER_COMPONENT.fullmatch(value)
+        and _SENSITIVE.search(value) is None
+    ):
+        return value
     return None
 
 
-def _connection_summary(value: object) -> Dict[str, Any]:
+def _cinder_host_components(value: object) -> Optional[Dict[str, str]]:
+    if not isinstance(value, str) or value.count("@") != 1:
+        return None
+    host, backend_pool = value.split("@", 1)
+    if backend_pool.count("#") > 1:
+        return None
+    backend, separator, pool = backend_pool.partition("#")
+    normalized_host = _component(host)
+    normalized_backend = _component(backend)
+    normalized_pool = _component(pool) if separator else None
+    if normalized_host is None or normalized_backend is None:
+        return None
+    if separator and normalized_pool is None:
+        return None
+    result = {"host": normalized_host, "backend_name": normalized_backend}
+    if normalized_pool is not None:
+        result["pool"] = normalized_pool
+    return result
+
+
+def _cluster_components(value: object) -> Optional[Dict[str, str]]:
+    if not isinstance(value, str) or value.count("@") != 1:
+        return None
+    cluster, backend = value.split("@", 1)
+    normalized_cluster = _component(cluster)
+    normalized_backend = _component(backend)
+    if normalized_cluster is None or normalized_backend is None:
+        return None
+    return {"cluster": normalized_cluster, "backend_name": normalized_backend}
+
+
+def _canonical_host(components: Mapping[str, str]) -> str:
+    suffix = f"#{components['pool']}" if "pool" in components else ""
+    return f"{components['host']}@{components['backend_name']}{suffix}"
+
+
+def _canonical_cluster(components: Mapping[str, str]) -> str:
+    return f"{components['cluster']}@{components['backend_name']}"
+
+
+def _connection_summary(
+    value: object, connector: object = None
+) -> Dict[str, Any]:
     payload = _parse_mapping(value) or {}
     driver = _field(payload, "driver_volume_type", "driver_type")
     driver_type = (
@@ -255,7 +377,10 @@ def _connection_summary(value: object) -> Dict[str, Any]:
         )
     ):
         target_count = 1
+    connector_payload = _parse_mapping(connector) or {}
     multipath = _field(data, "multipath")
+    if multipath is None:
+        multipath = _field(connector_payload, "multipath")
     return {
         "driver_type": driver_type,
         "target_count": target_count,
@@ -275,17 +400,23 @@ def _active_connection_evidence_valid(
         or len(connector_payload) == 0
     ):
         return False
-    connector_identity = False
+    typed_connector: Dict[str, Any] = {}
     for key in ("host", "initiator", "ip", "platform", "os_type"):
         if key in connector_payload:
-            if _safe_nonempty_string(connector_payload[key]) is None:
+            normalized = _safe_nonempty_string(connector_payload[key])
+            if normalized is None:
                 return False
-            connector_identity = True
+            typed_connector[key] = normalized
     if "wwpns" in connector_payload:
-        if _safe_nonempty_string_list(connector_payload["wwpns"]) is None:
+        normalized_wwpns = _safe_nonempty_string_list(
+            connector_payload["wwpns"]
+        )
+        if normalized_wwpns is None:
             return False
-        connector_identity = True
-    if connector_identity is False:
+        typed_connector["wwpns"] = normalized_wwpns
+    if "multipath" in connector_payload and not isinstance(
+        connector_payload["multipath"], bool
+    ):
         return False
     data = _field(connection, "data")
     if not isinstance(data, Mapping) or len(data) == 0:
@@ -298,11 +429,14 @@ def _active_connection_evidence_valid(
         and isinstance(target_count, int)
         and not isinstance(target_count, bool)
         and target_count > 0
-        and isinstance(summary.get("multipath"), bool)
     )
     if not base_valid:
         return False
     if driver == "iscsi":
+        if "initiator" not in typed_connector:
+            return False
+        if not isinstance(summary.get("multipath"), bool):
+            return False
         portals = _field(data, "target_portals")
         iqns = _field(data, "target_iqns")
         if portals is None:
@@ -317,9 +451,19 @@ def _active_connection_evidence_valid(
             and len(normalized_portals) == len(normalized_iqns)
         )
     if driver == "fibre_channel":
+        if "wwpns" not in typed_connector:
+            return False
+        if not isinstance(summary.get("multipath"), bool):
+            return False
         targets = _field(data, "target_wwn", "target_wwns")
         return _safe_nonempty_string_list(targets) is not None
     if driver == "rbd":
+        if "host" not in typed_connector:
+            return False
+        if "multipath" in data and not isinstance(
+            _field(data, "multipath"), bool
+        ):
+            return False
         return (
             _safe_nonempty_string(_field(data, "name")) is not None
             and _safe_nonempty_string_list(
@@ -327,6 +471,12 @@ def _active_connection_evidence_valid(
             ) is not None
         )
     if driver in {"nfs", "file", "lvm"}:
+        if "host" not in typed_connector:
+            return False
+        if "multipath" in data and not isinstance(
+            _field(data, "multipath"), bool
+        ):
+            return False
         return _safe_nonempty_string(
             _field(data, "export", "device_path", "path", "name")
         ) is not None
@@ -598,23 +748,44 @@ class CinderCollector:
                 result.blockers.append(
                     f"attachment API/DB server mismatch: {attachment_id}"
                 )
-            db_facts = _allowlisted(row, _ATTACHMENT_FIELDS)
+            db_facts = _allowlisted(
+                row, ("id", "volume_id", "instance_uuid")
+            )
             api_facts = _allowlisted(
                 api,
                 (
                     "id", "volume_id", "server_id", "instance_uuid",
-                    "status", "attach_status", "attach_mode",
                 ),
             )
-            db_status = _field(row, "attach_status")
-            api_status = _field(api, "attach_status", "status")
-            if db_status != api_status:
+            db_status = _attachment_state(_field(row, "attach_status"))
+            api_status = _attachment_state(
+                _field(api, "attach_status", "status")
+            )
+            db_mode = _attachment_mode(_field(row, "attach_mode"))
+            api_mode = _attachment_mode(_field(api, "attach_mode"))
+            if None in {db_status, api_status, db_mode, api_mode}:
+                result.blockers.append(
+                    f"attachment state or mode invalid: {attachment_id}"
+                )
+            if db_status is not None and api_status is not None:
+                db_facts["attach_status"] = db_status
+                api_facts["status"] = api_status
+            if db_mode is not None and api_mode is not None:
+                db_facts["attach_mode"] = db_mode
+                api_facts["attach_mode"] = api_mode
+            if (
+                db_status is not None
+                and api_status is not None
+                and db_status != api_status
+            ):
                 result.blockers.append(
                     f"attachment API/DB status mismatch: {attachment_id}"
                 )
-            db_mode = _field(row, "attach_mode")
-            api_mode = _field(api, "attach_mode")
-            if db_mode != api_mode:
+            if (
+                db_mode is not None
+                and api_mode is not None
+                and db_mode != api_mode
+            ):
                 result.blockers.append(
                     f"attachment API/DB mode mismatch: {attachment_id}"
                 )
@@ -622,9 +793,9 @@ class CinderCollector:
             facts["api_observed"] = api_facts
             connection_info = _field(row, "connection_info")
             connector = _field(row, "connector")
-            summary = _connection_summary(connection_info)
+            summary = _connection_summary(connection_info, connector)
             if (
-                _field(row, "attach_status") in {"attached", "attaching"}
+                db_status in {"attached", "attaching"}
                 and (
                     _parse_mapping(connection_info) is None
                     or _parse_mapping(connector) is None
@@ -634,7 +805,7 @@ class CinderCollector:
                     f"active attachment connection metadata invalid: {attachment_id}"
                 )
             if (
-                _field(row, "attach_status") in {"attached", "attaching"}
+                db_status in {"attached", "attaching"}
                 and not _active_connection_evidence_valid(
                     connection_info, connector, summary
                 )
@@ -796,24 +967,89 @@ class CinderCollector:
                     result.blockers.append(
                         f"volume API/DB {label} mismatch: {volume_id}"
                     )
-            for field in ("host", "cluster_name"):
-                if _volume_api_field(api, field) != _field(row, field):
-                    result.blockers.append(
-                        f"volume API/DB {field} mismatch: {volume_id}"
-                    )
+            db_host_components = _cinder_host_components(_field(row, "host"))
+            api_host_components = _cinder_host_components(
+                _volume_api_field(api, "host")
+            )
+            db_cluster_components = _cluster_components(
+                _field(row, "cluster_name")
+            )
+            api_cluster_components = _cluster_components(
+                _volume_api_field(api, "cluster_name")
+            )
+            storage_backend_id = _component(
+                _field(row, "storage_backend_id")
+            )
+            if (
+                db_host_components is None
+                or api_host_components is None
+                or db_cluster_components is None
+                or api_cluster_components is None
+                or storage_backend_id is None
+                or db_host_components["backend_name"]
+                != db_cluster_components["backend_name"]
+                or api_host_components["backend_name"]
+                != api_cluster_components["backend_name"]
+            ):
+                result.blockers.append(
+                    "Cinder host/backend/cluster facts invalid"
+                )
+            if (
+                db_host_components is not None
+                and api_host_components is not None
+                and db_host_components != api_host_components
+            ):
+                result.blockers.append(
+                    f"volume API/DB host mismatch: {volume_id}"
+                )
+            if (
+                db_cluster_components is not None
+                and api_cluster_components is not None
+                and db_cluster_components != api_cluster_components
+            ):
+                result.blockers.append(
+                    f"volume API/DB cluster_name mismatch: {volume_id}"
+                )
             facts = _allowlisted(row, _VOLUME_FIELDS)
             api_facts = _allowlisted(api, _API_VOLUME_FIELDS)
-            for field in ("host", "service_uuid"):
-                safe = _safe_value(_volume_api_field(api, field))
-                if safe is not None:
-                    api_facts[field] = safe
+            for unsafe_field in ("host", "cluster_name", "storage_backend_id"):
+                facts.pop(unsafe_field, None)
+                api_facts.pop(unsafe_field, None)
+            if db_host_components is not None:
+                facts["host"] = _canonical_host(db_host_components)
+                facts["host_components"] = deepcopy(db_host_components)
+            if db_cluster_components is not None:
+                facts["cluster_name"] = _canonical_cluster(
+                    db_cluster_components
+                )
+                facts["cluster_components"] = deepcopy(
+                    db_cluster_components
+                )
+            if storage_backend_id is not None:
+                facts["storage_backend_id"] = storage_backend_id
+            if api_host_components is not None:
+                api_facts["host"] = _canonical_host(api_host_components)
+                api_facts["host_components"] = deepcopy(api_host_components)
+            if api_cluster_components is not None:
+                api_facts["cluster_name"] = _canonical_cluster(
+                    api_cluster_components
+                )
+                api_facts["cluster_components"] = deepcopy(
+                    api_cluster_components
+                )
             facts["api_observed"] = api_facts
             facts["normalizations"] = {
                 "service_uuid": _row_id(row, "service_uuid"),
                 "volume_type_id": _row_id(row, "volume_type_id"),
-                "host": _safe_value(_field(row, "host")),
-                "cluster_name": _safe_value(_field(row, "cluster_name")),
             }
+            if db_host_components is not None:
+                facts["normalizations"]["host"] = _canonical_host(
+                    db_host_components
+                )
+            if db_cluster_components is not None:
+                facts["normalizations"]["cluster_name"] = _canonical_cluster(
+                    db_cluster_components
+                )
             for table, fact_name in (
                 ("volume_metadata", "metadata"),
                 ("volume_glance_metadata", "image_metadata"),
@@ -932,6 +1168,20 @@ class CinderCollector:
                     volume_backend_name = self._backend_name_from_host(
                         volume_host
                     )
+                    service_host_components = _cinder_host_components(
+                        service_host
+                    )
+                    service_cluster_components = _cluster_components(
+                        service_cluster
+                    )
+                    if (
+                        service_host_components is None
+                        or service_cluster_components is None
+                        or _component(service_backend_name) is None
+                    ):
+                        result.blockers.append(
+                            "Cinder host/backend/cluster facts invalid"
+                        )
                     if (
                         service_host != volume_host
                         or self._backend_name_from_host(service_host)
@@ -958,7 +1208,12 @@ class CinderCollector:
                         and isinstance(service_host, str)
                         and _SENSITIVE.search(service_host) is None
                     ):
-                        service_facts["host"] = service_host
+                        service_facts["host"] = _canonical_host(
+                            service_host_components
+                        )
+                        service_facts["host_components"] = deepcopy(
+                            service_host_components
+                        )
                     if (
                         service_cluster == volume_cluster
                         and self._backend_name_from_cluster(service_cluster)
@@ -966,7 +1221,12 @@ class CinderCollector:
                         and isinstance(service_cluster, str)
                         and _SENSITIVE.search(service_cluster) is None
                     ):
-                        service_facts["cluster_name"] = service_cluster
+                        service_facts["cluster_name"] = _canonical_cluster(
+                            service_cluster_components
+                        )
+                        service_facts["cluster_components"] = deepcopy(
+                            service_cluster_components
+                        )
                     if _field(service_row, "binary") == "cinder-volume":
                         service_facts["binary"] = "cinder-volume"
                     disabled = _typed_bool(_field(service_row, "disabled"))
@@ -982,15 +1242,23 @@ class CinderCollector:
             else:
                 result.blockers.append(f"Cinder service UUID missing: {volume_id}")
 
-            backend_id = _field(row, "storage_backend_id") or self._backend_from_host(_field(row, "host"))
-            if isinstance(backend_id, str) and _BACKEND_ID.fullmatch(backend_id):
-                add_node("storage_backend", backend_id, {
-                    "host": _safe_value(_field(row, "host")),
-                    "cluster_name": _safe_value(_field(row, "cluster_name")),
-                })
+            backend_id = storage_backend_id
+            if backend_id is not None:
+                backend_facts: Dict[str, Any] = {}
+                if db_host_components is not None:
+                    backend_facts["host_components"] = deepcopy(
+                        db_host_components
+                    )
+                if db_cluster_components is not None:
+                    backend_facts["cluster_components"] = deepcopy(
+                        db_cluster_components
+                    )
+                add_node("storage_backend", backend_id, backend_facts)
                 add_edge(volume.key, f"storage_backend:{backend_id}", "has_backing_backend")
             else:
-                result.blockers.append(f"storage backend identifier invalid: {volume_id}")
+                result.blockers.append(
+                    "Cinder host/backend/cluster facts invalid"
+                )
 
             encrypted = type_id in encryption_type_ids
             key_id = _row_id(row, "encryption_key_id")
@@ -1142,16 +1410,41 @@ class CinderCollector:
                         api_observed: Dict[str, Any] = {}
                         api_cluster = _field(matches[0], "cluster_name")
                         api_binary = _field(matches[0], "binary")
-                        if api_host == db_host:
-                            api_observed["host"] = api_host
+                        api_host_components = _cinder_host_components(api_host)
+                        db_host_components = _cinder_host_components(db_host)
+                        api_cluster_components = _cluster_components(api_cluster)
+                        db_cluster_components = _cluster_components(
+                            _field(db_service, "cluster_name")
+                        )
+                        if (
+                            api_host_components is None
+                            or db_host_components is None
+                            or api_cluster_components is None
+                            or db_cluster_components is None
+                        ):
+                            result.blockers.append(
+                                "Cinder host/backend/cluster facts invalid"
+                            )
+                        if (
+                            api_host_components is not None
+                            and api_host_components == db_host_components
+                        ):
+                            api_observed["host"] = _canonical_host(
+                                api_host_components
+                            )
                         if api_binary == "cinder-volume":
                             api_observed["binary"] = "cinder-volume"
                         if isinstance(status, str) and status.lower() == "enabled":
                             api_observed["status"] = "enabled"
                         if isinstance(state, str) and state.lower() == "up":
                             api_observed["state"] = "up"
-                        if api_cluster == _field(db_service, "cluster_name"):
-                            api_observed["cluster_name"] = api_cluster
+                        if (
+                            api_cluster_components is not None
+                            and api_cluster_components == db_cluster_components
+                        ):
+                            api_observed["cluster_name"] = _canonical_cluster(
+                                api_cluster_components
+                            )
                         api_backend_name = self._backend_name_from_host(api_host)
                         if (
                             api_backend_name is not None
@@ -1312,25 +1605,23 @@ class CinderCollector:
 
     @staticmethod
     def _backend_from_host(value: object) -> Optional[str]:
-        if not isinstance(value, str) or "@" not in value:
+        components = _cinder_host_components(value)
+        if components is None:
             return None
-        backend = value.split("@", 1)[1]
-        return backend if _BACKEND_ID.fullmatch(backend) else None
+        suffix = (
+            f"#{components['pool']}" if "pool" in components else ""
+        )
+        return f"{components['backend_name']}{suffix}"
 
     @staticmethod
     def _backend_name_from_host(value: object) -> Optional[str]:
-        backend = CinderCollector._backend_from_host(value)
-        if backend is None:
-            return None
-        name = backend.split("#", 1)[0]
-        return name if _BACKEND_ID.fullmatch(name) else None
+        components = _cinder_host_components(value)
+        return components["backend_name"] if components is not None else None
 
     @staticmethod
     def _backend_name_from_cluster(value: object) -> Optional[str]:
-        if not isinstance(value, str) or "@" not in value:
-            return None
-        backend = value.rsplit("@", 1)[1]
-        return backend if _BACKEND_ID.fullmatch(backend) else None
+        components = _cluster_components(value)
+        return components["backend_name"] if components is not None else None
 
     @staticmethod
     def _validate_required_edges(result: CollectorResult):

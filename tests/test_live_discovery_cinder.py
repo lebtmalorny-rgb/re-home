@@ -371,6 +371,119 @@ class CinderCollectorTests(unittest.TestCase):
                 result, _ = collect_from_fixture(fixture)
                 self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
 
+    def test_driver_connector_and_multipath_applicability_matrix(self):
+        valid_cases = (
+            (
+                {"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"], "multipath": False}},
+                {"initiator": "iqn.connector"},
+            ),
+            (
+                {"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"]}},
+                {"initiator": "iqn.connector", "multipath": False},
+            ),
+            (
+                {"driver_volume_type": "fibre_channel", "data": {"target_wwns": ["wwn1"], "multipath": True}},
+                {"wwpns": ["connector-wwpn"]},
+            ),
+            (
+                {"driver_volume_type": "rbd", "data": {"name": "pool/image", "hosts": ["mon1"]}},
+                {"host": "compute-1"},
+            ),
+            (
+                {"driver_volume_type": "nfs", "data": {"export": "nfs:/volumes/volume-1"}},
+                {"host": "compute-1"},
+            ),
+        )
+        for connection_info, connector in valid_cases:
+            with self.subTest(driver=connection_info["driver_volume_type"]):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0]["connection_info"] = json.dumps(connection_info)
+                fixture["tables"]["volume_attachment"][0]["connector"] = json.dumps(connector)
+                result, _ = collect_from_fixture(fixture)
+                self.assertNotIn("active attachment driver evidence invalid: attachment-1", result.blockers)
+
+        invalid_cases = (
+            (
+                {"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"], "multipath": False}},
+                {"host": "compute-1"},
+            ),
+            (
+                {"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"]}},
+                {"initiator": "iqn.connector"},
+            ),
+            (
+                {"driver_volume_type": "fibre_channel", "data": {"target_wwns": ["wwn1"], "multipath": False}},
+                {"host": "compute-1"},
+            ),
+        )
+        for connection_info, connector in invalid_cases:
+            with self.subTest(invalid=connection_info["driver_volume_type"], connector=connector):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0]["connection_info"] = json.dumps(connection_info)
+                fixture["tables"]["volume_attachment"][0]["connector"] = json.dumps(connector)
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
+
+    def test_attachment_state_and_mode_are_canonical_enums(self):
+        cases = (("attach_status", "status", "attached-secret-state"), ("attach_mode", "attach_mode", "rw-secret-mode"))
+        for db_field, api_field, sentinel in cases:
+            with self.subTest(field=db_field):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0][db_field] = sentinel
+                fixture["openstack"][1]["payload"][api_field] = sentinel
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("attachment state or mode invalid: attachment-1", result.blockers)
+                self.assertNotIn(sentinel, json.dumps(result.to_dict()))
+
+    def test_invalid_host_backend_cluster_never_serialize_raw_values(self):
+        cases = (
+            ("host", "node@backend-secret-token#pool"),
+            ("cluster_name", "cluster@backend-secret-token"),
+            ("storage_backend_id", "backend-secret-token"),
+        )
+        for field, sentinel in cases:
+            with self.subTest(field=field):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volumes"][0][field] = sentinel
+                if field in {"host", "cluster_name"}:
+                    fixture["openstack"][0]["payload"][field] = sentinel
+                if field == "host":
+                    fixture["tables"]["services"][0]["host"] = sentinel
+                    fixture["openstack"][3]["payload"][0]["host"] = sentinel
+                if field == "cluster_name":
+                    fixture["tables"]["services"][0]["cluster_name"] = sentinel
+                    fixture["openstack"][3]["payload"][0]["cluster_name"] = sentinel
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("Cinder host/backend/cluster facts invalid", result.blockers)
+                self.assertNotIn(sentinel, json.dumps(result.to_dict()))
+
+    def test_sensitive_metadata_key_and_value_are_both_dropped(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["tables"]["volume_metadata"].append({
+            "volume_id": "volume-1", "key": "chap_password_must-not-leak",
+            "value": "credential-value-must-not-leak",
+        })
+        result, _ = collect_from_fixture(fixture)
+        serialized = json.dumps(result.to_dict())
+        self.assertNotIn("chap_password_must-not-leak", serialized)
+        self.assertNotIn("credential-value-must-not-leak", serialized)
+
+    def test_connection_json_is_bounded_by_bytes_and_depth(self):
+        nested = {"leaf": "value"}
+        for _ in range(24):
+            nested = {"nested": nested}
+        payloads = (
+            '{"driver_volume_type":"iscsi","padding":"' + ("x" * 70000) + '"}',
+            json.dumps(nested),
+        )
+        for payload in payloads:
+            with self.subTest(size=len(payload)):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0]["connection_info"] = payload
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("active attachment connection metadata invalid: attachment-1", result.blockers)
+                self.assertNotIn("x" * 256, json.dumps(result.to_dict()))
+
     def test_unsupported_driver_value_is_never_serialized(self):
         fixture = deepcopy(self.source_fixture)
         raw_driver = "vendor-secret-driver-token-must-not-leak"

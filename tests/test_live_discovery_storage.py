@@ -139,6 +139,24 @@ class StorageProbeTests(unittest.TestCase):
         self.assertNotIn("do-not-leak", json.dumps(check.to_dict()))
         self.assertNotIn("secret-target", json.dumps(check.to_dict()))
 
+    def test_storage_json_is_bounded_by_bytes_and_depth(self):
+        nested = {"size": 1}
+        for _ in range(24):
+            nested = {"nested": nested}
+        outputs = (
+            '{"size":1,"padding":"' + ("x" * 70000) + '"}',
+            json.dumps(nested),
+        )
+        for stdout in outputs:
+            with self.subTest(size=len(stdout)):
+                runner = RecordingRunner(stdout)
+                check = probe_storage("rbd", {
+                    "pool": "volumes", "allowed_pools": ["volumes"],
+                    "image": "volume-1", "expected_size": 1,
+                }, runner)
+                self.assertEqual("BLOCKED", check.status)
+                self.assertNotIn("x" * 256, json.dumps(check.to_dict()))
+
 
 if __name__ == "__main__":
     unittest.main()

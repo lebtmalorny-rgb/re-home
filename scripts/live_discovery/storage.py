@@ -8,6 +8,9 @@ from .contract import CheckResult
 
 _STORAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,254}$")
 _PATH_PART = re.compile(r"^[A-Za-z0-9_.:+@#-]+$")
+_MAX_JSON_BYTES = 65536
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 4096
 
 
 def _valid_name(value: object) -> Optional[str]:
@@ -62,20 +65,53 @@ def _json_size(payload: object) -> Optional[int]:
     return None
 
 
+def _bounded_json(stdout: str) -> Optional[object]:
+    try:
+        if len(stdout.encode("utf-8")) > _MAX_JSON_BYTES:
+            return None
+        payload = json.loads(stdout)
+        stack = [(payload, 0)]
+        visited = 0
+        while stack:
+            current, depth = stack.pop()
+            visited += 1
+            if visited > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+                return None
+            if isinstance(current, Mapping):
+                for key, value in current.items():
+                    if not isinstance(key, str):
+                        return None
+                    stack.append((value, depth + 1))
+            elif isinstance(current, (list, tuple)):
+                for value in current:
+                    stack.append((value, depth + 1))
+            elif current is not None and not isinstance(
+                current, (str, int, float, bool)
+            ):
+                return None
+        return payload
+    except (Exception, MemoryError, RecursionError):
+        return None
+
+
 def _parse_size(kind: str, stdout: object) -> Optional[int]:
     if not isinstance(stdout, str):
+        return None
+    try:
+        if len(stdout.encode("utf-8")) > _MAX_JSON_BYTES:
+            return None
+    except (Exception, MemoryError):
         return None
     if kind == "nfs":
         stripped = stdout.strip()
         if stripped.isdigit():
             return int(stripped)
         try:
-            return _json_size(json.loads(stripped))
-        except (json.JSONDecodeError, TypeError):
+            return _json_size(_bounded_json(stripped))
+        except (Exception, MemoryError, RecursionError):
             return None
-    try:
-        payload = json.loads(stdout)
-    except (json.JSONDecodeError, TypeError):
+    payload = _bounded_json(stdout)
+    if payload is None:
         return None
     if kind == "rbd":
         return _json_size(payload)
@@ -144,7 +180,12 @@ def probe_storage(kind: object, resource: object, runner) -> CheckResult:
         return CheckResult(
             f"cinder.storage.{normalized_kind}", "BLOCKED", "backing object is unreadable"
         )
-    actual = _parse_size(normalized_kind, getattr(evidence, "stdout", None))
+    try:
+        actual = _parse_size(
+            normalized_kind, getattr(evidence, "stdout", None)
+        )
+    except (Exception, MemoryError, RecursionError):
+        actual = None
     safe_evidence_id = getattr(evidence, "evidence_id", None)
     evidence_ids = [safe_evidence_id] if isinstance(safe_evidence_id, str) and safe_evidence_id else []
     if actual is None:
