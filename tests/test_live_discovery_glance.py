@@ -154,7 +154,53 @@ class GlanceCollectorTests(unittest.TestCase):
                 fixture = deepcopy(self.source_fixture)
                 mutate(fixture["openstack"][2]["payload"])
                 result, _ = collect_from_fixture(fixture, self.required())
-                self.assertTrue(result.unknowns)
+                self.assertTrue(result.unknowns or result.blockers)
+
+    def test_store_inventory_rejects_case_and_alias_collisions_strictly(self):
+        mutations = (
+            ("id-conflict", lambda row: row.__setitem__("id", "rbd")),
+            ("id-equal", lambda row: row.__setitem__("id", "file")),
+            ("default-conflict", lambda row: row.__setitem__("default", False)),
+            ("default-equal", lambda row: row.__setitem__("default", True)),
+            ("backend-conflict", lambda row: row.update({"Backend Type": "file", "store_type": "rbd"})),
+            ("backend-equal", lambda row: row.update({"Backend Type": "file", "store_type": "file"})),
+            ("non-string-key", lambda row: row.__setitem__(7, "secret-token")),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                fixture = deepcopy(self.source_fixture)
+                mutate(fixture["openstack"][2]["payload"][0])
+                result, _ = collect_from_fixture(fixture, self.required())
+                serialized = json.dumps(result.to_dict(), sort_keys=True)
+                self.assertIn("Glance store inventory row malformed", result.blockers)
+                self.assertNotIn("secret-token", serialized)
+
+        fixture = deepcopy(self.source_fixture)
+        fixture["openstack"][2]["payload"][0] = []
+        result, _ = collect_from_fixture(fixture, self.required())
+        self.assertIn("Glance store inventory row malformed", result.blockers)
+
+    def test_store_capabilities_reject_alias_collisions_and_malformed_rows(self):
+        mutations = (
+            ("id-conflict", lambda row: row.__setitem__("id", "rbd")),
+            ("id-equal", lambda row: row.__setitem__("id", "file")),
+            ("type-conflict", lambda row: row.__setitem__("store_type", "rbd")),
+            ("type-equal", lambda row: row.__setitem__("store_type", "file")),
+            ("non-string-key", lambda row: row.__setitem__(7, "secret-token")),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                fixture = deepcopy(self.source_fixture)
+                mutate(fixture["store_capabilities"][0])
+                result, _ = collect_from_fixture(fixture, self.required())
+                serialized = json.dumps(result.to_dict(), sort_keys=True)
+                self.assertIn("Glance store capability row malformed", result.blockers)
+                self.assertNotIn("secret-token", serialized)
+
+        fixture = deepcopy(self.source_fixture)
+        fixture["store_capabilities"][0] = []
+        result, _ = collect_from_fixture(fixture, self.required())
+        self.assertIn("Glance store capability row malformed", result.blockers)
 
     def test_historical_image_warns_only_with_explicit_bdm_and_runtime_proof(self):
         result, client = collect_from_fixture(self.source_fixture, self.historical())

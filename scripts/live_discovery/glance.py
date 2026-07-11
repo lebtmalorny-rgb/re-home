@@ -65,6 +65,7 @@ _PROPERTY_FIELDS = {
 _MAX_BYTES = 64 * 1024
 _MAX_DEPTH = 16
 _MAX_NODES = 4096
+_MALFORMED = object()
 
 
 def _id(value: object, allow_fixture_aliases: bool = False) -> Optional[str]:
@@ -81,21 +82,45 @@ def _id(value: object, allow_fixture_aliases: bool = False) -> Optional[str]:
     return None
 
 
-def _field(payload: object, *names: str) -> Any:
+def _normalized_mapping(payload: object) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, Mapping):
         return None
-    for name in names:
-        if name in payload:
-            return payload[name]
-    normalized = {
-        re.sub(r"[ -]+", "_", str(key).lower()): value
-        for key, value in payload.items()
-    }
-    for name in names:
-        key = re.sub(r"[ -]+", "_", name.lower())
-        if key in normalized:
-            return normalized[key]
+    normalized: Dict[str, Any] = {}
+    try:
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                return None
+            semantic_key = re.sub(r"[ -]+", "_", key.lower())
+            if not semantic_key or semantic_key in normalized:
+                return None
+            normalized[semantic_key] = value
+    except (Exception, MemoryError, RecursionError):
+        return None
+    return normalized
+
+
+def _normalized_alias(
+    normalized: Mapping[str, Any], names: Tuple[str, ...]
+) -> Any:
+    aliases = tuple(
+        dict.fromkeys(re.sub(r"[ -]+", "_", name.lower()) for name in names)
+    )
+    present = [normalized[name] for name in aliases if name in normalized]
+    if len(present) > 1:
+        return _MALFORMED
+    if present:
+        return present[0]
     return None
+
+
+def _field(payload: object, *names: str) -> Any:
+    normalized = _normalized_mapping(payload)
+    if normalized is None:
+        return None
+    value = _normalized_alias(normalized, tuple(names))
+    if value is _MALFORMED:
+        return None
+    return value
 
 
 def _bounded(value: object) -> bool:
@@ -203,8 +228,11 @@ def _store_ids(value: object) -> Optional[List[str]]:
 def _location(value: object) -> Optional[Tuple[str, str, str]]:
     if not isinstance(value, Mapping) or not _bounded(value):
         return None
-    raw_url = value.get("url")
-    metadata = value.get("metadata")
+    normalized = _normalized_mapping(value)
+    if normalized is None:
+        return None
+    raw_url = _normalized_alias(normalized, ("url",))
+    metadata = _normalized_alias(normalized, ("metadata",))
     if not isinstance(raw_url, str) or not isinstance(metadata, Mapping):
         return None
     store_id = _safe_name(_field(metadata, "store", "store_id", "backend"))
@@ -233,12 +261,16 @@ def _location(value: object) -> Optional[Tuple[str, str, str]]:
 
 
 def _sanitize_evidence(evidence: object) -> Optional[Dict[str, str]]:
-    if not isinstance(evidence, Mapping):
+    normalized = _normalized_mapping(evidence)
+    if normalized is None:
         return None
-    for name in ("evidence_id", "id"):
-        value = evidence.get(name)
-        if _safe_name(value) is not None:
-            return {name: value}
+    value = _normalized_alias(normalized, ("evidence_id", "id"))
+    if value is _MALFORMED or _safe_name(value) is None:
+        return None
+    if "evidence_id" in normalized:
+        return {"evidence_id": value}
+    if "id" in normalized:
+        return {"id": value}
     return None
 
 
@@ -281,6 +313,7 @@ class GlanceCollector:
             f"glance-{self.side}-stores-info", result, required=any(
                 item["required"] for item in requirements.values()
             ),
+            invalid_payload_blocker="Glance store inventory row malformed",
         )
         capabilities_payload = None
         capabilities_evidence = None
@@ -295,10 +328,11 @@ class GlanceCollector:
                 sanitized_capability_evidence = _sanitize_evidence(
                     raw_evidence
                 )
-                if (
-                    _bounded(candidate)
-                    and sanitized_capability_evidence is not None
-                ):
+                if not _bounded(candidate):
+                    result.blockers.append(
+                        "Glance store capability row malformed"
+                    )
+                elif sanitized_capability_evidence is not None:
                     capabilities_payload = deepcopy(candidate)
                     capabilities_evidence = sanitized_capability_evidence
             except Exception:
@@ -389,7 +423,7 @@ class GlanceCollector:
 
     def _api(
         self, command, evidence_id, result, required=True,
-        tolerate_missing=False,
+        tolerate_missing=False, invalid_payload_blocker=None,
     ):
         try:
             payload, evidence = self.client.json(command, evidence_id, required=required)
@@ -404,7 +438,10 @@ class GlanceCollector:
                 result.unknowns.append("Glance API evidence unavailable")
             return None, None
         if not _bounded(payload):
-            result.unknowns.append("Glance API evidence exceeds safety bounds")
+            if invalid_payload_blocker is not None:
+                result.blockers.append(invalid_payload_blocker)
+            else:
+                result.unknowns.append("Glance API evidence exceeds safety bounds")
             return None, _sanitize_evidence(evidence)
         return deepcopy(payload), _sanitize_evidence(evidence)
 
@@ -421,18 +458,32 @@ class GlanceCollector:
                 capabilities_invalid = True
             else:
                 for item in capabilities_payload:
-                    store_id = _safe_name(
-                        _field(item, "store_id", "id")
-                    ) if isinstance(item, Mapping) else None
-                    if store_id is None or store_id in capabilities:
+                    normalized = _normalized_mapping(item)
+                    if normalized is None:
+                        capabilities_invalid = True
+                        continue
+                    raw_store_id = _normalized_alias(
+                        normalized, ("store_id", "id")
+                    )
+                    raw_backend_type = _normalized_alias(
+                        normalized,
+                        ("backend_type", "store_type", "driver_type"),
+                    )
+                    store_id = _safe_name(raw_store_id)
+                    if (
+                        raw_store_id is _MALFORMED
+                        or raw_backend_type is _MALFORMED
+                        or store_id is None
+                        or store_id in capabilities
+                    ):
                         capabilities_invalid = True
                         continue
                     capabilities[store_id] = _backend_evidence(
-                        _field(item, "backend_type", "store_type", "driver_type")
+                        raw_backend_type
                     )
         if capabilities_invalid:
-            result.unknowns.append(
-                "Glance store capability evidence ambiguous"
+            result.blockers.append(
+                "Glance store capability row malformed"
             )
             capabilities = {}
 
@@ -440,13 +491,22 @@ class GlanceCollector:
         defaults: List[str] = []
         invalid = False
         for item in payload:
-            store_id = _safe_name(_field(item, "id")) if isinstance(item, Mapping) else None
-            is_default = _field(item, "default") if isinstance(item, Mapping) else None
-            inline_backend_type = _field(
-                item, "backend_type", "store_type", "driver_type"
-            ) if isinstance(item, Mapping) else None
+            normalized = _normalized_mapping(item)
+            if normalized is None:
+                invalid = True
+                continue
+            raw_store_id = _normalized_alias(normalized, ("id",))
+            is_default = _normalized_alias(normalized, ("default",))
+            inline_backend_type = _normalized_alias(
+                normalized,
+                ("backend_type", "store_type", "driver_type"),
+            )
+            store_id = _safe_name(raw_store_id)
             if (
-                store_id is None
+                raw_store_id is _MALFORMED
+                or is_default is _MALFORMED
+                or inline_backend_type is _MALFORMED
+                or store_id is None
                 or not isinstance(is_default, bool)
                 or store_id in stores
             ):
@@ -466,7 +526,7 @@ class GlanceCollector:
             if is_default:
                 defaults.append(store_id)
         if invalid:
-            result.unknowns.append("Glance enabled store inventory ambiguous")
+            result.blockers.append("Glance store inventory row malformed")
             return {}, None
         if any(store_id not in stores for store_id in capabilities):
             result.unknowns.append(
