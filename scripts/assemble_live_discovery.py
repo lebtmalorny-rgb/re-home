@@ -97,6 +97,27 @@ def _bundle(path: Path):
     return [_collector(item) for item in payload["collectors"]], checks, payload
 
 
+_ROLE_REQUIREMENTS = {
+    "source-control": {
+        ("source", "nova"), ("source", "neutron"),
+        ("source", "cinder"), ("source", "glance"),
+    },
+    "target-control": {
+        ("target", "target-profile"), ("target", "runtime-capabilities"),
+        ("target", "neutron"), ("target", "cinder"),
+        ("target", "glance"),
+    },
+    "runtime": {("source", "runtime")},
+}
+
+
+def _validate_role(collectors, role):
+    expected = _ROLE_REQUIREMENTS[role]
+    actual = [(result.side, result.service) for result in collectors]
+    if len(actual) != len(set(actual)) or set(actual) != expected:
+        raise ValueError(f"{role} artifact role is invalid")
+
+
 def _fixture_paths(directory: Path):
     directory = Path(directory)
     if _has_symlink_component(directory) or not directory.is_dir():
@@ -104,10 +125,14 @@ def _fixture_paths(directory: Path):
     policy = directory / "schema-policy.json"
     if not policy.exists():
         policy = directory.parent / "schema-policy.json"
-    bundle = directory / "bundle.json"
-    if not bundle.exists():
-        bundle = directory.parent / "ready" / "bundle.json"
-    return [bundle, policy, directory / "status.json"]
+    ready = directory.parent / "ready"
+    role_paths = []
+    for name in ("source-control.json", "target-control.json", "runtime.json"):
+        candidate = directory / name
+        if not candidate.exists():
+            candidate = ready / name
+        role_paths.append(candidate)
+    return [*role_paths, policy, directory / "status.json"]
 
 
 def _directional_mapping(policy, capabilities):
@@ -163,18 +188,24 @@ def main(argv=None):
         parser.error("all live inputs are required")
     try:
         if args.fixture_dir is not None:
-            bundle_paths = [_fixture_paths(args.fixture_dir)[0]]
-            mapping_path = _fixture_paths(args.fixture_dir)[1]
-            fixture_status_path = _fixture_paths(args.fixture_dir)[2]
+            fixture_paths = _fixture_paths(args.fixture_dir)
+            role_paths = list(zip(fixture_paths[:3], ("source-control", "target-control", "runtime")))
+            mapping_path = fixture_paths[3]
+            fixture_status_path = fixture_paths[4]
         else:
-            bundle_paths = [args.source_control, args.target_control, args.runtime]
+            role_paths = [
+                (args.source_control, "source-control"),
+                (args.target_control, "target-control"),
+                (args.runtime, "runtime"),
+            ]
             mapping_path = args.schema_policy
             fixture_status_path = None
         collectors = []
         checks = []
         bundles = []
-        for path in bundle_paths:
+        for path, role in role_paths:
             new_collectors, new_checks, bundle = _bundle(path)
+            _validate_role(new_collectors, role)
             collectors.extend(new_collectors)
             checks.extend(new_checks)
             bundles.append(bundle)

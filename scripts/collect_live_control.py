@@ -3,23 +3,32 @@
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import sys
 import tempfile
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from live_discovery.mysql_json import build_json_row_query, uuid_in, validate_identifier
-from live_discovery.cinder import CinderCollector
+from live_discovery.mysql_json import build_json_row_query, validate_identifier
+from live_discovery.cinder import CinderCollector, CORE_TABLES as CINDER_CORE_TABLES, OPTIONAL_TABLES as CINDER_OPTIONAL_TABLES
+from live_discovery.contract import CheckResult, CollectorResult
 from live_discovery.glance import GlanceCollector
-from live_discovery.neutron import NeutronCollector
-from live_discovery.nova import NovaCollector
+from live_discovery.neutron import NeutronCollector, CORE_TABLES as NEUTRON_CORE_TABLES, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL_TABLE_FAMILIES
+from live_discovery.nova import NovaCollector, DB_SCHEMAS as NOVA_DB_SCHEMAS, DB_TABLES as NOVA_DB_TABLES
+from live_discovery.openstack import collect_target_profile
 from live_discovery.render import render_json
 from live_discovery.runner import ReadOnlyRunner, validate_select_only_sql
+from live_discovery.runtime import collect_target_capabilities
 from live_discovery.schema import parse_information_schema
+from live_discovery.storage import probe_storage
+from live_discovery.image_data import probe_image_data
 
 
 API_INPUT_VERSION = "openstack-rehome-control-api-input/v1alpha1"
@@ -29,6 +38,283 @@ BUNDLE_VERSION = "openstack-rehome-control-bundle/v1alpha1"
 _MAX_FILE = 8 * 1024 * 1024
 _MAX_LINES = 100_000
 _MAX_QUERIES = 512
+_SOURCE_NOVA_TABLES = {
+    "nova_api.host_mappings", "nova_api.instance_mappings",
+    "nova_api.request_specs", "nova.instances",
+    "nova.block_device_mapping", "nova.instance_info_caches",
+    "nova.compute_nodes", "nova.services",
+}
+_NEUTRON_CORE_TABLES = {
+    "neutron.ports", "neutron.networks", "neutron.subnets",
+    "neutron.ipallocations", "neutron.networksegments",
+    "neutron.ml2_port_bindings", "neutron.ml2_port_binding_levels",
+}
+_CINDER_CORE_TABLES = {
+    "cinder.volumes", "cinder.volume_attachment",
+    "cinder.volume_types", "cinder.services",
+}
+_SAFE_ROOT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,254}$")
+_TABLE_ROOT_FILTERS = {
+    "nova_api.host_mappings": (("hosts", "host"), ("cells", "cell_id")),
+    "nova_api.instance_mappings": (("instances", "instance_uuid"),),
+    "nova_api.request_specs": (("instances", "instance_uuid"),),
+    "nova.instances": (("instances", "uuid"),),
+    "nova.block_device_mapping": (("instances", "instance_uuid"),),
+    "nova.instance_info_caches": (("instances", "instance_uuid"),),
+    "nova.compute_nodes": (("compute_nodes", "uuid"), ("hosts", "host")),
+    "nova.services": (("services", "uuid"), ("hosts", "host")),
+    "neutron.ports": (("ports", "id"),),
+    "neutron.ipallocations": (("ports", "port_id"),),
+    "neutron.networks": (("networks", "id"),),
+    "neutron.subnets": (("subnets", "id"),),
+    "neutron.networksegments": (("networks", "network_id"),),
+    "neutron.ml2_port_bindings": (("ports", "port_id"),),
+    "neutron.ml2_distributed_port_bindings": (("ports", "port_id"),),
+    "neutron.ml2_port_binding_levels": (("ports", "port_id"),),
+    "neutron.securitygroupportbindings": (("ports", "port_id"),),
+    "neutron.securitygroups": (("security_groups", "id"),),
+    "neutron.securitygrouprules": (("security_groups", "security_group_id"),),
+    "neutron.allowedaddresspairs": (("ports", "port_id"),),
+    "neutron.portdnses": (("ports", "port_id"),),
+    "neutron.dnsnameservers": (("subnets", "subnet_id"),),
+    "neutron.extradhcpopts": (("ports", "port_id"),),
+    "neutron.qos_port_policy_bindings": (("ports", "port_id"),),
+    "neutron.qos_network_policy_bindings": (("networks", "network_id"),),
+    "neutron.qos_fip_policy_bindings": (("floating_ips", "fip_id"),),
+    "neutron.qos_policies": (("qos_policies", "id"),),
+    "neutron.trunks": (("ports", "port_id"), ("trunks", "id")),
+    "neutron.subports": (("ports", "port_id"), ("trunks", "trunk_id")),
+    "neutron.routers": (("routers", "id"),),
+    "neutron.routerports": (("ports", "port_id"),),
+    "neutron.routerroutes": (("routers", "router_id"),),
+    "neutron.floatingips": (("ports", "fixed_port_id"), ("floating_ips", "id")),
+    "neutron.portforwardings": (("ports", "internal_port_id"),),
+    "neutron.address_groups": (("address_groups", "id"),),
+    "neutron.address_associations": (("address_groups", "address_group_id"),),
+    "neutron.addressgrouprbacs": (("address_groups", "object_id"),),
+    "cinder.volumes": (("volumes", "id"),),
+    "cinder.volume_attachment": (("volumes", "volume_id"),),
+    "cinder.volume_types": (("volume_types", "id"),),
+    "cinder.services": (("cinder_services", "uuid"),),
+    "cinder.volume_type_extra_specs": (("volume_types", "volume_type_id"),),
+    "cinder.volume_type_projects": (("volume_types", "volume_type_id"),),
+    "cinder.volume_type_qos_specs": (("volume_types", "volume_type_id"),),
+    "cinder.qos_specs": (("qos_specs", "id"),),
+    "cinder.quality_of_service_specs": (("qos_specs", "specs_id"),),
+    "cinder.encryption": (("volume_types", "volume_type_id"),),
+    "cinder.snapshots": (("volumes", "volume_id"), ("snapshots", "id")),
+    "cinder.volume_metadata": (("volumes", "volume_id"),),
+    "cinder.volume_glance_metadata": (("volumes", "volume_id"),),
+    "cinder.volume_admin_metadata": (("volumes", "volume_id"),),
+    "cinder.groups": (("groups", "id"),),
+    "cinder.group_snapshots": (("group_snapshots", "id"),),
+}
+
+
+def _collector_table_catalog():
+    neutron = {
+        f"neutron.{table}" for table in (
+            set(NEUTRON_CORE_TABLES)
+            | {table for family in NEUTRON_OPTIONAL_TABLE_FAMILIES.values() for table in family}
+        )
+    }
+    cinder = {
+        f"cinder.{table}" for table in set(CINDER_CORE_TABLES) | set(CINDER_OPTIONAL_TABLES)
+    }
+    nova = {f"{NOVA_DB_SCHEMAS[table]}.{table}" for table in NOVA_DB_TABLES}
+    return {"nova": nova, "neutron": neutron, "cinder": cinder}
+
+
+def _expected_plan_tables(side, roots, available_tables):
+    catalog = _collector_table_catalog()
+    available = set(available_tables)
+    expected = set()
+    if side == "source":
+        if not catalog["nova"].issubset(available):
+            raise ValueError("required Nova schema table is missing")
+        expected.update(
+            table for table in catalog["nova"]
+            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+        )
+    if roots.get("ports"):
+        core = {f"neutron.{table}" for table in NEUTRON_CORE_TABLES}
+        if not core.issubset(available):
+            raise ValueError("required Neutron schema table is missing")
+        expected.update(
+            table for table in catalog["neutron"] & available
+            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+        )
+    if roots.get("volumes"):
+        core = {f"cinder.{table}" for table in CINDER_CORE_TABLES}
+        if not core.issubset(available):
+            raise ValueError("required Cinder schema table is missing")
+        expected.update(
+            table for table in catalog["cinder"] & available
+            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+        )
+    return expected
+
+
+def _canonical(value):
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _phase_binding(api_result, uuid_filters, query_plan):
+    return hashlib.sha256(_canonical({
+        "api_result": api_result,
+        "uuid_filters": uuid_filters,
+        "db_query_plan": query_plan,
+    }).encode("utf-8")).hexdigest()
+
+
+def _root_filter_values(api_result):
+    roots = api_result.get("roots")
+    if not isinstance(roots, dict):
+        raise ValueError("API UUID root manifest is missing")
+    values = set()
+    for name, items in roots.items():
+        if not isinstance(name, str) or not isinstance(items, list):
+            raise ValueError("API UUID root manifest is invalid")
+        for item in items:
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                values.add(item)
+            elif isinstance(item, str) and _SAFE_ROOT.fullmatch(item):
+                values.add(item)
+            else:
+                raise ValueError("API root filter value is invalid")
+    return values
+
+
+def _validate_query_coverage(side, api_result, queries):
+    identities = [
+        (query["schema"], query["table"], _canonical(query["filters"]))
+        for query in queries
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError("DB scoped query is duplicated")
+    present = {f"{query['schema']}.{query['table']}" for query in queries}
+    roots = api_result["roots"]
+    available = api_result.get("available_tables")
+    if not isinstance(available, list) or not all(isinstance(item, str) for item in available):
+        raise ValueError("live schema table inventory is missing")
+    required = _expected_plan_tables(side, roots, available)
+    if present != required:
+        raise ValueError("service DB query coverage differs from live schema scope")
+    allowed_values = _root_filter_values(api_result)
+    for query in queries:
+        for values in query["filters"].values():
+            if not set(values).issubset(allowed_values):
+                raise ValueError("DB query filter is not bound to API roots")
+        table = f"{query['schema']}.{query['table']}"
+        for column, values in query["filters"].items():
+            if not any(
+                planned_column == column and set(values).issubset(set(roots.get(category, [])))
+                for category, planned_column in _TABLE_ROOT_FILTERS.get(table, ())
+            ):
+                raise ValueError("DB query filter column differs from collector root scope")
+
+
+def _canonical_uuid(value):
+    try:
+        return str(uuid.UUID(value)) if isinstance(value, str) and str(uuid.UUID(value)) == value else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _scoped_in(column, values):
+    normalized = []
+    for value in values:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            normalized.append(str(value))
+        elif isinstance(value, str) and _SAFE_ROOT.fullmatch(value):
+            normalized.append("'" + value + "'")
+        else:
+            raise ValueError("invalid scoped filter value")
+    if not normalized:
+        raise ValueError("scoped filter requires values")
+    return f"`{validate_identifier(column)}` IN ({', '.join(normalized)})"
+
+
+def _load_protected_token(path):
+    candidate = Path(path)
+    if _has_symlink_component(candidate) or not candidate.is_file():
+        raise ValueError("Glance token file is unsafe")
+    metadata = candidate.stat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError("Glance token file permissions are unsafe")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise ValueError("Glance token file owner is unsafe")
+    if metadata.st_size <= 0 or metadata.st_size > 16 * 1024:
+        raise ValueError("Glance token file size is unsafe")
+    token = candidate.read_text(encoding="utf-8").strip()
+    if not token or "\r" in token or "\n" in token:
+        raise ValueError("Glance token value is unsafe")
+    return token
+
+
+def _execute_probe_config(config, runner, *, opener=None, token_loader=_load_protected_token):
+    if not isinstance(config, dict) or set(config) != {"schema_version", "storage", "glance"} or config.get("schema_version") != "openstack-rehome-probe-config/v1alpha1":
+        raise ValueError("probe configuration envelope is invalid")
+    if not isinstance(config["storage"], list) or len(config["storage"]) > 4096:
+        raise ValueError("storage probe configuration is invalid")
+    storage_results = []
+    for item in config["storage"]:
+        if not isinstance(item, dict) or set(item) != {"volume_id", "scope", "kind", "resource"}:
+            raise ValueError("storage probe row is invalid")
+        volume_id = _canonical_uuid(item["volume_id"])
+        if volume_id is None or item["scope"] not in {"source-compute", "target-storage"} or not isinstance(item["kind"], str):
+            raise ValueError("storage probe identity is invalid")
+        check = probe_storage(item["kind"], item["resource"], runner)
+        storage_results.append({
+            "volume_id": volume_id, "scope": item["scope"], "kind": item["kind"],
+            "status": check.status, "reason": check.reason,
+        })
+    glance = config["glance"]
+    if not isinstance(glance, dict) or set(glance) not in (
+        {"endpoint_url", "token_file", "images", "store_capabilities"},
+        {"endpoint_url", "token_env", "images", "store_capabilities"},
+    ):
+        raise ValueError("Glance probe configuration is invalid")
+    images = glance["images"]
+    stores = glance["store_capabilities"]
+    if not isinstance(images, list) or len(images) > 4096 or not isinstance(stores, list) or len(stores) > 4096:
+        raise ValueError("Glance probe configuration exceeds safety bounds")
+    normalized_stores = []
+    for item in stores:
+        if not isinstance(item, dict) or set(item) != {"store_id", "backend_type"} or not all(isinstance(value, str) and value for value in item.values()):
+            raise ValueError("Glance store capability is invalid")
+        normalized_stores.append(deepcopy(item))
+    if "token_file" in glance:
+        token = token_loader(glance["token_file"])
+    else:
+        variable = glance["token_env"]
+        if not isinstance(variable, str) or not variable or variable not in os.environ:
+            raise ValueError("Glance token environment reference is unavailable")
+        token = os.environ[variable]
+    image_results = []
+    try:
+        for item in images:
+            if not isinstance(item, dict) or set(item) != {"image_id", "expected_size", "required"}:
+                raise ValueError("Glance image probe row is invalid")
+            image_id = _canonical_uuid(item["image_id"])
+            if image_id is None or not isinstance(item["required"], bool):
+                raise ValueError("Glance image probe identity is invalid")
+            check = probe_image_data(
+                f"{glance['endpoint_url'].rstrip('/')}/v2/images/{image_id}/file",
+                token, item["expected_size"], opener=opener,
+                endpoint_url=glance["endpoint_url"], image_id=image_id,
+                required=item["required"],
+            )
+            image_results.append({
+                "image_id": image_id, "status": check.status, "reason": check.reason,
+            })
+    finally:
+        token = None
+    return {
+        "storage_probe_results": storage_results,
+        "glance_data_probe_results": image_results,
+        "glance_store_capabilities": normalized_stores,
+    }
 
 
 class _CombinedClient:
@@ -36,6 +322,7 @@ class _CombinedClient:
 
     def __init__(self, side, api_result, records, evidence):
         self.side = side
+        self._api_result = deepcopy(api_result)
         self._api = {}
         for item in api_result.get("openstack", []):
             if not isinstance(item, dict) or set(item) != {"command", "payload", "evidence"} or not isinstance(item["command"], list):
@@ -44,8 +331,10 @@ class _CombinedClient:
             if key in self._api:
                 raise ValueError("cached OpenStack response is duplicated")
             self._api[key] = (deepcopy(item["payload"]), deepcopy(item["evidence"]))
-        self._records = records
-        self._evidence = {f"{item['schema']}.{item['table']}": item for item in evidence}
+        if not isinstance(records, list) or not isinstance(evidence, list):
+            raise ValueError("cached DB transport is invalid")
+        self._records = deepcopy(records)
+        self._evidence = deepcopy(evidence)
 
     def json(self, command, evidence_id, required=True):
         del evidence_id, required
@@ -55,14 +344,82 @@ class _CombinedClient:
         return deepcopy(self._api[key])
 
     def db_records(self, table, filters=None):
-        matches = [key for key in self._records if key.endswith(f".{table}")]
+        matches = [
+            item for item in self._records
+            if item["table"] == table
+            and (filters is None or item["filters"] == filters)
+        ]
         if len(matches) != 1:
             return [], {"evidence_id": f"{self.side}-db:unknown.{table}"}
-        key = matches[0]
-        evidence = deepcopy(self._evidence[key])
-        if filters is not None and evidence.get("filters") != filters:
-            raise ValueError("collector DB filter differs from executed query")
-        return deepcopy(self._records[key]), evidence
+        match = matches[0]
+        evidence_matches = [
+            item for item in self._evidence
+            if item["schema"] == match["schema"]
+            and item["table"] == match["table"]
+            and item["filters"] == match["filters"]
+        ]
+        if len(evidence_matches) != 1:
+            raise ValueError("collector DB evidence identity is ambiguous")
+        return deepcopy(match["rows"]), deepcopy(evidence_matches[0])
+
+    def glance_store_capabilities(self, evidence_id):
+        values = self._api_result.get("glance_store_capabilities", [])
+        if not isinstance(values, list):
+            raise ValueError("Glance store capabilities are invalid")
+        normalized = []
+        for item in values:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"store_id", "backend_type"}
+                or not all(isinstance(item[key], str) and item[key] for key in item)
+            ):
+                raise ValueError("Glance store capability row is invalid")
+            normalized.append(deepcopy(item))
+        return normalized, {"evidence_id": evidence_id}
+
+    def probe_image_data(self, image_id, expected_size, required):
+        del expected_size, required
+        values = self._api_result.get("glance_data_probe_results", [])
+        if not isinstance(values, list):
+            values = []
+        matches = [
+            item for item in values
+            if isinstance(item, dict) and item.get("image_id") == image_id
+        ]
+        if len(matches) != 1 or set(matches[0]) != {"image_id", "status", "reason"}:
+            return CheckResult(
+                f"glance.image-data.{image_id}", "UNKNOWN",
+                "Glance image data probe evidence is missing",
+            )
+        status = matches[0].get("status")
+        if status not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"}:
+            status = "UNKNOWN"
+        reason = {
+            "PASS": "Glance image data byte is readable",
+            "WARN": "Glance image data probe completed with warning",
+            "UNKNOWN": "Glance image data probe is inconclusive",
+            "BLOCKED": "Glance image data probe blocked",
+        }[status]
+        return CheckResult(
+            f"glance.image-data.{image_id}", status, reason,
+            [f"image:{image_id}"],
+        )
+
+
+class _CachedCapabilityRunner:
+    def __init__(self, outputs):
+        self.outputs = outputs if isinstance(outputs, dict) else {}
+        self.side = "target"
+
+    def run(self, argv, evidence_id, sensitive_stdout=False):
+        del argv, sensitive_stdout
+        if evidence_id not in self.outputs or not isinstance(self.outputs[evidence_id], str):
+            raise RuntimeError("cached target capability output is missing")
+        return type("Evidence", (), {
+            "stdout": self.outputs[evidence_id], "stderr": "", "returncode": 0,
+            "evidence_id": evidence_id,
+            "to_dict": lambda instance: {"evidence_id": instance.evidence_id},
+        })()
 
 
 def _dependency_ids(result, kind):
@@ -72,6 +429,61 @@ def _dependency_ids(result, kind):
         for edge in result.edges
         if edge.required and edge.target.startswith(prefix)
     })
+
+
+def _integrate_storage_readiness(result, volume_ids, api_result):
+    values = api_result.get("storage_probe_results", [])
+    if not isinstance(values, list):
+        values = []
+    for volume_id in volume_ids:
+        matches = [
+            item for item in values
+            if isinstance(item, dict) and item.get("volume_id") == volume_id
+        ]
+        scopes = set()
+        for item in matches:
+            if set(item) != {"volume_id", "scope", "kind", "status", "reason"}:
+                continue
+            scope = item["scope"]
+            kind = item["kind"]
+            status = item["status"]
+            if (
+                scope not in {"source-compute", "target-storage"}
+                or not isinstance(kind, str) or not kind
+                or status not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"}
+            ):
+                continue
+            scopes.add(scope)
+            reason = {
+                "PASS": "backing object is readable with expected size",
+                "WARN": "backing object probe completed with warning",
+                "UNKNOWN": (
+                    "storage driver is unsupported"
+                    if kind not in {"nfs", "file", "rbd", "lvm"}
+                    else "backing object probe is inconclusive"
+                ),
+                "BLOCKED": "backing object probe blocked",
+            }[status]
+            result.checks.append(CheckResult(
+                f"cinder.storage.{scope}.{kind}", status, reason,
+                [f"volume:{volume_id}"],
+            ))
+            if status == "BLOCKED" and reason not in result.blockers:
+                result.blockers.append(reason)
+            if status == "UNKNOWN" and reason not in result.unknowns:
+                result.unknowns.append(reason)
+        required_scopes = (
+            {"source-compute"} if result.side == "source" else {"target-storage"}
+        )
+        for missing_scope in sorted(required_scopes - scopes):
+            result.unknowns.append(
+                f"storage probe evidence missing: {volume_id} {missing_scope}"
+            )
+            result.checks.append(CheckResult(
+                f"cinder.storage.{missing_scope}.missing.{volume_id}",
+                "UNKNOWN", "required storage probe evidence is missing",
+                [f"volume:{volume_id}"],
+            ))
 
 
 def _compose_collectors(side, api_result, records, evidence, snapshot):
@@ -88,18 +500,25 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
             if node.kind == "instance" and isinstance(node.facts.get("project_id"), str)
         })
     else:
-        port_ids = list(api_result.get("port_ids", []))
-        volume_ids = list(api_result.get("volume_ids", []))
-        image_ids = list(api_result.get("image_ids", []))
-        project_ids = list(api_result.get("project_ids", []))
-        # Target profile acquisition needs container/runtime probes not present in
-        # DB JSONL phase; keep that missing capability explicit and fail-closed.
-        from live_discovery.contract import CollectorResult
-        profile = CollectorResult(service="target-profile", side="target")
-        profile.unknowns.append("target profile runtime evidence is unavailable in control combine")
-        results.append(profile)
+        roots = api_result.get("roots", {})
+        port_ids = list(roots.get("ports", []))
+        volume_ids = list(roots.get("volumes", []))
+        image_ids = list(roots.get("images", []))
+        project_ids = list(roots.get("projects", []))
+        results.append(collect_target_profile(
+            client,
+            api_result.get("target_manage_outputs", {}),
+            api_result.get("target_image_inspects", {}),
+        ))
+        results.append(collect_target_capabilities(
+            _CachedCapabilityRunner(api_result.get("target_runtime_outputs", {})),
+            api_result.get("target_virsh_argv", ["virsh"]),
+            api_result.get("target_qemu_argv", ["qemu-system-x86_64"]),
+        ))
     results.append(NeutronCollector(client, side, snapshot).collect(port_ids))
-    results.append(CinderCollector(client, side, snapshot).collect(volume_ids))
+    cinder = CinderCollector(client, side, snapshot).collect(volume_ids)
+    _integrate_storage_readiness(cinder, volume_ids, api_result)
+    results.append(cinder)
     requirements = {
         image_id: {
             "required": True,
@@ -125,6 +544,19 @@ def _read_json(path):
         raise ValueError("input file is unsafe")
     with path.open("r", encoding="utf-8") as stream:
         return json.load(stream)
+
+
+def _read_protected_json(path):
+    candidate = Path(path)
+    payload = _read_json(candidate)
+    metadata = candidate.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+    ):
+        raise ValueError("protected probe configuration permissions are unsafe")
+    return payload
 
 
 def _safe_out(path):
@@ -153,20 +585,33 @@ def _write_directory(path, files):
 
 
 def _request(item, index):
-    allowed = {"schema", "table", "columns", "filter_column", "filter_values"}
-    if not isinstance(item, dict) or set(item) != allowed:
+    single = {"schema", "table", "columns", "filter_column", "filter_values"}
+    multiple = {"schema", "table", "columns", "filters"}
+    if not isinstance(item, dict) or set(item) not in (single, multiple):
         raise ValueError("query request is invalid")
     schema = validate_identifier(item["schema"])
     table = validate_identifier(item["table"])
     columns = item["columns"]
-    values = item["filter_values"]
-    column = validate_identifier(item["filter_column"])
-    if not isinstance(columns, list) or not columns or not isinstance(values, list) or not values:
+    if not isinstance(columns, list) or not columns:
         raise ValueError("query request is unscoped")
     columns = [validate_identifier(value) for value in columns]
     if len(columns) != len(set(columns)):
         raise ValueError("query columns are duplicated")
-    where = uuid_in(column, values)
+    raw_filters = (
+        {item["filter_column"]: item["filter_values"]}
+        if set(item) == single else item["filters"]
+    )
+    if not isinstance(raw_filters, dict) or not raw_filters:
+        raise ValueError("query request is unscoped")
+    filters = {}
+    for raw_column, values in raw_filters.items():
+        column = validate_identifier(raw_column)
+        if not isinstance(values, list) or not values:
+            raise ValueError("query request is unscoped")
+        filters[column] = list(values)
+    where = "(" + ") OR (".join(
+        _scoped_in(column, filters[column]) for column in sorted(filters)
+    ) + ")"
     sql = build_json_row_query(schema, table, columns, where)
     filename = f"{index:04d}-{schema}-{table}"
     return {
@@ -174,42 +619,214 @@ def _request(item, index):
         "schema": schema,
         "table": table,
         "columns": columns,
-        "filters": {column: values},
+        "filters": filters,
         "sql": sql,
         "jsonl_file": filename + ".jsonl",
         "rc_file": filename + ".rc",
     }
 
 
+def _auto_requests(side, snapshot, roots):
+    expected = _expected_plan_tables(side, roots, snapshot.tables.keys())
+    requests = []
+    for identity in sorted(expected):
+        schema, table = identity.split(".", 1)
+        columns_by_name = snapshot.tables[identity]
+        columns = [
+            column.name for column in sorted(
+                columns_by_name.values(), key=lambda item: item.ordinal
+            )
+            if re.search(
+                r"password|passwd|token|secret|chap|credential|connector|connection[_-]?(?:info|data)",
+                column.name, re.IGNORECASE,
+            ) is None
+        ]
+        active_filters = []
+        for category, filter_column in _TABLE_ROOT_FILTERS[identity]:
+            values = roots.get(category, [])
+            if not values:
+                continue
+            if filter_column not in columns_by_name:
+                raise ValueError(f"live schema filter column is missing: {identity}.{filter_column}")
+            if filter_column not in columns:
+                columns.append(filter_column)
+            active_filters.append((filter_column, list(values)))
+        if not active_filters:
+            continue
+        groups = (
+            [{column: values} for column, values in active_filters]
+            if identity in {"neutron.trunks", "neutron.subports"}
+            else [dict(active_filters)]
+            if identity in {"neutron.floatingips", "cinder.snapshots"}
+            else [{active_filters[0][0]: active_filters[0][1]}]
+        )
+        for filters in groups:
+            requests.append({
+                "schema": schema, "table": table, "columns": columns,
+                "filters": filters,
+            })
+    return requests
+
+
+def _payload_ids(payload, *keys):
+    items = payload if isinstance(payload, list) else [payload]
+    values = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            raw = item.get(key)
+            if isinstance(raw, dict):
+                raw = raw.get("id") or raw.get("uuid")
+            if isinstance(raw, list):
+                candidates = raw
+            else:
+                candidates = [raw]
+            for candidate in candidates:
+                if _canonical_uuid(candidate) is not None:
+                    values.append(candidate)
+    return sorted(dict.fromkeys(values))
+
+
 def _api_phase(args):
     if args.fixture is None:
-        required = (args.rehome_host, args.cloud, args.clouds_file, args.container)
+        required = (
+            args.rehome_host, args.cloud, args.clouds_file, args.container,
+            args.information_schema,
+        )
         if not all(required):
             raise ValueError("live API arguments are incomplete")
-        # Live API collection is intentionally limited to the first, read-only root
-        # probe. Its output is then reviewed into explicit UUID query requests.
         from live_discovery.openstack import OpenStackClient
         client = OpenStackClient(ReadOnlyRunner(), args.cloud, args.container, str(args.clouds_file))
-        servers, evidence = client.json(["server", "list", "--all-projects", "--host", args.rehome_host, "--long", "-f", "json"], f"nova-{args.side}-server-list")
+        cached = []
+        def acquire(command, evidence_id):
+            value, evidence = client.json(command, evidence_id)
+            cached.append({"command": list(command), "payload": value, "evidence": evidence})
+            return value
+        server_command = ["server", "list", "--all-projects", "--host", args.rehome_host, "--long", "-f", "json"]
+        servers = acquire(server_command, f"nova-{args.side}-server-list-{args.rehome_host}")
         instance_ids = sorted({item.get("ID") or item.get("id") for item in servers if isinstance(item, dict) and (item.get("ID") or item.get("id"))})
-        command = ["server", "list", "--all-projects", "--host", args.rehome_host, "--long", "-f", "json"]
-        payload = {"schema_version": API_INPUT_VERSION, "side": args.side, "api_result": {"rehome_host": args.rehome_host, "servers": servers, "openstack": [{"command": command, "payload": servers, "evidence": evidence}]}, "requests": [{"schema": "nova", "table": "instances", "columns": ["uuid", "host", "project_id", "user_id"], "filter_column": "uuid", "filter_values": instance_ids}]}
+        roots = {
+            "hosts": [args.rehome_host], "instances": instance_ids,
+            "ports": [], "networks": [], "subnets": [], "security_groups": [],
+            "qos_policies": [], "trunks": [], "floating_ips": [], "routers": [],
+            "address_groups": [], "volumes": [], "volume_types": [],
+            "cinder_services": [], "qos_specs": [], "snapshots": [],
+            "groups": [], "group_snapshots": [], "images": [], "projects": [],
+            "services": [], "compute_nodes": [], "cells": [],
+        }
+        service_command = ["compute", "service", "list", "--host", args.rehome_host, "-f", "json"]
+        services = acquire(service_command, f"nova-{args.side}-compute-service-list-{args.rehome_host}")
+        roots["services"] = _payload_ids(services, "uuid", "UUID")
+        hypervisor_command = ["hypervisor", "show", args.rehome_host, "-f", "json"]
+        hypervisor = acquire(hypervisor_command, f"nova-{args.side}-hypervisor-show-{args.rehome_host}")
+        roots["compute_nodes"] = _payload_ids(hypervisor, "uuid")
+        provider_command = ["resource", "provider", "list", "--name", args.rehome_host, "-f", "json"]
+        acquire(provider_command, f"nova-{args.side}-resource-provider-list-{args.rehome_host}")
+        for instance_id in instance_ids:
+            server = acquire(["server", "show", instance_id, "-f", "json"], f"nova-{args.side}-server-show-{instance_id}")
+            roots["images"].extend(_payload_ids(server, "image", "image_id"))
+            roots["projects"].extend(_payload_ids(server, "project_id"))
+            ports = acquire(["port", "list", "--server", instance_id, "-f", "json"], f"neutron-{args.side}-port-list-{instance_id}")
+            roots["ports"].extend(_payload_ids(ports, "id", "ID"))
+            volumes = acquire(["server", "volume", "list", instance_id, "-f", "json"], f"cinder-{args.side}-server-volume-list-{instance_id}")
+            roots["volumes"].extend(_payload_ids(volumes, "id", "ID", "volume_id"))
+        for port_id in sorted(set(roots["ports"])):
+            port = acquire(["port", "show", port_id, "-f", "json"], f"neutron-{args.side}-port-show-{port_id}")
+            roots["networks"].extend(_payload_ids(port, "network_id"))
+            roots["security_groups"].extend(_payload_ids(port, "security_group_ids", "security_groups"))
+            roots["qos_policies"].extend(_payload_ids(port, "qos_policy_id"))
+            fixed_ips = port.get("fixed_ips", []) if isinstance(port, dict) else []
+            roots["subnets"].extend(_payload_ids(fixed_ips, "subnet_id"))
+        for volume_id in sorted(set(roots["volumes"])):
+            volume = acquire(["volume", "show", volume_id, "-f", "json"], f"cinder-{args.side}-volume-show-{volume_id}")
+            roots["volume_types"].extend(_payload_ids(volume, "volume_type_id", "type_id"))
+            roots["cinder_services"].extend(_payload_ids(volume, "service_uuid"))
+            roots["snapshots"].extend(_payload_ids(volume, "snapshot_id"))
+            roots["volumes"].extend(_payload_ids(volume, "source_volid"))
+            roots["groups"].extend(_payload_ids(volume, "group_id", "consistencygroup_id"))
+            roots["group_snapshots"].extend(_payload_ids(volume, "group_snapshot_id"))
+        if args.root_manifest is not None:
+            manifest = _read_json(args.root_manifest)
+            if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "side", "roots"} or manifest.get("schema_version") != "openstack-rehome-root-manifest/v1alpha1" or manifest.get("side") != args.side or not isinstance(manifest["roots"], dict):
+                raise ValueError("root manifest is invalid")
+            for category, values in manifest["roots"].items():
+                if category not in roots or not isinstance(values, list):
+                    raise ValueError("root manifest category is invalid")
+                roots[category].extend(values)
+        roots = {key: sorted(dict.fromkeys(values)) for key, values in roots.items()}
+        snapshot = parse_information_schema(args.information_schema)
+        api_result = {
+            "rehome_host": args.rehome_host, "instances": instance_ids,
+            "roots": roots, "available_tables": sorted(snapshot.tables),
+            "openstack": cached,
+        }
+        payload = {
+            "schema_version": API_INPUT_VERSION, "side": args.side,
+            "api_result": api_result,
+            "requests": _auto_requests(args.side, snapshot, roots),
+        }
     else:
         payload = _read_json(args.fixture)
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "side", "api_result", "requests"} or payload["schema_version"] != API_INPUT_VERSION or payload["side"] != args.side:
         raise ValueError("API fixture envelope is invalid")
-    if not isinstance(payload["api_result"], dict) or not isinstance(payload["requests"], list) or not payload["requests"] or len(payload["requests"]) > _MAX_QUERIES:
+    allowed_api_result = {
+        "rehome_host", "instances", "roots", "available_tables", "openstack",
+        "storage_probe_results", "glance_data_probe_results",
+        "glance_store_capabilities", "target_manage_outputs",
+        "target_image_inspects", "target_runtime_outputs", "target_virsh_argv",
+        "target_qemu_argv", "schema_capabilities",
+    }
+    if (
+        not isinstance(payload["api_result"], dict)
+        or not set(payload["api_result"]).issubset(allowed_api_result)
+        or not isinstance(payload["requests"], list)
+        or not payload["requests"] or len(payload["requests"]) > _MAX_QUERIES
+    ):
         raise ValueError("API result is invalid")
+    if "collectors" in payload["api_result"]:
+        raise ValueError("cached collector composition bypass is forbidden")
+    if args.probe_config is not None:
+        probe_results = _execute_probe_config(
+            _read_protected_json(args.probe_config), ReadOnlyRunner()
+        )
+        for key, value in probe_results.items():
+            if key in payload["api_result"]:
+                raise ValueError("probe result identity is duplicated")
+            payload["api_result"][key] = value
+    if args.capability_config is not None:
+        capability = _read_protected_json(args.capability_config)
+        expected = {
+            "schema_version", "target_manage_outputs", "target_image_inspects",
+            "target_runtime_outputs", "target_virsh_argv", "target_qemu_argv",
+            "schema_capabilities",
+        }
+        if (
+            not isinstance(capability, dict) or set(capability) != expected
+            or capability.get("schema_version") != "openstack-rehome-target-capability-input/v1alpha1"
+        ):
+            raise ValueError("target capability input is invalid")
+        for key in expected - {"schema_version"}:
+            if key in payload["api_result"]:
+                raise ValueError("target capability identity is duplicated")
+            payload["api_result"][key] = deepcopy(capability[key])
     queries = [_request(item, index + 1) for index, item in enumerate(payload["requests"])]
+    _validate_query_coverage(args.side, payload["api_result"], queries)
     query_ids = [item["query_id"] for item in queries]
     if len(query_ids) != len(set(query_ids)):
         raise ValueError("query identity is duplicated")
-    filters = {}
-    for query in queries:
-        filters.setdefault(query["schema"], {}).setdefault(query["table"], {}).update(query["filters"])
-    api_result = {"schema_version": API_RESULT_VERSION, "side": args.side, "api_result": payload["api_result"]}
-    uuid_filters = {"schema_version": "openstack-rehome-uuid-filters/v1alpha1", "side": args.side, "filters": filters}
-    plan = {"schema_version": PLAN_VERSION, "side": args.side, "queries": queries}
+    filters = [
+        {"query_id": query["query_id"], "schema": query["schema"],
+         "table": query["table"], "filters": deepcopy(query["filters"])}
+        for query in queries
+    ]
+    api_base = json.loads(render_json({"schema_version": API_RESULT_VERSION, "side": args.side, "api_result": payload["api_result"]}))
+    filters_base = json.loads(render_json({"schema_version": "openstack-rehome-uuid-filters/v1alpha1", "side": args.side, "filters": filters}))
+    plan_base = json.loads(render_json({"schema_version": PLAN_VERSION, "side": args.side, "queries": queries}))
+    binding = _phase_binding(api_base, filters_base, plan_base)
+    api_result = {**api_base, "binding_sha256": binding}
+    uuid_filters = {**filters_base, "binding_sha256": binding}
+    plan = {**plan_base, "binding_sha256": binding}
     _write_directory(args.out, {"api-result.json": api_result, "uuid-filters.json": uuid_filters, "db-query-plan.json": plan})
 
 
@@ -228,6 +845,8 @@ def _read_jsonl(path, query):
                 raise ValueError("DB JSONL record is malformed") from error
             if not isinstance(record, dict) or set(record) != {"_schema", "_table", "row"} or record["_schema"] != query["schema"] or record["_table"] != query["table"] or not isinstance(record["row"], dict):
                 raise ValueError("DB JSONL provenance is invalid")
+            if set(record["row"]) != set(query["columns"]):
+                raise ValueError("DB JSONL selected columns do not match query plan")
             if not any(record["row"].get(field) in values for field, values in query["filters"].items()):
                 raise ValueError("DB JSONL row is outside query scope")
             records.append(record)
@@ -236,11 +855,27 @@ def _read_jsonl(path, query):
 
 def _combine_phase(args):
     api = _read_json(args.api_result)
+    filters_document = _read_json(Path(args.api_result).with_name("uuid-filters.json"))
     plan = _read_json(Path(args.api_result).with_name("db-query-plan.json"))
-    if not isinstance(api, dict) or set(api) != {"schema_version", "side", "api_result"} or api.get("schema_version") != API_RESULT_VERSION or api.get("side") != args.side:
+    if not isinstance(api, dict) or set(api) != {"schema_version", "side", "api_result", "binding_sha256"} or api.get("schema_version") != API_RESULT_VERSION or api.get("side") != args.side:
         raise ValueError("API result envelope is invalid")
-    if not isinstance(plan, dict) or set(plan) != {"schema_version", "side", "queries"} or plan.get("schema_version") != PLAN_VERSION or plan.get("side") != args.side or not isinstance(plan["queries"], list) or not plan["queries"] or len(plan["queries"]) > _MAX_QUERIES:
+    if not isinstance(filters_document, dict) or set(filters_document) != {"schema_version", "side", "filters", "binding_sha256"} or filters_document.get("schema_version") != "openstack-rehome-uuid-filters/v1alpha1" or filters_document.get("side") != args.side or not isinstance(filters_document.get("filters"), list):
+        raise ValueError("UUID filter envelope is invalid")
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "side", "queries", "binding_sha256"} or plan.get("schema_version") != PLAN_VERSION or plan.get("side") != args.side or not isinstance(plan["queries"], list) or not plan["queries"] or len(plan["queries"]) > _MAX_QUERIES:
         raise ValueError("DB query plan is invalid")
+    api_base = {key: value for key, value in api.items() if key != "binding_sha256"}
+    filters_base = {key: value for key, value in filters_document.items() if key != "binding_sha256"}
+    plan_base = {key: value for key, value in plan.items() if key != "binding_sha256"}
+    binding = _phase_binding(api_base, filters_base, plan_base)
+    if {api["binding_sha256"], filters_document["binding_sha256"], plan["binding_sha256"]} != {binding}:
+        raise ValueError("API/filter/query phase binding is invalid")
+    planned_filters = [
+        {"query_id": query.get("query_id"), "schema": query.get("schema"),
+         "table": query.get("table"), "filters": query.get("filters")}
+        for query in plan["queries"] if isinstance(query, dict)
+    ]
+    if planned_filters != filters_document["filters"]:
+        raise ValueError("UUID filters differ from query plan")
     db_dir = Path(args.db_jsonl_dir)
     if _has_symlink_component(db_dir) or not db_dir.is_dir() or len(list(db_dir.iterdir())) > _MAX_QUERIES * 2:
         raise ValueError("DB output directory is unsafe")
@@ -253,7 +888,7 @@ def _combine_phase(args):
     actual_outputs = {entry.name for entry in db_dir.iterdir()}
     if actual_outputs != expected_outputs:
         raise ValueError("DB output set does not match query plan")
-    records = {}
+    records = []
     evidence = []
     for query_index, query in enumerate(plan["queries"], start=1):
         expected = {"query_id", "schema", "table", "columns", "filters", "sql", "jsonl_file", "rc_file"}
@@ -263,16 +898,22 @@ def _combine_phase(args):
             not isinstance(query["columns"], list)
             or not query["columns"]
             or not isinstance(query["filters"], dict)
-            or len(query["filters"]) != 1
+            or not query["filters"]
         ):
             raise ValueError("DB query scope is invalid")
         schema = validate_identifier(query["schema"])
         table = validate_identifier(query["table"])
         columns = [validate_identifier(value) for value in query["columns"]]
-        filter_column, filter_values = next(iter(query["filters"].items()))
-        filter_column = validate_identifier(filter_column)
+        normalized_filters = {
+            validate_identifier(column): values
+            for column, values in query["filters"].items()
+        }
+        where = "(" + ") OR (".join(
+            _scoped_in(column, normalized_filters[column])
+            for column in sorted(normalized_filters)
+        ) + ")"
         expected_sql = build_json_row_query(
-            schema, table, columns, uuid_in(filter_column, filter_values)
+            schema, table, columns, where
         )
         if query["sql"] != expected_sql:
             raise ValueError("DB query does not match its reviewed scope")
@@ -288,9 +929,10 @@ def _combine_phase(args):
             raise ValueError("DB query failed")
         rows = _read_jsonl(output_path, query)
         key = f"{query['schema']}.{query['table']}"
-        if key in records:
+        record_identity = (query["schema"], query["table"], _canonical(query["filters"]))
+        if any((item["schema"], item["table"], _canonical(item["filters"])) == record_identity for item in records):
             raise ValueError("DB query output is duplicated")
-        records[key] = rows
+        records.append({"schema": query["schema"], "table": query["table"], "filters": deepcopy(query["filters"]), "rows": rows})
         evidence.append({"evidence_id": f"{args.side}-db:{key}", "kind": "db-jsonl", "schema": query["schema"], "table": query["table"], "filters": deepcopy(query["filters"])})
     # Parse/validate the two policy inputs now; service collectors consume these
     # exact documents in the next orchestration layer.
@@ -299,23 +941,27 @@ def _combine_phase(args):
     snapshot = parse_information_schema(args.information_schema)
     if not snapshot.tables:
         raise ValueError("information_schema evidence is empty")
+    live_expected_tables = _expected_plan_tables(
+        args.side, api["api_result"]["roots"], snapshot.tables.keys()
+    )
+    planned_table_set = {
+        f"{query['schema']}.{query['table']}" for query in plan["queries"]
+    }
+    if planned_table_set != live_expected_tables:
+        raise ValueError("DB query plan differs from live schema-gated collector scope")
     schema_policy = _read_json(args.schema_policy)
     if not isinstance(schema_policy, dict):
         raise ValueError("schema policy is invalid")
-    supplied_collectors = api["api_result"].get("collectors", [])
-    if not isinstance(supplied_collectors, list):
-        raise ValueError("collector result set is invalid")
-    collectors = deepcopy(supplied_collectors)
-    if not collectors:
-        collectors = _compose_collectors(
-            args.side, api["api_result"], records, evidence, snapshot
-        )
+    collectors = _compose_collectors(
+        args.side, api["api_result"], records, evidence, snapshot
+    )
     side_filters = {"source": {}, "target": {}}
     side_filters[args.side] = {
-        key: value for key, value in sorted(
-            ((f"{query['schema']}.{query['table']}", query["filters"]) for query in plan["queries"]),
-            key=lambda item: item[0],
-        )
+        query["query_id"]: {
+            "schema": query["schema"], "table": query["table"],
+            "filters": deepcopy(query["filters"]),
+        }
+        for query in plan["queries"]
     }
     capabilities = deepcopy(api["api_result"].get("schema_capabilities", {}))
     if not isinstance(capabilities, dict):
@@ -361,16 +1007,19 @@ def main(argv=None):
     parser.add_argument("--db-jsonl-dir", type=Path)
     parser.add_argument("--information-schema", type=Path)
     parser.add_argument("--schema-policy", type=Path)
+    parser.add_argument("--probe-config", type=Path)
+    parser.add_argument("--root-manifest", type=Path)
+    parser.add_argument("--capability-config", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.phase == "api":
-            if any((args.api_result, args.db_jsonl_dir, args.information_schema, args.schema_policy)):
+            if any((args.api_result, args.db_jsonl_dir, args.schema_policy)):
                 raise ValueError("combine arguments are forbidden in API phase")
-            if args.fixture is not None and any((args.rehome_host, args.cloud, args.clouds_file, args.container)):
+            if args.fixture is not None and any((args.rehome_host, args.cloud, args.clouds_file, args.container, args.information_schema, args.root_manifest, args.capability_config)):
                 raise ValueError("fixture and live API arguments are mutually exclusive")
             _api_phase(args)
         else:
-            if args.fixture is not None or any((args.rehome_host, args.cloud, args.clouds_file, args.container)) or not all((args.api_result, args.db_jsonl_dir, args.information_schema, args.schema_policy)):
+            if args.fixture is not None or args.probe_config is not None or args.root_manifest is not None or args.capability_config is not None or any((args.rehome_host, args.cloud, args.clouds_file, args.container)) or not all((args.api_result, args.db_jsonl_dir, args.information_schema, args.schema_policy)):
                 raise ValueError("combine arguments are incomplete")
             _combine_phase(args)
         print(f"PHASE={args.phase} SIDE={args.side} STATUS=OK")

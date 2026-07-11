@@ -1,16 +1,18 @@
 """Deterministic, independently sanitized live-discovery artifact rendering."""
 
 from collections import Counter
+import html
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import tempfile
 from typing import Any, Mapping
 
-from .graph import _SENSITIVE_KEY, _SENSITIVE_VALUE, validate_graph
+from .graph import _SENSITIVE_KEY, _SENSITIVE_VALUE, _canonical, validate_graph
 
 
 _GRAPH_KEYS = frozenset({"schema_version", "collectors", "nodes", "edges", "checks", "assembly_checks", "graph_sha256"})
@@ -23,6 +25,18 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_DEPTH = 20
 _MAX_NODES = 100_000
 _MAX_STRING = 64 * 1024
+_RENDER_SENSITIVE_KEY = re.compile(
+    r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|credential|"
+    r"connector|connection[_-]?(?:info|data)|api[_-]?key|access[_-]?key",
+    re.IGNORECASE,
+)
+_RENDER_SENSITIVE_VALUE = re.compile(
+    r"api[\s_-]*key\s*[:=]|access[\s_-]*key\s*[:=]|secret[\s_-]*key\s*[:=]|"
+    r"\bAKIA[A-Z0-9]{16}\b",
+    re.IGNORECASE,
+)
+_TABLE_ID = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+_SAFE_CAPABILITY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$")
 
 
 def _sanitize(value: object) -> object:
@@ -41,7 +55,7 @@ def _sanitize(value: object) -> object:
         if isinstance(item, str):
             if len(item) > _MAX_STRING or "\x00" in item:
                 raise ValueError("artifact string exceeds safety bounds")
-            return "[REDACTED]" if _SENSITIVE_VALUE.search(item) else item
+            return "[REDACTED]" if (_SENSITIVE_VALUE.search(item) or _RENDER_SENSITIVE_VALUE.search(item)) else item
         if isinstance(item, (list, tuple)):
             return [walk(child, depth + 1) for child in item]
         if isinstance(item, Mapping):
@@ -50,7 +64,7 @@ def _sanitize(value: object) -> object:
                 if not isinstance(raw_key, str) or not raw_key or len(raw_key) > 512 or "\x00" in raw_key:
                     raise ValueError("artifact key is invalid")
                 normalized[raw_key] = (
-                    "[REDACTED]" if _SENSITIVE_KEY.search(raw_key)
+                    "[REDACTED]" if (_SENSITIVE_KEY.search(raw_key) or _RENDER_SENSITIVE_KEY.search(raw_key))
                     else walk(child, depth + 1)
                 )
             return {key: normalized[key] for key in sorted(normalized)}
@@ -140,7 +154,14 @@ def render_markdown(graph: Mapping[str, Any], verdict: Mapping[str, Any]) -> str
             if isinstance(values, list):
                 for reason in values:
                     if isinstance(reason, str):
-                        lines.append(f"- `{status}`: {reason}")
+                        safe_reason = "".join(
+                            " " if ord(character) < 32 or ord(character) == 127 else character
+                            for character in reason
+                        )
+                        safe_reason = html.escape(safe_reason, quote=True)
+                        for character in ("\\", "`", "|", "[", "]", "(", ")", "*", "_", "#"):
+                            safe_reason = safe_reason.replace(character, "\\" + character)
+                        lines.append(f"- `{status}`: {safe_reason}")
                         emitted = True
     if not emitted:
         lines.append("- No reasons were recorded.")
@@ -239,6 +260,12 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
     _exact_mapping(capabilities, _CAPABILITY_KEYS, "schema capabilities")
     if capabilities.get("schema_version") != "openstack-rehome-schema-capabilities/v1alpha1" or not isinstance(capabilities.get("services"), Mapping):
         raise ValueError("schema capabilities version is invalid")
+    if len(capabilities["services"]) > 4096:
+        raise ValueError("schema capabilities exceed safety bounds")
+    for service, payload in capabilities["services"].items():
+        if not isinstance(service, str) or _SAFE_CAPABILITY_ID.fullmatch(service) is None or not isinstance(payload, Mapping):
+            raise ValueError("schema capability service is invalid")
+        _sanitize(payload)
     _exact_mapping(mapping, _MAPPING_KEYS, "schema mapping")
     if mapping.get("schema_version") != "openstack-rehome-directional-schema-mapping/v1alpha1":
         raise ValueError("schema mapping version is invalid")
@@ -248,6 +275,41 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
     _exact_mapping(evidence["index"], _EVIDENCE_INDEX_KEYS, "evidence index")
     if evidence["uuid_filters"].get("schema_version") != "openstack-rehome-uuid-filters/v1alpha1" or evidence["index"].get("schema_version") != "openstack-rehome-evidence-index/v1alpha1" or not isinstance(evidence["index"].get("entries"), list):
         raise ValueError("evidence version is invalid")
+    for side in ("source", "target"):
+        tables = evidence["uuid_filters"].get(side)
+        if not isinstance(tables, Mapping) or len(tables) > 4096:
+            raise ValueError("UUID filter side is invalid")
+        for query_id, query in tables.items():
+            if (
+                not isinstance(query_id, str) or _SAFE_CAPABILITY_ID.fullmatch(query_id) is None
+                or not isinstance(query, Mapping)
+                or set(query) != {"schema", "table", "filters"}
+                or not isinstance(query["schema"], str)
+                or not isinstance(query["table"], str)
+                or _TABLE_ID.fullmatch(f"{query['schema']}.{query['table']}") is None
+            ):
+                raise ValueError("UUID filter table is invalid")
+            filters = query["filters"]
+            if not isinstance(filters, Mapping) or not filters:
+                raise ValueError("UUID filter table is invalid")
+            for column, values in filters.items():
+                if not isinstance(column, str) or not column or not isinstance(values, list) or not values or len(values) > 4096:
+                    raise ValueError("UUID filter column is invalid")
+                if len({_canonical(item) for item in values}) != len(values) or any(not isinstance(item, (str, int)) or isinstance(item, bool) for item in values):
+                    raise ValueError("UUID filter values are invalid")
+    if len(evidence["index"]["entries"]) > 100_000:
+        raise ValueError("evidence index exceeds safety bounds")
+    for entry in evidence["index"]["entries"]:
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"evidence_id", "kind", "schema", "table", "filters"}
+            or entry.get("kind") != "db-jsonl"
+            or not isinstance(entry.get("evidence_id"), str)
+            or not isinstance(entry.get("schema"), str)
+            or not isinstance(entry.get("table"), str)
+            or not isinstance(entry.get("filters"), Mapping)
+        ):
+            raise ValueError("evidence index entry schema is invalid")
     if not isinstance(evidence["sensitive"], Mapping):
         raise ValueError("sensitive evidence schema is invalid")
     _validate_sensitive(evidence["sensitive"])
@@ -284,21 +346,134 @@ def _write(path: Path, content: str, mode: int = 0o644) -> None:
         raise
 
 
+class _AtomicArtifactWriter:
+    """Owned-lock sibling swap with signal-triggered rollback."""
+
+    def __init__(self, out_dir):
+        self.out_dir = Path(out_dir)
+        self.parent = self.out_dir.parent
+        self.lock = self.parent / f".{self.out_dir.name}.lock"
+        self.owner = self.lock / "owner.json"
+        self.token = hashlib.sha256(os.urandom(32)).hexdigest()
+        self.staging = None
+        self.backup = None
+        self.installed = False
+        self.completed = False
+        self.owns_lock = False
+        self.previous_handlers = {}
+
+    def _owner_payload(self):
+        return {"pid": os.getpid(), "token": self.token}
+
+    def _lock_is_owned(self):
+        try:
+            if self.owner.is_symlink() or not self.owner.is_file():
+                return False
+            return json.loads(self.owner.read_text(encoding="utf-8")) == self._owner_payload()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+
+    def begin(self):
+        self.out_dir = _safe_destination(self.out_dir)
+        self.parent = self.out_dir.parent
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                self.previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self.handle_signal)
+            self.lock.mkdir(mode=0o700)
+            self.owns_lock = True
+            _write(self.owner, json.dumps(self._owner_payload(), sort_keys=True) + "\n", 0o600)
+            self.staging = Path(tempfile.mkdtemp(prefix=f".{self.out_dir.name}.staging-", dir=self.parent))
+        except FileExistsError as error:
+            self.cleanup()
+            raise ValueError("another artifact writer is active") from error
+        except BaseException:
+            self.cleanup()
+            raise
+        return self
+
+    def backup_existing(self):
+        if self.out_dir.exists():
+            if self.out_dir.is_symlink() or not self.out_dir.is_dir():
+                raise ValueError("output path is not a safe directory")
+            self.backup = self.parent / f".{self.out_dir.name}.backup-{self.token}"
+            os.replace(self.out_dir, self.backup)
+
+    def install_staging(self):
+        if self.staging is None or not self.staging.is_dir():
+            raise ValueError("artifact staging directory is unavailable")
+        os.replace(self.staging, self.out_dir)
+        self.staging = None
+        self.installed = True
+
+    def _restore_handlers(self):
+        for signum, previous in self.previous_handlers.items():
+            try:
+                signal.signal(signum, previous)
+            except (ValueError, OSError):
+                pass
+        self.previous_handlers.clear()
+
+    def _remove_owned_lock(self):
+        if not self.owns_lock:
+            return
+        if not self._lock_is_owned():
+            try:
+                self.lock.rmdir()
+                self.owns_lock = False
+            except OSError:
+                pass
+            return
+        try:
+            self.owner.unlink()
+            self.lock.rmdir()
+            self.owns_lock = False
+        except OSError:
+            pass
+
+    def rollback(self):
+        if self.installed and self.out_dir.exists():
+            if self.out_dir.is_symlink() or not self.out_dir.is_dir():
+                raise ValueError("installed artifact path is unsafe")
+            shutil.rmtree(self.out_dir)
+            self.installed = False
+        if self.backup is not None and self.backup.exists():
+            if self.out_dir.exists():
+                raise ValueError("cannot restore prior artifact over existing path")
+            os.replace(self.backup, self.out_dir)
+            self.backup = None
+        if self.staging is not None and self.staging.exists():
+            shutil.rmtree(self.staging, ignore_errors=True)
+            self.staging = None
+
+    def cleanup(self):
+        try:
+            if not self.completed:
+                self.rollback()
+        finally:
+            self._restore_handlers()
+            self._remove_owned_lock()
+
+    def complete(self):
+        if self.backup is not None and self.backup.exists():
+            shutil.rmtree(self.backup, ignore_errors=True)
+            self.backup = None
+        self.completed = True
+        self._restore_handlers()
+        self._remove_owned_lock()
+
+    def handle_signal(self, signum, frame):
+        del frame
+        self.cleanup()
+        raise InterruptedError(f"artifact write interrupted by signal {signum}")
+
+
 def write_artifacts(out_dir, graph, verdict, schema_capabilities, schema_mapping, evidence) -> None:
     """Write the reviewed artifact set using a rollback-safe sibling swap."""
     _validate_inputs(graph, verdict, schema_capabilities, schema_mapping, evidence)
-    out_dir = _safe_destination(Path(out_dir))
-    parent = out_dir.parent
-    lock = parent / f".{out_dir.name}.lock"
+    writer = _AtomicArtifactWriter(Path(out_dir)).begin()
     try:
-        lock.mkdir(mode=0o700)
-    except FileExistsError as error:
-        raise ValueError("another artifact writer is active") from error
-    staging = None
-    backup = parent / f".{out_dir.name}.backup-{os.getpid()}-{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
-    replaced = False
-    try:
-        staging = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.staging-", dir=parent))
+        staging = writer.staging
         _write(staging / "resource-graph.json", render_json(graph))
         _write(staging / "resource-graph.yml", render_yaml(graph))
         _write(staging / "readiness-report.json", render_json(verdict))
@@ -315,27 +490,9 @@ def write_artifacts(out_dir, graph, verdict, schema_capabilities, schema_mapping
             raw = json.dumps(evidence["sensitive"], ensure_ascii=False, sort_keys=True, indent=2) + "\n"
             _write(sensitive / "evidence.json", raw, 0o600)
             os.chmod(sensitive / "evidence.json", 0o600)
-        if out_dir.exists():
-            if not out_dir.is_dir():
-                raise ValueError("output path is not a directory")
-            os.replace(out_dir, backup)
-            replaced = True
-        try:
-            os.replace(staging, out_dir)
-        except Exception:
-            if replaced:
-                os.replace(backup, out_dir)
-                replaced = False
-            raise
-        if replaced:
-            shutil.rmtree(backup, ignore_errors=True)
-            replaced = False
-    finally:
-        if staging is not None and staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-        if replaced and backup.exists() and not out_dir.exists():
-            os.replace(backup, out_dir)
-        try:
-            lock.rmdir()
-        except OSError:
-            pass
+        writer.backup_existing()
+        writer.install_staging()
+        writer.complete()
+    except BaseException:
+        writer.cleanup()
+        raise

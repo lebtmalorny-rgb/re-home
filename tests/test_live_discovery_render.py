@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from live_discovery.render import _safe_destination, render_json, render_markdown, write_artifacts
+from live_discovery.render import _AtomicArtifactWriter, _safe_destination, render_json, render_markdown, write_artifacts
 from live_discovery.contract import CollectorResult, ResourceNode
 from live_discovery.graph import assemble_graph
 from live_discovery.verdict import compute_verdict
@@ -44,9 +45,21 @@ class LiveDiscoveryRenderTests(unittest.TestCase):
         self.assertIn("Instances: `1`", markdown)
 
     def test_normal_artifacts_are_resanitized(self):
-        rendered = render_json({"password": "chap-secret-value", "safe": "ok"})
+        rendered = render_json({"password": "chap-secret-value", "api_key": "api-key-material", "access_key_id": "access-material", "secret_access_key": "secret-access-material", "safe": "ok"})
         self.assertNotIn("chap-secret-value", rendered)
+        self.assertNotIn("api-key-material", rendered)
+        self.assertNotIn("access-material", rendered)
+        self.assertNotIn("secret-access-material", rendered)
         self.assertIn("[REDACTED]", rendered)
+
+    def test_markdown_escapes_html_delimiters_and_controls(self):
+        verdict = sample_verdict()
+        verdict["reasons"]["BLOCKED"] = ["<script>alert(1)</script> | [link](bad)\t"]
+        markdown = render_markdown(sample_graph(), verdict)
+        self.assertNotIn("<script>", markdown)
+        self.assertNotIn(" | ", markdown)
+        self.assertNotIn("[link](bad)", markdown)
+        self.assertNotIn("\t", markdown)
 
     def test_artifacts_are_exact_deterministic_and_sensitive_is_protected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -105,6 +118,40 @@ class LiveDiscoveryRenderTests(unittest.TestCase):
                     write_artifacts(out, sample_graph(), sample_verdict(), {"schema_version": "openstack-rehome-schema-capabilities/v1alpha1", "services": {}}, {"schema_version": "openstack-rehome-directional-schema-mapping/v1alpha1", "source_profile": "keystack-2025.1", "target_profile": "vanilla-openstack-2025.1-epoxy", "tables": {}, "blockers": []}, evidence)
             self.assertEqual({"keep"}, {path.name for path in out.iterdir()})
             self.assertEqual("old", (out / "keep").read_text(encoding="utf-8"))
+
+    def test_signal_cleanup_is_owned_rolls_back_each_atomic_stage_and_reruns(self):
+        for stage, signum in (("staging", signal.SIGTERM), ("backup", signal.SIGINT), ("installed", signal.SIGTERM)):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                out = root / "out"
+                out.mkdir()
+                (out / "keep").write_text("old", encoding="utf-8")
+                writer = _AtomicArtifactWriter(out)
+                writer.begin()
+                (writer.staging / "new").write_text("new", encoding="utf-8")
+                if stage in {"backup", "installed"}:
+                    writer.backup_existing()
+                if stage == "installed":
+                    writer.install_staging()
+                with self.assertRaises(InterruptedError):
+                    writer.handle_signal(signum, None)
+                self.assertEqual("old", (out / "keep").read_text(encoding="utf-8"))
+                self.assertFalse(any(path.name.startswith(".out.") for path in root.iterdir()))
+                evidence = {"uuid_filters": {"schema_version": "openstack-rehome-uuid-filters/v1alpha1", "source": {}, "target": {}}, "index": {"schema_version": "openstack-rehome-evidence-index/v1alpha1", "entries": []}, "sensitive": {}}
+                write_artifacts(out, sample_graph(), sample_verdict(), {"schema_version": "openstack-rehome-schema-capabilities/v1alpha1", "services": {}}, {"schema_version": "openstack-rehome-directional-schema-mapping/v1alpha1", "source_profile": "keystack-2025.1", "target_profile": "vanilla-openstack-2025.1-epoxy", "tables": {}, "blockers": []}, evidence)
+                self.assertTrue((out / "readiness-report.json").is_file())
+
+    def test_writer_does_not_delete_foreign_owned_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock = root / ".out.lock"
+            lock.mkdir()
+            (lock / "owner.json").write_text('{"pid":999999,"token":"foreign"}', encoding="utf-8")
+            writer = _AtomicArtifactWriter(root / "out")
+            with self.assertRaisesRegex(ValueError, "writer"):
+                writer.begin()
+            writer.cleanup()
+            self.assertTrue(lock.is_dir())
 
     def test_rejects_symlink_output(self):
         with tempfile.TemporaryDirectory() as temporary:

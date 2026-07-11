@@ -1,0 +1,36 @@
+SERVICE:nova
+SECTION:COLUMNS
+nova	instances	1	uuid	varchar(36)	NO	NULL	\N
+nova	instances	2	host	varchar(255)	YES	NULL	\N
+nova	instances	3	project_id	varchar(36)	YES	NULL	\N
+nova	instances	4	user_id	varchar(36)	YES	NULL	\N
+nova	block_device_mapping	1	id	int(11)	NO	NULL	\N
+nova	block_device_mapping	2	instance_uuid	varchar(36)	NO	NULL	\N
+nova	block_device_mapping	3	volume_id	varchar(36)	YES	NULL	\N
+nova	block_device_mapping	4	deleted	int(11)	YES	0	\N
+nova	instance_info_caches	1	id	int(11)	NO	NULL	\N
+nova	instance_info_caches	2	instance_uuid	varchar(36)	NO	NULL	\N
+nova	instance_info_caches	3	network_info	longtext	YES	NULL	\N
+nova	instance_info_caches	4	deleted	int(11)	YES	0	\N
+nova	compute_nodes	1	id	int(11)	NO	NULL	\N
+nova	compute_nodes	2	uuid	varchar(36)	NO	NULL	\N
+nova	compute_nodes	3	host	varchar(255)	YES	NULL	\N
+nova	compute_nodes	4	hypervisor_hostname	varchar(255)	YES	NULL	\N
+nova	compute_nodes	5	service_id	int(11)	YES	NULL	\N
+nova	services	1	id	int(11)	NO	NULL	\N
+nova	services	2	uuid	varchar(36)	NO	NULL	\N
+nova	services	3	host	varchar(255)	YES	NULL	\N
+nova	services	4	binary	varchar(255)	YES	NULL	\N
+nova	services	5	disabled	int(11)	YES	0	\N
+nova	services	6	deleted	int(11)	YES	0	\N
+SERVICE:nova_api
+SECTION:COLUMNS
+nova_api	host_mappings	1	id	int(11)	NO	NULL	\N
+nova_api	host_mappings	2	host	varchar(255)	NO	NULL	\N
+nova_api	host_mappings	3	cell_id	varchar(36)	NO	NULL	\N
+nova_api	instance_mappings	1	id	int(11)	NO	NULL	\N
+nova_api	instance_mappings	2	instance_uuid	varchar(36)	NO	NULL	\N
+nova_api	instance_mappings	3	cell_id	varchar(36)	NO	NULL	\N
+nova_api	request_specs	1	id	int(11)	NO	NULL	\N
+nova_api	request_specs	2	instance_uuid	varchar(36)	NO	NULL	\N
+nova_api	request_specs	3	spec	longtext	YES	NULL	\N

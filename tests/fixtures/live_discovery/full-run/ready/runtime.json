@@ -1,0 +1,5 @@
+{
+  "schema_version":"openstack-rehome-live-discovery/v1alpha1","service":"runtime","side":"source",
+  "nodes":[{"kind":"libvirt_domain","id":"11111111-1111-1111-1111-111111111111","side":"source","facts":{"machine_type":"pc-q35-8.2","disk_buses":["virtio"]},"evidence_ids":["runtime-source"],"key":"libvirt_domain:11111111-1111-1111-1111-111111111111"}],
+  "edges":[],"checks":[{"check_id":"runtime.source.ready","status":"PASS","reason":"Runtime domain is correlated","resource_ids":["libvirt_domain:11111111-1111-1111-1111-111111111111"],"evidence_ids":["runtime-source"]}],"unknowns":[],"blockers":[],"evidence":[{"evidence_id":"runtime-source","kind":"fixture"}]
+}
