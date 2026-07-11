@@ -32,6 +32,10 @@ CONNECTION_SENTINELS = (
     "auth_token=do-not-serialize",
     "token-material-do-not-serialize",
     "pwd=do-not-serialize",
+    "PASSWORD_value_do-not-serialize",
+    "prefix-PassWd:do-not-serialize",
+    "pWd do-not-serialize",
+    "auth_Token:do-not-serialize",
 )
 
 
@@ -421,6 +425,30 @@ class LiveDiscoveryGraphTests(unittest.TestCase):
                         item["status"] == "BLOCKED"
                         for item in [*graph["assembly_checks"], *graph["checks"]]
                     ))
+
+    def test_credential_boundaries_preserve_alphanumeric_words_and_safe_redactions(self):
+        safe_words = ("passwordless", "compasswdx", "repwded", "tokenized")
+        for index, safe in enumerate(safe_words):
+            result = collector(nodes=[ResourceNode(
+                "instance", f"vm-{index}", "source", {"state": safe},
+                [f"evidence-{safe}"],
+            )])
+            graph = assemble_graph([result])
+            self.assertEqual(1, len(graph["nodes"]))
+            self.assertEqual(safe, graph["nodes"][0]["facts"]["state"])
+            self.assertEqual([f"evidence-{safe}"], graph["nodes"][0]["evidence_ids"])
+
+        canonical = ResourceNode(
+            "encryption_key_ref", "key-1", "source",
+            {"connection_info": "[REDACTED]"},
+            ["cinder-source-secret-get-key-1"],
+        )
+        graph = assemble_graph([collector("cinder", nodes=[canonical])])
+        self.assertEqual(1, len(graph["nodes"]))
+        self.assertEqual("[REDACTED]", graph["nodes"][0]["facts"]["connection_info"])
+        self.assertEqual(
+            ["cinder-source-secret-get-key-1"], graph["nodes"][0]["evidence_ids"],
+        )
 
     def test_unknown_top_level_and_nested_graph_fields_are_blocked(self):
         base = assemble_graph([collector(

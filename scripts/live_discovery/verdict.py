@@ -6,7 +6,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from .contract import CheckResult
-from .graph import _canonical, _safe_reason, validate_graph
+from .graph import _SENSITIVE_VALUE, _canonical, _safe_reason, validate_graph
 
 
 VERDICT_VERSION = "openstack-rehome-readiness-verdict/v1alpha1"
@@ -36,16 +36,6 @@ _BLOCKING_MAPPING_CLASSES = frozenset({
     "TARGET_VALUE_REQUIRED", "SEMANTIC_MISMATCH", "BLOCKED"
 })
 _SAFE_TEXT = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
-_SENSITIVE_VALUE = re.compile(
-    r"\bsecret[-_]?token\b|\b(?:password|passwd|pwd|token|credential)\b|"
-    r"(?:password|passwd|pwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
-    r"chap|connector|initiator|credential|"
-    r"connection[\s_-]*(?:info(?:rmation)?|data)|"
-    r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
-    r"\bsk-[A-Za-z0-9_-]{8,}\b|"
-    r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",
-    flags=re.IGNORECASE,
-)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_CHECKS = 100_000
 _MAX_MAPPING_TABLES = 4096

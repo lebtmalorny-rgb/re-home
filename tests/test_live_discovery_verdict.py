@@ -28,6 +28,10 @@ CONNECTION_SENTINELS = (
     "auth_token=do-not-serialize",
     "token-material-do-not-serialize",
     "pwd=do-not-serialize",
+    "PASSWORD_value_do-not-serialize",
+    "prefix-PassWd:do-not-serialize",
+    "pWd do-not-serialize",
+    "auth_Token:do-not-serialize",
 )
 
 
@@ -421,6 +425,17 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
                     serialized = json.dumps(verdict, sort_keys=True)
                     self.assertNotIn("do-not-serialize", serialized)
                     self.assertEqual("BLOCKED", verdict["verdict"])
+
+    def test_separator_rules_do_not_match_inside_alphanumeric_words(self):
+        for index, safe in enumerate((
+            "passwordless", "compasswdx", "repwded", "tokenized",
+        )):
+            verdict = compute_verdict(
+                complete_graph(),
+                [CheckResult(f"safe-{index}", "WARN", safe)],
+                clean_mapping(),
+            )
+            self.assertIn(safe, verdict["reasons"]["WARN"])
 
 
 if __name__ == "__main__":

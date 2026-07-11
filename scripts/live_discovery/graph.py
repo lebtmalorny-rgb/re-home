@@ -36,16 +36,21 @@ _STATUSES = frozenset({"PASS", "WARN", "UNKNOWN", "BLOCKED"})
 _SIDES = frozenset({"source", "target"})
 _EXCLUDED_SERVICES = frozenset({"masakari", "drs"})
 _SAFE_IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
+_SEPARATOR_CREDENTIAL_MARKER = (
+    r"(?<![A-Za-z0-9])(?:password|passwd|pwd|token)(?![A-Za-z0-9])"
+)
 _SENSITIVE_KEY = re.compile(
-    r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|credential|"
-    r"connector|initiator|connection[\s_-]*(?:info(?:rmation)?|data)",
+    _SEPARATOR_CREDENTIAL_MARKER
+    + r"|(?<![A-Za-z0-9])(?:secret|chap|connector|initiator|credential)(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])connection[\s_-]*(?:info(?:rmation)?|data)(?![A-Za-z0-9])",
     flags=re.IGNORECASE,
 )
 _SENSITIVE_VALUE = re.compile(
-    r"(?:password|passwd|pwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
-    r"chap|connector|initiator|credential|"
-    r"connection[\s_-]*(?:info(?:rmation)?|data)|"
-    r"\bsecret[-_]?token\b|\b(?:password|passwd|pwd|token|credential)\b|"
+    _SEPARATOR_CREDENTIAL_MARKER
+    + r"|(?<![A-Za-z0-9])secret[\s_-]*[:=]\s*\S+|"
+    r"(?<![A-Za-z0-9])secret[\s_-]+token(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])(?:chap|connector|initiator|credential)(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])connection[\s_-]*(?:info(?:rmation)?|data)(?![A-Za-z0-9])|"
     r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
     r"\bsk-[A-Za-z0-9_-]{8,}\b|"
     r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",
