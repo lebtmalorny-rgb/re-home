@@ -1,0 +1,14 @@
+{
+  "schema_version": "openstack-rehome-directional-schema-mapping/v1alpha1",
+  "source_profile": "keystack-2025.1",
+  "target_profile": "vanilla-openstack-2025.1-epoxy",
+  "tables": {
+    "nova.instances": [{
+      "column": "id",
+      "classification": "COMMON_COMPATIBLE",
+      "source": {"name": "id", "ordinal": 1, "column_type": "varchar(36)", "nullable": false, "default": null, "extra": ""},
+      "target": {"name": "id", "ordinal": 1, "column_type": "varchar(36)", "nullable": false, "default": null, "extra": ""}
+    }]
+  },
+  "blockers": []
+}
