@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+import json
 import re
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence
@@ -20,6 +21,15 @@ _DOCKER_EXEC_OPTIONS_WITH_VALUE = {
     "--detach-keys", "--env", "--env-file", "--user", "--workdir",
     "-e", "-u", "-w",
 }
+_SQL_BEARING_MYSQL_OPTIONS = {
+    "--execute", "--init-command", "--init-command-add",
+}
+_MYSQL_SHORT_OPTIONS_WITH_VALUE = {"D", "h", "p", "P", "S", "u"}
+_SENSITIVE_MARKER = re.compile(
+    r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|"
+    r"connection[_-]?(?:info|data)|chap|credential|connector",
+    flags=re.IGNORECASE,
+)
 _FORBIDDEN_SQL = (
     (r"\bINSERT\b", "INSERT"),
     (r"\bUPDATE\b", "UPDATE"),
@@ -86,12 +96,15 @@ def classify_mutation(argv: Sequence[object]) -> Optional[str]:
     phrase = " ".join(lowered)
     if "online_data_migrations" in phrase:
         return "online_data_migrations"
-    if lowered and lowered[0] == "openstack":
-        for token in lowered[1:]:
-            if token in MUTATING_TOKENS:
-                return " ".join(lowered[1:3])
     if lowered and lowered[0] in {"mysql", "mariadb"}:
         return "mysql requires run_sql"
+    if lowered:
+        for index, token in enumerate(lowered[1:], start=1):
+            if token in MUTATING_TOKENS:
+                if lowered[0] == "openstack":
+                    return " ".join(lowered[1:3])
+                start = max(1, index - 1)
+                return " ".join(lowered[start:index + 1])
     return None
 
 
@@ -107,6 +120,81 @@ def _validate_select_only_sql(sql: str) -> str:
     ):
         raise MutationRejected("run_sql accepts one SELECT statement ending with ';'")
     return statement
+
+
+def _reject_sql_bearing_argv(argv: Sequence[str]) -> None:
+    for value in argv[1:]:
+        lowered = value.lower()
+        option = lowered.split("=", 1)[0]
+        short_execute = _has_short_execute_option(value)
+        long_sql_option = len(option) > 2 and any(
+            candidate.startswith(option) for candidate in _SQL_BEARING_MYSQL_OPTIONS
+        )
+        if short_execute or long_sql_option:
+            label = "-e" if short_execute else option
+            raise MutationRejected(f"SQL-bearing client option is not allowed: {label}")
+
+
+def _has_short_execute_option(value: str) -> bool:
+    if not value.startswith("-") or value.startswith("--"):
+        return False
+    for option in value[1:]:
+        if option == "e":
+            return True
+        if option in _MYSQL_SHORT_OPTIONS_WITH_VALUE:
+            return False
+    return False
+
+
+def _redact_evidence_argv(argv: Sequence[str]) -> List[str]:
+    redacted: List[str] = []
+    redact_next = False
+    for index, value in enumerate(argv):
+        if index == 0:
+            redacted.append(value)
+            continue
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+
+        if value.startswith("-p") and not value.startswith("--") and len(value) > 2:
+            redacted.append("-p[REDACTED]")
+            continue
+        if "=" in value:
+            key, _unused = value.split("=", 1)
+            if _SENSITIVE_MARKER.search(key):
+                redacted.append(f"{key}=[REDACTED]")
+                continue
+        if value.startswith("-") and _SENSITIVE_MARKER.search(value):
+            redacted.append(value)
+            redact_next = True
+            continue
+        if _is_cinder_connection_payload(value) or _SENSITIVE_MARKER.search(value):
+            redacted.append("[REDACTED]")
+            continue
+        redacted.append(value)
+    return redacted
+
+
+def _is_cinder_connection_payload(value: str) -> bool:
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and "driver_volume_type" in payload
+        and isinstance(payload.get("data"), dict)
+    )
+
+
+def _redact_evidence_stderr(stderr: str, sensitive: bool) -> str:
+    if not stderr:
+        return stderr
+    if sensitive or _SENSITIVE_MARKER.search(stderr):
+        return "[REDACTED]"
+    return stderr
 
 
 class ReadOnlyRunner:
@@ -130,10 +218,10 @@ class ReadOnlyRunner:
         )
         evidence = CommandEvidence(
             evidence_id=evidence_id,
-            argv=values,
+            argv=_redact_evidence_argv(values),
             returncode=completed.returncode,
             stdout="[REDACTED]" if sensitive_stdout else completed.stdout,
-            stderr=completed.stderr,
+            stderr=_redact_evidence_stderr(completed.stderr, sensitive_stdout),
         )
         if completed.returncode != 0:
             raise ProbeFailed(evidence)
@@ -149,6 +237,7 @@ class ReadOnlyRunner:
         nested = unwrap_docker_exec(values)
         if not nested or nested[0].lower() not in {"mysql", "mariadb"}:
             raise MutationRejected("run_sql requires mysql or mariadb")
+        _reject_sql_bearing_argv(nested)
         _validate_select_only_sql(sql)
 
         completed = subprocess.run(
@@ -161,10 +250,10 @@ class ReadOnlyRunner:
         )
         evidence = CommandEvidence(
             evidence_id=evidence_id,
-            argv=values,
+            argv=_redact_evidence_argv(values),
             returncode=completed.returncode,
             stdout=completed.stdout,
-            stderr=completed.stderr,
+            stderr=_redact_evidence_stderr(completed.stderr, sensitive=False),
         )
         if completed.returncode != 0:
             raise ProbeFailed(evidence)
