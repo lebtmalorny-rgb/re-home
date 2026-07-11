@@ -14,6 +14,8 @@ from live_discovery.neutron import NeutronCollector, compare_neutron_results
 
 
 class FixtureClient:
+    _fixture_only = True
+
     def __init__(self, fixture):
         self.fixture = deepcopy(fixture)
         self.responses = {
@@ -22,9 +24,11 @@ class FixtureClient:
         }
         self.queried_tables = []
         self.queries = []
+        self.commands = []
 
     def json(self, command, evidence_id, required=True):
         del required
+        self.commands.append(deepcopy(command))
         key = tuple(command)
         if key not in self.responses:
             raise AssertionError(f"unexpected OpenStack command: {command}")
@@ -59,9 +63,35 @@ def schema_from_fixture(fixture):
     return {f"neutron.{table}": {} for table in fixture["schema_tables"]}
 
 
+UUID_ALIASES = {
+    alias: f"00000000-0000-0000-0000-{index:012d}"
+    for index, alias in enumerate(
+        (
+            "port-1", "network-1", "instance-1", "subnet-1", "segment-1",
+            "sg-1", "rule-1", "address-group-1", "qos-1", "trunk-1",
+            "router-1", "fip-1", "network-external", "pf-1",
+        ),
+        start=1,
+    )
+}
+
+
+def canonical_uuid_fixture(fixture):
+    def replace(value):
+        if isinstance(value, str):
+            return UUID_ALIASES.get(value, value)
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        return value
+
+    return replace(deepcopy(fixture))
+
+
 def collect_from_fixture(fixture, port_ids):
     client = FixtureClient(fixture)
-    result = NeutronCollector(
+    result = NeutronCollector.for_fixture(
         client, fixture.get("side", "source"), schema_from_fixture(fixture)
     ).collect(port_ids)
     return result
@@ -206,7 +236,106 @@ class NeutronCollectorTests(unittest.TestCase):
 
         self.assertIn("Neutron port roots invalid", result.blockers)
         self.assertEqual([], client.queries)
+        self.assertEqual([], client.commands)
         self.assertNotIn("port-root-secret", json.dumps(result.to_dict()))
+
+    def test_production_rejects_short_fixture_alias_before_acquisition(self):
+        client = FixtureClient(self.source_fixture)
+
+        result = NeutronCollector(
+            client, "source", schema_from_fixture(self.source_fixture)
+        ).collect(["port-1"])
+
+        self.assertIn("Neutron port roots invalid", result.blockers)
+        self.assertEqual([], client.queries)
+        self.assertEqual([], client.commands)
+        self.assertNotIn("port-1", json.dumps(result.to_dict()))
+
+    def test_fixture_aliases_require_explicit_fixture_only_factory(self):
+        result = NeutronCollector.for_fixture(
+            FixtureClient(self.source_fixture),
+            "source",
+            schema_from_fixture(self.source_fixture),
+        ).collect(["port-1"])
+
+        self.assertFalse(any("port roots invalid" in item for item in result.blockers))
+        with self.assertRaises(ValueError):
+            NeutronCollector.for_fixture(
+                object(), "source", schema_from_fixture(self.source_fixture)
+            )
+
+    def test_readiness_rejects_alias_results_without_fixture_marker(self):
+        source = collect_from_fixture(self.source_fixture, ["port-1"])
+        target = collect_from_fixture(self.ovs_target_fixture, ["port-1"])
+        if hasattr(source, "_fixture_aliases"):
+            del source._fixture_aliases
+        if hasattr(target, "_fixture_aliases"):
+            del target._fixture_aliases
+
+        result = compare_neutron_results(
+            source,
+            target,
+            runtime_from_fixture(self.source_fixture),
+            runtime_from_fixture(self.ovs_target_fixture),
+            "ovs",
+        )
+
+        self.assertNotIn("port-1", json.dumps(result.to_dict()))
+
+    def test_production_accepts_canonical_uuid_dependency_graph(self):
+        fixture = canonical_uuid_fixture(self.source_fixture)
+        port_id = UUID_ALIASES["port-1"]
+
+        result = NeutronCollector(
+            FixtureClient(fixture), "source", schema_from_fixture(fixture)
+        ).collect([port_id])
+
+        self.assertEqual([], result.blockers)
+        self.assertIn(f"port:{port_id}", {node.key for node in result.nodes})
+        self.assertNotIn("port-1", json.dumps(result.to_dict()))
+        uuid_node_kinds = {
+            "port", "network", "subnet", "segment", "security_group",
+            "qos_policy", "trunk", "floating_ip", "router", "address_group",
+        }
+        canonical_uuid = r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+        for node in result.nodes:
+            if node.kind in uuid_node_kinds:
+                self.assertRegex(node.id, canonical_uuid)
+
+    def test_production_excludes_malformed_dependency_ids(self):
+        cases = (
+            ("segment", "networksegments", "id", "segment-id-secret"),
+            ("qos", "qos_port_policy_bindings", "policy_id", "qos-id-secret"),
+            ("router", "routerports", "router_id", "router-id-secret"),
+        )
+        for name, table, field, secret in cases:
+            with self.subTest(name=name):
+                fixture = canonical_uuid_fixture(self.source_fixture)
+                fixture["tables"][table][0][field] = secret
+                port_id = UUID_ALIASES["port-1"]
+
+                result = NeutronCollector(
+                    FixtureClient(fixture), "source", schema_from_fixture(fixture)
+                ).collect([port_id])
+
+                self.assertNotIn(secret, json.dumps(result.to_dict()))
+
+    def test_production_excludes_malformed_rbac_target_project_id(self):
+        fixture = canonical_uuid_fixture(self.source_fixture)
+        fixture["tables"]["addressgrouprbacs"] = [
+            {
+                "id": "00000000-0000-0000-0000-000000000015",
+                "object_id": UUID_ALIASES["address-group-1"],
+                "target_project": "target-project-id-secret",
+                "action": "access_as_shared",
+            }
+        ]
+
+        result = NeutronCollector(
+            FixtureClient(fixture), "source", schema_from_fixture(fixture)
+        ).collect([UUID_ALIASES["port-1"]])
+
+        self.assertNotIn("target-project-id-secret", json.dumps(result.to_dict()))
 
     def test_missing_qos_policy_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)
@@ -261,6 +390,68 @@ class NeutronCollectorTests(unittest.TestCase):
                 )
                 self.assertNotIn("binding-level-dict-secret", serialized)
                 self.assertNotIn("binding-level-list-secret", serialized)
+
+    def test_malformed_supplied_ml2_hosts_fail_closed(self):
+        cases = (
+            (
+                "binding-dict", "ml2_port_bindings",
+                {"token": "binding-host-secret"},
+                "ML2 binding host invalid for port port-1", "ml2_binding",
+            ),
+            (
+                "binding-whitespace", "ml2_port_bindings", "   ",
+                "ML2 binding host invalid for port port-1", "ml2_binding",
+            ),
+            (
+                "level-list", "ml2_port_binding_levels",
+                ["level-host-secret"],
+                "binding level host invalid for port port-1", "binding_level",
+            ),
+            (
+                "level-malformed", "ml2_port_binding_levels", "compute/023",
+                "binding level host invalid for port port-1", "binding_level",
+            ),
+        )
+        for name, table, value, reason, node_kind in cases:
+            with self.subTest(name=name):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"][table][0]["host"] = value
+
+                result = collect_from_fixture(fixture, ["port-1"])
+                serialized = json.dumps(result.to_dict())
+
+                self.assertIn(reason, result.blockers)
+                self.assertFalse(any(node.kind == node_kind for node in result.nodes))
+                self.assertNotIn("binding-host-secret", serialized)
+                self.assertNotIn("level-host-secret", serialized)
+
+    def test_missing_or_empty_ml2_hosts_are_explicit_unbound(self):
+        cases = (
+            ("ml2_port_bindings", "ml2_binding", "port-1:unbound"),
+            (
+                "ml2_port_binding_levels", "binding_level",
+                "port-1:unbound:0",
+            ),
+        )
+        for table, node_kind, expected_id in cases:
+            for supplied in (False, True):
+                with self.subTest(table=table, supplied=supplied):
+                    fixture = deepcopy(self.source_fixture)
+                    row = fixture["tables"][table][0]
+                    if supplied:
+                        row["host"] = ""
+                    else:
+                        row.pop("host")
+
+                    result = collect_from_fixture(fixture, ["port-1"])
+
+                    self.assertIn(
+                        expected_id,
+                        {
+                            node.id for node in result.nodes
+                            if node.kind == node_kind
+                        },
+                    )
 
     def test_missing_router_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)
@@ -391,7 +582,7 @@ class NeutronCollectorTests(unittest.TestCase):
         )
         client = FixtureClient(fixture)
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             client, "source", schema_from_fixture(fixture)
         ).collect(["port-2"])
         keys = {node.key for node in result.nodes}
@@ -453,7 +644,7 @@ class NeutronCollectorTests(unittest.TestCase):
         fixture = deepcopy(self.ovs_target_fixture)
         client = FixtureClient(fixture)
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             client, "target", schema_from_fixture(fixture)
         ).collect(["port-1"])
 
@@ -469,7 +660,9 @@ class NeutronCollectorTests(unittest.TestCase):
             }
         }
 
-        result = NeutronCollector(client, "target", schema).collect(["port-1"])
+        result = NeutronCollector.for_fixture(
+            client, "target", schema
+        ).collect(["port-1"])
 
         self.assertFalse(
             any("required Neutron table missing" in item for item in result.blockers)
@@ -478,7 +671,7 @@ class NeutronCollectorTests(unittest.TestCase):
     def test_db_queries_are_acquired_with_explicit_active_root_filters(self):
         client = FixtureClient(self.source_fixture)
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             client, "source", schema_from_fixture(self.source_fixture)
         ).collect(["port-1"])
         queries = {table: filters for table, filters in client.queries}
@@ -502,7 +695,7 @@ class NeutronCollectorTests(unittest.TestCase):
 
         client = BareRecordClient(self.source_fixture)
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             client, "source", schema_from_fixture(self.source_fixture)
         ).collect(["port-1"])
 
@@ -516,7 +709,7 @@ class NeutronCollectorTests(unittest.TestCase):
                     records[0]["source"] = "untrusted"
                 return records, evidence
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             ExtraEnvelopeClient(self.source_fixture),
             "source",
             schema_from_fixture(self.source_fixture),
@@ -532,7 +725,7 @@ class NeutronCollectorTests(unittest.TestCase):
                     evidence["password"] = "db-evidence-secret"
                 return records, evidence
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             ArbitraryEvidenceClient(self.source_fixture),
             "source",
             schema_from_fixture(self.source_fixture),
@@ -548,7 +741,7 @@ class NeutronCollectorTests(unittest.TestCase):
                     raise RuntimeError("database-password-secret")
                 return super().db_records(table, filters)
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             FailingDbClient(self.source_fixture),
             "source",
             schema_from_fixture(self.source_fixture),
@@ -583,7 +776,7 @@ class NeutronCollectorTests(unittest.TestCase):
                 evidence["token"] = "api-evidence-token"
                 return payload, evidence
 
-        result = NeutronCollector(
+        result = NeutronCollector.for_fixture(
             SecretEvidenceClient(fixture), "source", schema_from_fixture(fixture)
         ).collect(["port-1"])
         serialized = json.dumps(result.to_dict())
@@ -976,13 +1169,32 @@ class NeutronCollectorTests(unittest.TestCase):
             result.blockers,
         )
 
-    def test_unsupported_backend_is_explicit_unknown(self):
-        result = compare_source_target(
-            self.source_fixture, self.ovs_target_fixture, backend="linuxbridge"
+    def test_invalid_or_unsupported_backend_is_sanitized_unknown(self):
+        cases = (
+            None,
+            {"token": "backend-dict-secret"},
+            ["backend-list-secret"],
+            "   ",
+            "backend-string-secret",
         )
+        for backend in cases:
+            with self.subTest(backend=backend):
+                result = compare_neutron_results(
+                    collect_from_fixture(self.source_fixture, ["port-1"]),
+                    collect_from_fixture(self.ovs_target_fixture, ["port-1"]),
+                    runtime_from_fixture(self.source_fixture),
+                    runtime_from_fixture(self.ovs_target_fixture),
+                    backend,
+                )
+                serialized = json.dumps(result.to_dict())
 
-        self.assertIn("unsupported network backend: linuxbridge", result.unknowns)
-        self.assertTrue(any(check.status == "UNKNOWN" for check in result.checks))
+                self.assertIn("network backend unsupported or invalid", result.unknowns)
+                self.assertNotIn("backend-dict-secret", serialized)
+                self.assertNotIn("backend-list-secret", serialized)
+                self.assertNotIn("backend-string-secret", serialized)
+                self.assertTrue(
+                    any(check.status == "UNKNOWN" for check in result.checks)
+                )
 
 
 if __name__ == "__main__":

@@ -117,8 +117,25 @@ _INTEGER_FACT_FIELDS = {
 }
 _MAX_BINDING_LEVEL = 255
 _RUNTIME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_OPENSTACK_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 _MAC_ADDRESS = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 _PORT_IDENTITY_FIELDS = {"network_id", "device_id", "device_owner", "mac_address"}
+_OPENSTACK_ID_FACT_FIELDS = {
+    "id", "api_id", "network_id", "device_id", "subnetpool_id", "port_id",
+    "segment_id", "project_id", "security_group_id", "remote_group_id",
+    "remote_address_group_id", "subnet_id", "trunk_id", "fixed_port_id",
+    "router_id", "floating_network_id", "floatingip_id", "internal_port_id",
+    "object_id", "address_group_id",
+}
+_FIXTURE_POLICY_TOKEN = object()
+
+
+class _PolicyMapping(dict):
+    def __init__(self, value: Mapping[str, Any], allow_fixture_aliases: bool):
+        super().__init__(value)
+        self.allow_fixture_aliases = allow_fixture_aliases
 
 
 def _field(payload: object, *names: str) -> Any:
@@ -138,32 +155,43 @@ def _field(payload: object, *names: str) -> Any:
     return None
 
 
-def _identifier_list(value: object) -> Optional[List[str]]:
+def _openstack_id(
+    value: object, allow_fixture_aliases: bool = False
+) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    if _OPENSTACK_UUID.fullmatch(value):
+        return value
+    if allow_fixture_aliases and _RUNTIME_NAME.fullmatch(value):
+        return value
+    return None
+
+
+def _identifier_list(
+    value: object, allow_fixture_aliases: bool = False
+) -> Optional[List[str]]:
     if isinstance(value, str):
-        return [value] if _RUNTIME_NAME.fullmatch(value) else None
+        identifier = _openstack_id(value, allow_fixture_aliases)
+        return [identifier] if identifier is not None else None
     if not isinstance(value, (list, tuple, set)):
         return None
     values = []
     for item in value:
         if isinstance(item, Mapping):
             item = _field(item, "id", "uuid")
-        if not isinstance(item, str) or not _RUNTIME_NAME.fullmatch(item):
+        identifier = _openstack_id(item, allow_fixture_aliases)
+        if identifier is None:
             return None
-        values.append(item)
+        values.append(identifier)
     return list(dict.fromkeys(values))
-
-
-def _identifiers(value: object) -> List[str]:
-    return _identifier_list(value) or []
 
 
 def _row_id(row: Mapping[str, Any], *names: str) -> Optional[str]:
     value = _field(row, *names)
-    if isinstance(value, str):
-        return value if _RUNTIME_NAME.fullmatch(value) else None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return None
+    return _openstack_id(
+        value,
+        bool(getattr(row, "allow_fixture_aliases", False)),
+    )
 
 
 def _schema_table_names(schema: object) -> Set[str]:
@@ -186,24 +214,38 @@ def _dedupe(values: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
-def _port_identity(field: str, value: object) -> Optional[str]:
+def _port_identity(
+    field: str, value: object, allow_fixture_aliases: bool = False
+) -> Optional[str]:
     if not isinstance(value, str):
         return None
     if field == "mac_address":
         return value.lower() if _MAC_ADDRESS.fullmatch(value) else None
+    if field in {"network_id", "device_id"}:
+        return _openstack_id(value, allow_fixture_aliases)
     return value if _RUNTIME_NAME.fullmatch(value) else None
 
 
-def _normalize_fact_value(field: str, value: object) -> object:
+def _normalize_fact_value(
+    field: str, value: object, allow_fixture_aliases: bool = False
+) -> object:
     if field == "security_group_ids":
         if not isinstance(value, (list, tuple, set)):
             return _INVALID_FACT
-        identifiers = _identifier_list(value)
+        identifiers = _identifier_list(value, allow_fixture_aliases)
         return identifiers if identifiers is not None else _INVALID_FACT
     if value is None:
         return None
     if field in _PORT_IDENTITY_FIELDS:
-        normalized = _port_identity(field, value)
+        normalized = _port_identity(field, value, allow_fixture_aliases)
+        return normalized if normalized is not None else _INVALID_FACT
+    if field == "target_project":
+        if value == "*":
+            return value
+        normalized = _openstack_id(value, allow_fixture_aliases)
+        return normalized if normalized is not None else _INVALID_FACT
+    if field in _OPENSTACK_ID_FACT_FIELDS:
+        normalized = _openstack_id(value, allow_fixture_aliases)
         return normalized if normalized is not None else _INVALID_FACT
     if field in _BOOLEAN_FACT_FIELDS:
         return value if isinstance(value, bool) else _INVALID_FACT
@@ -218,6 +260,9 @@ def _normalize_fact_value(field: str, value: object) -> object:
 
 def _allowlisted(payload: Mapping[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
     facts = {}
+    allow_fixture_aliases = bool(
+        getattr(payload, "allow_fixture_aliases", False)
+    )
     normalized = {
         str(key).lower().replace("-", "_").replace(" ", "_"): value
         for key, value in payload.items()
@@ -225,9 +270,13 @@ def _allowlisted(payload: Mapping[str, Any], fields: Sequence[str]) -> Dict[str,
     for field in fields:
         value = _INVALID_FACT
         if field in payload:
-            value = _normalize_fact_value(field, payload[field])
+            value = _normalize_fact_value(
+                field, payload[field], allow_fixture_aliases
+            )
         elif field in normalized:
-            value = _normalize_fact_value(field, normalized[field])
+            value = _normalize_fact_value(
+                field, normalized[field], allow_fixture_aliases
+            )
         if value is not _INVALID_FACT:
             facts[field] = deepcopy(value)
     return facts
@@ -254,19 +303,41 @@ def _runtime_name(value: object) -> Optional[str]:
     return value
 
 
+def _ml2_host(row: Mapping[str, Any]) -> Tuple[str, bool]:
+    raw_host = _field(row, "host")
+    if raw_host is None or raw_host == "":
+        return "unbound", True
+    host = _runtime_name(raw_host)
+    return (host or "unbound"), host is not None
+
+
 class NeutronCollector:
-    def __init__(self, client, side: str, schema) -> None:
+    def __init__(self, client, side: str, schema, *, _fixture_policy=None) -> None:
         self.client = client
         self.side = side
         self.schema = schema
         self.available_tables = _schema_table_names(schema)
+        self._allow_fixture_aliases = _fixture_policy is _FIXTURE_POLICY_TOKEN
+
+    @classmethod
+    def for_fixture(cls, client, side: str, schema):
+        if getattr(client, "_fixture_only", False) is not True:
+            raise ValueError("fixture-only Neutron client required")
+        return cls(
+            client, side, schema, _fixture_policy=_FIXTURE_POLICY_TOKEN
+        )
 
     def collect(self, port_ids: Sequence[str]) -> CollectorResult:
         result = CollectorResult(service="neutron", side=self.side)
+        if self._allow_fixture_aliases:
+            result._fixture_aliases = _FIXTURE_POLICY_TOKEN
         if not port_ids:
             result.blockers.append("Neutron port roots missing")
             return result
-        normalized_ports = [_runtime_name(value) for value in port_ids]
+        normalized_ports = [
+            _openstack_id(value, self._allow_fixture_aliases)
+            for value in port_ids
+        ]
         if any(value is None for value in normalized_ports):
             result.blockers.append("Neutron port roots invalid")
             return result
@@ -346,8 +417,12 @@ class NeutronCollector:
             for field in ("network_id", "mac_address", "device_id", "device_owner"):
                 api_raw = _field(api, field)
                 db_raw = _field(db_port, field)
-                api_value = _port_identity(field, api_raw)
-                db_value = _port_identity(field, db_raw)
+                api_value = _port_identity(
+                    field, api_raw, self._allow_fixture_aliases
+                )
+                db_value = _port_identity(
+                    field, db_raw, self._allow_fixture_aliases
+                )
                 api_present = api_raw not in (None, "")
                 db_present = db_raw not in (None, "")
                 if (
@@ -368,10 +443,6 @@ class NeutronCollector:
                     result.blockers.append(reason)
             facts = _table_facts("ports", db_port)
             facts.update(_allowlisted(api, PORT_FACT_FIELDS))
-            if "security_group_ids" in facts:
-                facts["security_group_ids"] = _identifiers(
-                    facts["security_group_ids"]
-                )
             facts["api_id"] = api_id
             node = add_node("port", port_id, facts, [evidence_id] if evidence_id else [])
             assert node is not None
@@ -384,7 +455,9 @@ class NeutronCollector:
             api_security_group_raw = _field(
                 api, "security_group_ids", "security_groups"
             )
-            api_security_group_ids = _identifier_list(api_security_group_raw)
+            api_security_group_ids = _identifier_list(
+                api_security_group_raw, self._allow_fixture_aliases
+            )
             if (
                 api_security_group_raw is not None
                 and api_security_group_ids is None
@@ -487,7 +560,12 @@ class NeutronCollector:
                 port_id = _row_id(row, "port_id")
                 if port_id not in selected_port_set:
                     continue
-                host = _row_id(row, "host") or "unbound"
+                host, host_valid = _ml2_host(row)
+                if not host_valid:
+                    result.blockers.append(
+                        f"ML2 binding host invalid for port {port_id}"
+                    )
+                    continue
                 binding_id = f"{port_id}:{host}"
                 binding = add_node(
                     "ml2_binding", binding_id,
@@ -512,7 +590,12 @@ class NeutronCollector:
             port_id = _row_id(row, "port_id")
             if port_id not in selected_port_set:
                 continue
-            host = _row_id(row, "host") or "unbound"
+            host, host_valid = _ml2_host(row)
+            if not host_valid:
+                result.blockers.append(
+                    f"binding level host invalid for port {port_id}"
+                )
+                continue
             level = _binding_level(_field(row, "level"))
             if level is None:
                 result.blockers.append(
@@ -869,7 +952,11 @@ class NeutronCollector:
             ):
                 result.blockers.append(f"DB row outside filter: {table}[{index}]")
                 continue
-            rows.append(deepcopy(dict(row)))
+            rows.append(
+                _PolicyMapping(
+                    deepcopy(dict(row)), self._allow_fixture_aliases
+                )
+            )
         return rows
 
     def _api(
@@ -889,7 +976,9 @@ class NeutronCollector:
         evidence_value = _field(evidence, "evidence_id", "id")
         if evidence_value != evidence_id:
             result.blockers.append(f"OpenStack API evidence invalid: {evidence_id}")
-            return payload, None
+            return _PolicyMapping(
+                deepcopy(dict(payload)), self._allow_fixture_aliases
+            ), None
         result.evidence.append(
             {
                 "evidence_id": evidence_id,
@@ -897,7 +986,9 @@ class NeutronCollector:
                 "command": list(command),
             }
         )
-        return payload, evidence_id
+        return _PolicyMapping(
+            deepcopy(dict(payload)), self._allow_fixture_aliases
+        ), evidence_id
 
     def _expand_optional(
         self,
@@ -1100,8 +1191,28 @@ class NeutronCollector:
                 add_node("address_group", address_group_id, facts)
 
 
+def _result_allows_fixture_aliases(result: CollectorResult) -> bool:
+    return getattr(result, "_fixture_aliases", None) is _FIXTURE_POLICY_TOKEN
+
+
 def _node_map(result: CollectorResult, kind: str) -> Dict[str, ResourceNode]:
-    return {node.id: node for node in result.nodes if node.kind == kind}
+    allow_fixture_aliases = _result_allows_fixture_aliases(result)
+    nodes = {}
+    for node in result.nodes:
+        if node.kind != kind:
+            continue
+        identifier = _openstack_id(node.id, allow_fixture_aliases)
+        if identifier is not None:
+            nodes[identifier] = node
+    return nodes
+
+
+def _result_row_id(
+    result: CollectorResult, row: Mapping[str, Any], *names: str
+) -> Optional[str]:
+    return _openstack_id(
+        _field(row, *names), _result_allows_fixture_aliases(result)
+    )
 
 
 def _port_network(result: CollectorResult, port_id: str) -> Optional[str]:
@@ -1114,7 +1225,7 @@ def _port_network(result: CollectorResult, port_id: str) -> Optional[str]:
         ):
             return edge.target.removeprefix(prefix)
     port = _node_map(result, "port").get(port_id)
-    return _row_id(port.facts, "network_id") if port else None
+    return _result_row_id(result, port.facts, "network_id") if port else None
 
 
 def _port_segments(result: CollectorResult, port_id: str) -> List[ResourceNode]:
@@ -1205,9 +1316,15 @@ def compare_neutron_results(
     target: CollectorResult,
     source_runtime: CollectorResult,
     target_runtime: CollectorResult,
-    network_backend: str,
+    network_backend: object,
 ) -> CollectorResult:
     result = CollectorResult(service="neutron-readiness", side="target")
+    normalized_backend = (
+        network_backend
+        if isinstance(network_backend, str)
+        and network_backend in {"ovs", "ovn"}
+        else None
+    )
     source_ports = _node_map(source, "port")
     target_ports = _node_map(target, "port")
     target_networks = _node_map(target, "network")
@@ -1266,7 +1383,9 @@ def compare_neutron_results(
             )
 
         network_id = _port_network(source, port_id)
-        target_port_network = _row_id(target_port.facts, "network_id")
+        target_port_network = _result_row_id(
+            target, target_port.facts, "network_id"
+        )
         if network_id and target_port_network != network_id:
             check(
                 f"neutron.port-network.{port_id}", "BLOCKED",
@@ -1304,7 +1423,8 @@ def compare_neutron_results(
         matches_by_signature = {
             signature: [
                 segment for segment in target_segments
-                if _row_id(segment.facts, "network_id") == network_id
+                if _result_row_id(target, segment.facts, "network_id")
+                == network_id
                 and _segment_signature(segment) == signature
             ]
             for signature in signatures
@@ -1349,18 +1469,18 @@ def compare_neutron_results(
                 [source_port.key, *(node.key for node in segment_matches)],
             )
 
-        if network_backend == "ovs":
+        if normalized_backend == "ovs":
             _compare_ovs_port(
                 port_id, source_runtime, target_runtime, check
             )
-        elif network_backend == "ovn":
+        elif normalized_backend == "ovn":
             _compare_ovn_port(
                 port_id, source_runtime, target_runtime, check
             )
         else:
             check(
                 f"neutron.backend.{port_id}", "UNKNOWN",
-                f"unsupported network backend: {network_backend}",
+                "network backend unsupported or invalid",
                 [source_port.key],
             )
     return result
