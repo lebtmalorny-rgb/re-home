@@ -10,6 +10,20 @@ from live_discovery.runner import MutationRejected, ProbeFailed, ReadOnlyRunner
 
 
 class LiveDiscoveryRunnerTests(unittest.TestCase):
+    @patch("live_discovery.runner.subprocess.run")
+    def test_allows_read_only_qemu_machine_help_probe(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = "pc-q35-9.0 fixture\n"
+        run.return_value.stderr = ""
+
+        evidence = ReadOnlyRunner().run(
+            ["qemu-system-x86_64", "-machine", "help"],
+            "qemu-machine-help",
+        )
+
+        self.assertEqual(0, evidence.returncode)
+        run.assert_called_once()
+
     def test_rejects_mutating_openstack_command_before_subprocess(self):
         runner = ReadOnlyRunner()
         with self.assertRaisesRegex(MutationRejected, "server set"):

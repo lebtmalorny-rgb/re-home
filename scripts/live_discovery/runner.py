@@ -15,6 +15,7 @@ READ_ONLY_EXECUTABLES = {
     "openstack", "nova-manage", "neutron-db-manage", "cinder-manage",
     "mysql", "mariadb", "virsh", "ovs-vsctl", "ovs-ofctl", "ovn-nbctl",
     "ovn-sbctl", "rbd", "lvs", "stat", "test", "docker", "printf", "false",
+    "qemu-system-x86_64",
 }
 
 _DOCKER_EXEC_OPTIONS_WITH_VALUE = {
@@ -549,6 +550,11 @@ class ReadOnlyRunner:
                 raise MutationRejected(f"unknown executable rejected: {nested_executable}")
         else:
             nested_executable = executable
+
+        if nested_executable == "qemu-system-x86_64" and nested[1:] != [
+            "-machine", "help",
+        ]:
+            raise MutationRejected("only qemu -machine help is allowed")
 
         if not allow_sql and nested_executable in {"mysql", "mariadb"}:
             raise MutationRejected("mysql requires run_sql")
