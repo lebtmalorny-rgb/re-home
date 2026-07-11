@@ -15,31 +15,183 @@
           Live discovery never chooses a first host implicitly. Inventory must
           contain exactly one host in every required role.
 
-    - name: Live discovery | freeze caller run ID or UTC-generated run ID
+    - name: Live discovery | freeze authoritative source controller variables
+      ansible.builtin.set_fact:
+        live_discovery_frozen_source:
+          controller: "{{ groups['source_control'][0] }}"
+          rehome_host: "{{ hostvars[groups['source_control'][0]].rehome_host }}"
+          run_id: "{{ hostvars[groups['source_control'][0]].live_discovery_run_id }}"
+          remote_dir: "{{ hostvars[groups['source_control'][0]].live_discovery_remote_dir }}"
+          local_dir: "{{ hostvars[groups['source_control'][0]].live_discovery_local_dir }}"
+          target_profile: "{{ hostvars[groups['source_control'][0]].live_discovery_target_profile }}"
+          schema_policy: "{{ hostvars[groups['source_control'][0]].live_discovery_schema_policy_file }}"
+          phase_key: "{{ hostvars[groups['source_control'][0]].live_discovery_phase_hmac_key_file_local }}"
+          probe_config: "{{ hostvars[groups['source_control'][0]].live_discovery_source_probe_config_file_local }}"
+          glance_token: "{{ hostvars[groups['source_control'][0]].live_discovery_source_glance_token_file_local }}"
+          cinder_sensitive: "{{ hostvars[groups['source_control'][0]].live_discovery_source_cinder_sensitive_evidence_file_local }}"
+          clouds_file: "{{ hostvars[groups['source_control'][0]].source_clouds_file_local }}"
+          cloud_name: "{{ hostvars[groups['source_control'][0]].source_cloud_name }}"
+          openstack_container: "{{ hostvars[groups['source_control'][0]].openstack_cli_container }}"
+          storage_backends: "{{ hostvars[groups['source_control'][0]].live_discovery_storage_backends }}"
+          glance_range: "{{ hostvars[groups['source_control'][0]].live_discovery_glance_range_probe_enabled | bool }}"
+          fail_on_not_ready: "{{ hostvars[groups['source_control'][0]].live_discovery_fail_on_not_ready | bool }}"
+          argv:
+            nova_api: "{{ hostvars[groups['source_control'][0]].live_discovery_nova_api_db_version_argv }}"
+            nova_cell: "{{ hostvars[groups['source_control'][0]].live_discovery_nova_cell_db_version_argv }}"
+            neutron: "{{ hostvars[groups['source_control'][0]].live_discovery_neutron_db_version_argv }}"
+            cinder: "{{ hostvars[groups['source_control'][0]].live_discovery_cinder_db_version_argv }}"
+            inspect: "{{ hostvars[groups['source_control'][0]].live_discovery_container_inspect_argv_prefix }}"
+      no_log: true
+
+    - name: Live discovery | freeze authoritative target controller variables
+      ansible.builtin.set_fact:
+        live_discovery_frozen_target:
+          controller: "{{ groups['target_control'][0] }}"
+          reference: "{{ groups['target_reference_compute'][0] }}"
+          compute: "{{ groups['rehome_compute'][0] }}"
+          rehome_host: "{{ hostvars[groups['target_control'][0]].rehome_host }}"
+          remote_dir: "{{ hostvars[groups['target_control'][0]].live_discovery_remote_dir }}"
+          local_dir: "{{ hostvars[groups['target_control'][0]].live_discovery_local_dir }}"
+          target_profile: "{{ hostvars[groups['target_control'][0]].live_discovery_target_profile }}"
+          schema_policy: "{{ hostvars[groups['target_control'][0]].live_discovery_schema_policy_file }}"
+          phase_key: "{{ hostvars[groups['target_control'][0]].live_discovery_phase_hmac_key_file_local }}"
+          probe_config: "{{ hostvars[groups['target_control'][0]].live_discovery_target_probe_config_file_local }}"
+          glance_token: "{{ hostvars[groups['target_control'][0]].live_discovery_target_glance_token_file_local }}"
+          cinder_sensitive: "{{ hostvars[groups['target_control'][0]].live_discovery_target_cinder_sensitive_evidence_file_local }}"
+          clouds_file: "{{ hostvars[groups['target_control'][0]].target_clouds_file_local }}"
+          cloud_name: "{{ hostvars[groups['target_control'][0]].target_cloud_name }}"
+          openstack_container: "{{ hostvars[groups['target_control'][0]].openstack_cli_container }}"
+          storage_backends: "{{ hostvars[groups['target_control'][0]].live_discovery_storage_backends }}"
+          glance_range: "{{ hostvars[groups['target_control'][0]].live_discovery_glance_range_probe_enabled | bool }}"
+          fail_on_not_ready: "{{ hostvars[groups['target_control'][0]].live_discovery_fail_on_not_ready | bool }}"
+          argv:
+            nova_api: "{{ hostvars[groups['target_control'][0]].live_discovery_nova_api_db_version_argv }}"
+            nova_cell: "{{ hostvars[groups['target_control'][0]].live_discovery_nova_cell_db_version_argv }}"
+            neutron: "{{ hostvars[groups['target_control'][0]].live_discovery_neutron_db_version_argv }}"
+            cinder: "{{ hostvars[groups['target_control'][0]].live_discovery_cinder_db_version_argv }}"
+            inspect: "{{ hostvars[groups['target_control'][0]].live_discovery_container_inspect_argv_prefix }}"
+      no_log: true
+
+    - name: Live discovery | require controller orchestration invariants to agree
+      ansible.builtin.assert:
+        that:
+          - live_discovery_frozen_source.rehome_host == live_discovery_frozen_target.rehome_host
+          - live_discovery_frozen_source.remote_dir == live_discovery_frozen_target.remote_dir
+          - live_discovery_frozen_source.local_dir == live_discovery_frozen_target.local_dir
+          - live_discovery_frozen_source.target_profile == live_discovery_frozen_target.target_profile
+          - live_discovery_frozen_source.schema_policy == live_discovery_frozen_target.schema_policy
+          - live_discovery_frozen_source.phase_key == live_discovery_frozen_target.phase_key
+          - live_discovery_frozen_source.storage_backends == live_discovery_frozen_target.storage_backends
+          - live_discovery_frozen_source.glance_range == live_discovery_frozen_target.glance_range
+          - live_discovery_frozen_source.fail_on_not_ready
+          - live_discovery_frozen_target.fail_on_not_ready
+      no_log: true
+
+    - name: Live discovery | validate authoritative typed storage backends
+      ansible.builtin.assert:
+        that:
+          - item.value.keys() | sort == ['allowed_scopes', 'kind', 'probe_template', 'source_delegate', 'target_delegate']
+          - item.value.kind is match('^[a-z][a-z0-9_-]{0,31}$')
+          - item.value.source_delegate in groups['all']
+          - item.value.target_delegate in groups['all']
+          - item.value.allowed_scopes | sort == ['source-compute', 'target-storage']
+          - >-
+            (item.value.kind in ['nfs', 'file', 'rbd', 'lvm'] and
+             item.value.probe_template == ('nfs' if item.value.kind == 'file' else item.value.kind)) or
+            (item.value.kind not in ['nfs', 'file', 'rbd', 'lvm'] and
+             item.value.probe_template == 'unsupported')
+      loop: "{{ live_discovery_frozen_source.storage_backends | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Live discovery | require one explicit probe delegate per side
+      ansible.builtin.assert:
+        that:
+          - live_discovery_frozen_source.storage_backends.values() | map(attribute='source_delegate') | unique | list | length <= 1
+          - live_discovery_frozen_target.storage_backends.values() | map(attribute='target_delegate') | unique | list | length <= 1
+        fail_msg: >-
+          Task 10 executes one protected probe phase per side; every declared
+          backend on that side must therefore use the same explicit delegate.
+
+    - name: Live discovery | freeze caller run ID or collision-resistant generated ID
       ansible.builtin.set_fact:
         live_discovery_frozen_run_id: >-
-          {{ live_discovery_run_id if live_discovery_run_id | length > 0
-             else now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}
+          {{ live_discovery_frozen_source.run_id if live_discovery_frozen_source.run_id | length > 0
+             else now(utc=true, fmt='%Y%m%dT%H%M%S%fZ') ~ '-' ~
+                  lookup('password', '/dev/null length=16 chars=ascii_lowercase,digits') }}
+
+    - name: Live discovery | publish immutable localhost orchestration facts
+      ansible.builtin.set_fact:
+        rehome_host: "{{ live_discovery_frozen_source.rehome_host }}"
+        live_discovery_remote_dir: "{{ live_discovery_frozen_source.remote_dir }}"
+        live_discovery_local_dir: "{{ live_discovery_frozen_source.local_dir }}"
+        live_discovery_target_profile: "{{ live_discovery_frozen_source.target_profile }}"
+        live_discovery_schema_policy_file: "{{ live_discovery_frozen_source.schema_policy }}"
+        live_discovery_phase_hmac_key_file_local: "{{ live_discovery_frozen_source.phase_key }}"
+        live_discovery_source_probe_config_file_local: "{{ live_discovery_frozen_source.probe_config }}"
+        live_discovery_target_probe_config_file_local: "{{ live_discovery_frozen_target.probe_config }}"
+        live_discovery_source_glance_token_file_local: "{{ live_discovery_frozen_source.glance_token }}"
+        live_discovery_target_glance_token_file_local: "{{ live_discovery_frozen_target.glance_token }}"
+        live_discovery_source_cinder_sensitive_evidence_file_local: "{{ live_discovery_frozen_source.cinder_sensitive }}"
+        live_discovery_target_cinder_sensitive_evidence_file_local: "{{ live_discovery_frozen_target.cinder_sensitive }}"
+        source_clouds_file_local: "{{ live_discovery_frozen_source.clouds_file }}"
+        target_clouds_file_local: "{{ live_discovery_frozen_target.clouds_file }}"
+        source_cloud_name: "{{ live_discovery_frozen_source.cloud_name }}"
+        target_cloud_name: "{{ live_discovery_frozen_target.cloud_name }}"
+        openstack_cli_container: "{{ live_discovery_frozen_source.openstack_container }}"
+        live_discovery_storage_backends: "{{ live_discovery_frozen_source.storage_backends }}"
+        live_discovery_glance_range_probe_enabled: "{{ live_discovery_frozen_source.glance_range }}"
+        live_discovery_source_controller: "{{ live_discovery_frozen_source.controller }}"
+        live_discovery_target_controller: "{{ live_discovery_frozen_target.controller }}"
+        live_discovery_target_reference_host: "{{ live_discovery_frozen_target.reference }}"
+        live_discovery_rehome_compute_host: "{{ live_discovery_frozen_target.compute }}"
+        live_discovery_source_storage_probe_host: >-
+          {{ (live_discovery_frozen_source.storage_backends.values() |
+              map(attribute='source_delegate') | unique | list | first)
+             if live_discovery_frozen_source.storage_backends | length > 0
+             else live_discovery_frozen_source.controller }}
+        live_discovery_target_storage_probe_host: >-
+          {{ (live_discovery_frozen_target.storage_backends.values() |
+              map(attribute='target_delegate') | unique | list | first)
+             if live_discovery_frozen_target.storage_backends | length > 0
+             else live_discovery_frozen_target.controller }}
+      no_log: true
 
     - name: Live discovery | validate run ID before constructing paths
       ansible.builtin.assert:
         that:
-          - live_discovery_enabled | bool
           - live_discovery_frozen_run_id is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
           - live_discovery_target_profile == 'vanilla-openstack-2025.1-epoxy'
           - live_discovery_fail_on_not_ready | bool
           - live_discovery_phase_hmac_key_file_local | length > 0
           - live_discovery_source_probe_config_file_local | length > 0
           - live_discovery_target_probe_config_file_local | length > 0
-          - live_discovery_glance_token_file_local | length > 0
+          - live_discovery_source_glance_token_file_local | length > 0
+          - live_discovery_target_glance_token_file_local | length > 0
 
-    - name: Live discovery | publish immutable run paths to localhost facts
+    - name: Live discovery | validate all overrideable command argv
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/live_discovery/argv_policy.py"
+          - --config-json
+          - "{{ item | to_json }}"
+      loop:
+        - "{{ live_discovery_frozen_source.argv | combine({
+              'source_virsh': hostvars[live_discovery_rehome_compute_host].live_discovery_source_virsh_argv,
+              'target_virsh': hostvars[live_discovery_target_reference_host].live_discovery_target_virsh_argv,
+              'target_qemu': hostvars[live_discovery_target_reference_host].live_discovery_target_qemu_argv,
+              'openstack_container': live_discovery_frozen_source.openstack_container}) }}"
+        - "{{ live_discovery_frozen_target.argv | combine({
+              'source_virsh': hostvars[live_discovery_rehome_compute_host].live_discovery_source_virsh_argv,
+              'target_virsh': hostvars[live_discovery_target_reference_host].live_discovery_target_virsh_argv,
+              'target_qemu': hostvars[live_discovery_target_reference_host].live_discovery_target_qemu_argv,
+              'openstack_container': live_discovery_frozen_target.openstack_container}) }}"
+      changed_when: false
+
+    - name: Live discovery | publish immutable run path
       ansible.builtin.set_fact:
         live_discovery_local_run_dir: "{{ live_discovery_local_dir }}/{{ live_discovery_frozen_run_id }}"
-        live_discovery_source_controller: "{{ groups['source_control'][0] }}"
-        live_discovery_target_controller: "{{ groups['target_control'][0] }}"
-        live_discovery_target_reference_host: "{{ groups['target_reference_compute'][0] }}"
-        live_discovery_rehome_compute_host: "{{ groups['rehome_compute'][0] }}"
 
     - name: Live discovery | inspect protected local inputs
       ansible.builtin.stat:
@@ -48,7 +200,8 @@
         - "{{ live_discovery_phase_hmac_key_file_local }}"
         - "{{ live_discovery_source_probe_config_file_local }}"
         - "{{ live_discovery_target_probe_config_file_local }}"
-        - "{{ live_discovery_glance_token_file_local }}"
+        - "{{ live_discovery_source_glance_token_file_local }}"
+        - "{{ live_discovery_target_glance_token_file_local }}"
       register: live_discovery_protected_local_inputs
       no_log: true
 
@@ -61,12 +214,98 @@
       loop: "{{ live_discovery_protected_local_inputs.results }}"
       no_log: true
 
+    - name: Live discovery | require independently acquired per-side Glance tokens
+      ansible.builtin.assert:
+        that:
+          - live_discovery_source_glance_token_file_local != live_discovery_target_glance_token_file_local
+          - live_discovery_protected_local_inputs.results[3].stat.checksum != live_discovery_protected_local_inputs.results[4].stat.checksum
+        fail_msg: "Source and target Glance tokens must be independently acquired."
+      no_log: true
+
     - name: Live discovery | require bounded external HMAC anchor
       ansible.builtin.assert:
         that:
           - live_discovery_protected_local_inputs.results[0].stat.size >= 16
           - live_discovery_protected_local_inputs.results[0].stat.size <= 4096
         fail_msg: "The external phase HMAC key must contain 16..4096 bytes."
+      no_log: true
+
+    - name: Live discovery | load protected per-side probe plans
+      ansible.builtin.set_fact:
+        live_discovery_source_probe_plan: >-
+          {{ lookup('file', live_discovery_source_probe_config_file_local) | from_json }}
+        live_discovery_target_probe_plan: >-
+          {{ lookup('file', live_discovery_target_probe_config_file_local) | from_json }}
+      no_log: true
+
+    - name: Live discovery | validate authoritative backend and probe contract
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py"
+          - --backends-json
+          - "{{ live_discovery_storage_backends | to_json }}"
+          - --source-plan
+          - "{{ live_discovery_source_probe_config_file_local }}"
+          - --target-plan
+          - "{{ live_discovery_target_probe_config_file_local }}"
+          - --range-enabled
+          - "{{ live_discovery_glance_range_probe_enabled | bool | ternary('true', 'false') }}"
+          - --source-controller
+          - "{{ live_discovery_source_controller }}"
+          - --target-controller
+          - "{{ live_discovery_target_controller }}"
+          - --inventory-hosts-json
+          - "{{ groups['all'] | to_json }}"
+      register: live_discovery_probe_contract_result
+      changed_when: false
+      no_log: true
+
+    - name: Live discovery | freeze validated probe contract result
+      ansible.builtin.set_fact:
+        live_discovery_probe_contract: "{{ live_discovery_probe_contract_result.stdout | from_json }}"
+      no_log: true
+
+    - name: Live discovery | require derived delegates to match validated contract
+      ansible.builtin.assert:
+        that:
+          - live_discovery_probe_contract.source_delegate == live_discovery_source_storage_probe_host
+          - live_discovery_probe_contract.target_delegate == live_discovery_target_storage_probe_host
+
+    - name: Live discovery | validate probe plan envelopes and range policy
+      ansible.builtin.assert:
+        that:
+          - item.schema_version == 'openstack-rehome-probe-config/v1alpha1'
+          - item.storage is sequence
+          - item.glance is mapping
+          - item.glance.token_env == 'LIVE_DISCOVERY_GLANCE_TOKEN'
+          - live_discovery_glance_range_probe_enabled or item.glance.images | length == 0
+          - live_discovery_storage_backends | length > 0 or item.storage | length == 0
+      loop:
+        - "{{ live_discovery_source_probe_plan }}"
+        - "{{ live_discovery_target_probe_plan }}"
+      no_log: true
+
+    - name: Live discovery | bind source storage plan to authoritative backends
+      ansible.builtin.assert:
+        that:
+          - item.backend_id in live_discovery_storage_backends
+          - item.kind == live_discovery_storage_backends[item.backend_id].kind
+          - item.scope == 'source-compute'
+          - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
+          - live_discovery_storage_backends[item.backend_id].source_delegate == live_discovery_source_storage_probe_host
+      loop: "{{ live_discovery_source_probe_plan.storage }}"
+      no_log: true
+
+    - name: Live discovery | bind target storage plan to authoritative backends
+      ansible.builtin.assert:
+        that:
+          - item.backend_id in live_discovery_storage_backends
+          - item.kind == live_discovery_storage_backends[item.backend_id].kind
+          - item.scope == 'target-storage'
+          - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
+          - live_discovery_storage_backends[item.backend_id].target_delegate == live_discovery_target_storage_probe_host
+      loop: "{{ live_discovery_target_probe_plan.storage }}"
       no_log: true
 
     - name: Live discovery | inspect optional raw protected Cinder inputs
@@ -89,11 +328,27 @@
       when: not item.skipped | default(false)
       no_log: true
 
-    - name: Live discovery | create normal local artifact directory
+    - name: Live discovery | create local artifact parent
       ansible.builtin.file:
-        path: "{{ live_discovery_local_run_dir }}"
+        path: "{{ live_discovery_local_dir }}"
         state: directory
         mode: "0750"
+
+    - name: Live discovery | acquire exclusive local run directory
+      ansible.builtin.command:
+        argv:
+          - mkdir
+          - --
+          - "{{ live_discovery_local_run_dir }}"
+      changed_when: true
+
+    - name: Live discovery | persist owned run guard
+      ansible.builtin.copy:
+        dest: "{{ live_discovery_local_run_dir }}/run-owner.json"
+        mode: "0640"
+        content: >-
+          {{ {'schema_version': 'openstack-rehome-run-owner/v1alpha1',
+              'run_id': live_discovery_frozen_run_id} | to_nice_json }}
 
 - name: 02B | Collect source control-plane evidence
   hosts: source_control
@@ -121,7 +376,6 @@
             - {path: "{{ live_discovery_side_remote_dir }}", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/db-jsonl", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/db-stderr", mode: "0700"}
-            - {path: "{{ live_discovery_side_remote_dir }}/sql", mode: "0700"}
             - {path: "{{ live_discovery_side_remote_dir }}/profile", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/protected", mode: "0700"}
 
@@ -153,40 +407,6 @@
             live_discovery_mysql_password: >-
               {{ (lookup('file', live_discovery_kolla_passwords_file_local) | from_yaml)
                  [live_discovery_schema_mysql_password_key] }}
-          no_log: true
-
-        # Read-only commands: nova-manage api_db version; nova-manage db version;
-        # neutron-db-manage current --verbose; cinder-manage db version.
-        - name: Source live discovery | collect management DB versions
-          ansible.builtin.command:
-            argv: "{{ item.argv }}"
-          loop:
-            - {name: nova-api-db, argv: "{{ live_discovery_nova_api_db_version_argv }}"}
-            - {name: nova-cell-db, argv: "{{ live_discovery_nova_cell_db_version_argv }}"}
-            - {name: neutron-db, argv: "{{ live_discovery_neutron_db_version_argv }}"}
-            - {name: cinder-db, argv: "{{ live_discovery_cinder_db_version_argv }}"}
-          loop_control:
-            label: "{{ item.name }}"
-          register: live_discovery_source_profile_probes
-          changed_when: false
-          failed_when: false
-
-        - name: Source live discovery | collect Glance Alembic row
-          ansible.builtin.command:
-            argv: "{{ live_discovery_mysql_json_argv + ['--execute', 'SELECT version_num FROM glance.alembic_version;'] }}"
-          environment: "{{ live_discovery_mysql_environment }}"
-          register: live_discovery_source_glance_alembic
-          changed_when: false
-          failed_when: false
-          no_log: "{{ live_discovery_mysql_no_log | bool }}"
-
-        - name: Source live discovery | inspect service container image digests
-          ansible.builtin.command:
-            argv: "{{ live_discovery_container_inspect_argv_prefix + [item] }}"
-          loop: "{{ live_discovery_profile_containers }}"
-          register: live_discovery_source_image_inspects
-          changed_when: false
-          failed_when: false
           no_log: true
 
         - name: Source live discovery | collect information_schema
@@ -281,7 +501,6 @@
             - {path: "{{ live_discovery_side_remote_dir }}", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/db-jsonl", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/db-stderr", mode: "0700"}
-            - {path: "{{ live_discovery_side_remote_dir }}/sql", mode: "0700"}
             - {path: "{{ live_discovery_side_remote_dir }}/profile", mode: "0750"}
             - {path: "{{ live_discovery_side_remote_dir }}/protected", mode: "0700"}
 
@@ -350,7 +569,11 @@
         - name: Target live discovery | inspect service container image digests
           ansible.builtin.command:
             argv: "{{ live_discovery_container_inspect_argv_prefix + [item] }}"
-          loop: "{{ live_discovery_profile_containers }}"
+          loop:
+            - nova_api
+            - neutron_server
+            - cinder_api
+            - glance_api
           register: live_discovery_target_image_inspects_raw
           changed_when: false
           failed_when: false
@@ -525,14 +748,9 @@
           - live_discovery_target_storage_probe_host | length > 0
           - live_discovery_source_storage_probe_host in groups['all']
           - live_discovery_target_storage_probe_host in groups['all']
-          - >-
-            live_discovery_storage_backend_kinds | length == 0 or
-            (live_discovery_storage_backend_kinds |
-             difference(live_discovery_storage_backend_templates.keys() | list) |
-             length == 0)
         fail_msg: >-
-          Probe delegates must be explicit. An empty backend remains UNKNOWN;
-          otherwise declare a reviewed NFS, RBD, LVM or vendor read-only type.
+          Probe delegates must be explicit inventory hosts. Empty backend maps
+          deliberately fall back to the matching controller and render UNKNOWN.
 
     - name: Probe live discovery | refresh source signed phase and combine
       block:
@@ -574,7 +792,7 @@
             - {src: "{{ source_clouds_file_local }}", dest: clouds.yaml}
             - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
             - {src: "{{ live_discovery_source_probe_config_file_local }}", dest: source-probe-config.json}
-            - {src: "{{ live_discovery_glance_token_file_local }}", dest: glance-token}
+            - {src: "{{ live_discovery_source_glance_token_file_local }}", dest: glance-token}
           delegate_to: "{{ live_discovery_source_storage_probe_host }}"
           no_log: true
 
@@ -621,7 +839,7 @@
               - --out
               - "{{ live_discovery_source_probe_dir }}/api"
           environment:
-            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_glance_token_file_local) }}"
+            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_source_glance_token_file_local) }}"
           delegate_to: "{{ live_discovery_source_storage_probe_host }}"
           register: live_discovery_source_probe_phase
           changed_when: false
@@ -754,7 +972,7 @@
             - {src: "{{ target_clouds_file_local }}", dest: clouds.yaml}
             - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
             - {src: "{{ live_discovery_target_probe_config_file_local }}", dest: target-probe-config.json}
-            - {src: "{{ live_discovery_glance_token_file_local }}", dest: glance-token}
+            - {src: "{{ live_discovery_target_glance_token_file_local }}", dest: glance-token}
           delegate_to: "{{ live_discovery_target_storage_probe_host }}"
           no_log: true
 
@@ -811,7 +1029,7 @@
               - --out
               - "{{ live_discovery_target_probe_dir }}/api"
           environment:
-            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_glance_token_file_local) }}"
+            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_target_glance_token_file_local) }}"
           delegate_to: "{{ live_discovery_target_storage_probe_host }}"
           register: live_discovery_target_probe_phase
           changed_when: false

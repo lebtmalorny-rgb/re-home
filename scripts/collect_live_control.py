@@ -1611,6 +1611,112 @@ def _read_jsonl(path, query):
     return records
 
 
+def _verified_query_plan(args):
+    api = _read_json(args.api_result)
+    filters_document = _read_json(Path(args.api_result).with_name("uuid-filters.json"))
+    plan = _read_json(Path(args.api_result).with_name("db-query-plan.json"))
+    if not isinstance(api, dict) or set(api) != {"schema_version", "side", "api_result", "binding_sha256"} or api.get("schema_version") != API_RESULT_VERSION or api.get("side") != args.side:
+        raise ValueError("API result envelope is invalid")
+    if not isinstance(filters_document, dict) or set(filters_document) != {"schema_version", "side", "filters", "binding_sha256"} or filters_document.get("schema_version") != "openstack-rehome-uuid-filters/v1alpha1" or filters_document.get("side") != args.side or not isinstance(filters_document.get("filters"), list):
+        raise ValueError("UUID filter envelope is invalid")
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "side", "queries", "binding_sha256"} or plan.get("schema_version") != PLAN_VERSION or plan.get("side") != args.side or not isinstance(plan["queries"], list) or not plan["queries"] or len(plan["queries"]) > _MAX_QUERIES:
+        raise ValueError("DB query plan is invalid")
+    fixture_mode = bool(getattr(args, "fixture_phase", False))
+    if fixture_mode and any((getattr(args, "phase_key_file", None), getattr(args, "phase_key_env", None))):
+        raise ValueError("fixture phase trust anchor input is forbidden")
+    api_base = {key: value for key, value in api.items() if key != "binding_sha256"}
+    filters_base = {key: value for key, value in filters_document.items() if key != "binding_sha256"}
+    plan_base = {key: value for key, value in plan.items() if key != "binding_sha256"}
+    binding = _phase_binding(
+        api_base, filters_base, plan_base,
+        key=_load_phase_key(args, fixture=fixture_mode),
+        trust_domain="fixture" if fixture_mode else "live",
+    )
+    if {api["binding_sha256"], filters_document["binding_sha256"], plan["binding_sha256"]} != {binding}:
+        raise ValueError("API/filter/query phase binding is invalid")
+    planned_filters = [
+        {"query_id": query.get("query_id"), "schema": query.get("schema"),
+         "table": query.get("table"), "filters": query.get("filters")}
+        for query in plan["queries"] if isinstance(query, dict)
+    ]
+    if planned_filters != filters_document["filters"]:
+        raise ValueError("UUID filters differ from query plan")
+    _validate_query_coverage(args.side, api["api_result"], plan["queries"])
+    for query_index, query in enumerate(plan["queries"], start=1):
+        expected = {"query_id", "schema", "table", "columns", "filters", "sql", "jsonl_file", "rc_file"}
+        if not isinstance(query, dict) or set(query) != expected or not query["filters"]:
+            raise ValueError("DB query is invalid")
+        schema = validate_identifier(query["schema"])
+        table = validate_identifier(query["table"])
+        if not isinstance(query["columns"], list) or not query["columns"]:
+            raise ValueError("DB query columns are invalid")
+        columns = [validate_identifier(value) for value in query["columns"]]
+        if len(columns) != len(set(columns)) or not isinstance(query["filters"], dict):
+            raise ValueError("DB query scope is invalid")
+        normalized_filters = {
+            validate_identifier(column): values
+            for column, values in query["filters"].items()
+        }
+        if any(not isinstance(values, list) or not values for values in normalized_filters.values()):
+            raise ValueError("DB query scope is invalid")
+        where = "(" + ") OR (".join(
+            _scoped_in(column, normalized_filters[column])
+            for column in sorted(normalized_filters)
+        ) + ")"
+        expected_sql = build_json_row_query(schema, table, columns, where)
+        expected_query_id = f"{query_index:04d}-{schema}-{table}"
+        if (
+            query["sql"] != expected_sql
+            or query["query_id"] != expected_query_id
+            or query["jsonl_file"] != expected_query_id + ".jsonl"
+            or query["rc_file"] != expected_query_id + ".rc"
+        ):
+            raise ValueError("DB query identity or SQL is invalid")
+        validate_select_only_sql(query["sql"])
+    if _has_symlink_component(args.information_schema) or not args.information_schema.is_file() or args.information_schema.stat().st_size > _MAX_FILE:
+        raise ValueError("information_schema input is unsafe")
+    snapshot = parse_information_schema(args.information_schema)
+    if not snapshot.tables:
+        raise ValueError("information_schema evidence is empty")
+    expected_tables = _expected_plan_tables(
+        args.side, api["api_result"]["roots"], snapshot.tables.keys()
+    )
+    if {f"{query['schema']}.{query['table']}" for query in plan["queries"]} != expected_tables:
+        raise ValueError("DB query plan differs from live schema scope")
+    return plan
+
+
+def _write_verified_plan(path, plan):
+    path = _safe_out(path)
+    staging = Path(tempfile.mkdtemp(prefix=f".{path.name}.staging-", dir=path.parent))
+    try:
+        query_ids = [query["query_id"] for query in plan["queries"]]
+        marker = {
+            "schema_version": "openstack-rehome-verified-plan/v1alpha1",
+            "side": plan["side"],
+            "plan_sha256": hashlib.sha256(_canonical(plan).encode("utf-8")).hexdigest(),
+            "binding_sha256": plan["binding_sha256"],
+            "query_ids": query_ids,
+        }
+        marker_path = staging / "verified-plan.json"
+        marker_path.write_text(render_json(marker), encoding="utf-8")
+        marker_path.chmod(0o640)
+        for query in plan["queries"]:
+            sql_path = staging / f"{query['query_id']}.sql"
+            sql_path.write_text(query["sql"] + "\n", encoding="utf-8")
+            sql_path.chmod(0o600)
+        if path.exists():
+            raise ValueError("verified output directory already exists")
+        os.replace(staging, path)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _verify_phase(args):
+    _write_verified_plan(args.out, _verified_query_plan(args))
+
+
 def _closure_checks(side, api_cache_misses, db_cache_misses):
     checks = []
     if api_cache_misses:
@@ -1784,7 +1890,7 @@ def _combine_phase(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Collect read-only control-plane facts")
-    parser.add_argument("--phase", choices=("api", "combine"), required=True)
+    parser.add_argument("--phase", choices=("api", "verify", "combine"), required=True)
     parser.add_argument("--side", choices=("source", "target"), required=True)
     parser.add_argument("--rehome-host")
     parser.add_argument("--cloud")
@@ -1812,6 +1918,10 @@ def main(argv=None):
             if args.fixture is not None and any((args.rehome_host, args.cloud, args.clouds_file, args.container, args.information_schema, args.root_manifest, args.probe_config, args.capability_config, args.phase_key_file, args.phase_key_env)):
                 raise ValueError("fixture and live API arguments are mutually exclusive")
             _api_phase(args)
+        elif args.phase == "verify":
+            if args.fixture is not None or args.db_jsonl_dir is not None or args.schema_policy is not None or args.probe_config is not None or args.root_manifest is not None or args.capability_config is not None or args.cinder_sensitive_evidence is not None or any((args.rehome_host, args.cloud, args.clouds_file, args.container)) or not all((args.api_result, args.information_schema)):
+                raise ValueError("verify arguments are incomplete")
+            _verify_phase(args)
         else:
             if args.fixture is not None or args.probe_config is not None or args.root_manifest is not None or args.capability_config is not None or any((args.rehome_host, args.cloud, args.clouds_file, args.container)) or not all((args.api_result, args.db_jsonl_dir, args.information_schema, args.schema_policy)):
                 raise ValueError("combine arguments are incomplete")

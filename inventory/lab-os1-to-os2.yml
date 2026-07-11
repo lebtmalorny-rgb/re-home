@@ -43,18 +43,15 @@ all:
     container_runtime_cli: docker
     network_backend: ovs
     openstack_cli_container: kolla_toolbox
-    live_discovery_storage_backend_kind: nfs
-    live_discovery_storage_backend_kinds: [nfs]
-    live_discovery_source_storage_probe_host: os1-compute-02
-    live_discovery_target_storage_probe_host: os2-ctrl-01
     # NFS is the current lab profile only. The orchestration accepts the same
     # command-list shape for RBD, LVM or a reviewed vendor-specific probe.
     live_discovery_storage_backends:
       nfs:
-        supported: true
-        source_probe_host: os1-compute-02
-        target_probe_host: os2-ctrl-01
-        read_only_probe_argv: [stat, --format, "%s"]
+        kind: nfs
+        source_delegate: os1-compute-02
+        target_delegate: os2-ctrl-01
+        allowed_scopes: [source-compute, target-storage]
+        probe_template: nfs
     live_discovery_mysql_json_argv:
       - docker
       - exec

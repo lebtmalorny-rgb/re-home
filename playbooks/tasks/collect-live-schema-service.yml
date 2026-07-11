@@ -7,6 +7,18 @@
       - live_discovery_schema_db_names | length > 0
       - live_discovery_mysql_json_argv | length > 0
 
+- name: Live schema | validate rendered MySQL transport argv
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.argv_policy
+      - --mysql-json
+      - "{{ live_discovery_mysql_json_argv | to_json }}"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  changed_when: false
+  no_log: true
+
 - name: Live schema | query information_schema columns
   ansible.builtin.command:
     argv: >-

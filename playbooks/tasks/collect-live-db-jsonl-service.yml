@@ -1,8 +1,34 @@
 ---
+- name: Live DB JSONL | verify HMAC and exact query coverage before SQL
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ live_discovery_side_remote_dir }}/scripts/collect_live_control.py"
+      - --phase
+      - verify
+      - --side
+      - "{{ live_discovery_schema_side }}"
+      - --api-result
+      - "{{ live_discovery_side_remote_dir }}/api/api-result.json"
+      - --information-schema
+      - "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+      - --phase-key-file
+      - "{{ live_discovery_side_remote_dir }}/protected/phase-hmac.key"
+      - --out
+      - "{{ live_discovery_side_remote_dir }}/sql"
+  changed_when: false
+  no_log: true
+
 - name: Live DB JSONL | load generated query plan
   ansible.builtin.slurp:
     src: "{{ live_discovery_side_remote_dir }}/api/db-query-plan.json"
   register: live_discovery_db_query_plan_raw
+  no_log: true
+
+- name: Live DB JSONL | load HMAC-bound verified marker
+  ansible.builtin.slurp:
+    src: "{{ live_discovery_side_remote_dir }}/sql/verified-plan.json"
+  register: live_discovery_db_verified_marker_raw
   no_log: true
 
 - name: Live DB JSONL | decode exact Task 10 query plan
@@ -11,22 +37,43 @@
       {{ live_discovery_db_query_plan_raw.content | b64decode | from_json }}
   no_log: true
 
+- name: Live DB JSONL | decode verified marker
+  ansible.builtin.set_fact:
+    live_discovery_db_verified_marker: >-
+      {{ live_discovery_db_verified_marker_raw.content | b64decode | from_json }}
+  no_log: true
+
 - name: Live DB JSONL | validate plan envelope and side
   ansible.builtin.assert:
     that:
       - live_discovery_db_query_plan.schema_version == 'openstack-rehome-db-query-plan/v1alpha1'
       - live_discovery_db_query_plan.side == live_discovery_schema_side
       - live_discovery_db_query_plan.queries | length > 0
+      - live_discovery_db_verified_marker.schema_version == 'openstack-rehome-verified-plan/v1alpha1'
+      - live_discovery_db_verified_marker.side == live_discovery_schema_side
+      - live_discovery_db_verified_marker.binding_sha256 == live_discovery_db_query_plan.binding_sha256
+      - live_discovery_db_verified_marker.query_ids == (live_discovery_db_query_plan.queries | map(attribute='query_id') | list)
 
-- name: Live DB JSONL | write exact generated SQL files
-  ansible.builtin.copy:
-    dest: "{{ live_discovery_side_remote_dir }}/sql/{{ item.query_id }}.sql"
-    mode: "0600"
-    content: "{{ item.sql }}\n"
+- name: Live DB JSONL | bind verified marker to exact plan digest
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.mysql_json
+      - --verify-plan-marker
+      - "{{ live_discovery_side_remote_dir }}/api/db-query-plan.json"
+      - "{{ live_discovery_side_remote_dir }}/sql/verified-plan.json"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  changed_when: false
+
+- name: Live DB JSONL | require safe verified query IDs
+  ansible.builtin.assert:
+    that:
+      - item.query_id is match('^[0-9]{4}-[a-z_][a-z0-9_]*-[a-z_][a-z0-9_]*$')
+      - item.query_id in live_discovery_db_verified_marker.query_ids
   loop: "{{ live_discovery_db_query_plan.queries }}"
   loop_control:
     label: "{{ item.query_id }}"
-  no_log: true
 
 - name: Live DB JSONL | validate every SQL file as SELECT-only
   ansible.builtin.command:
@@ -41,6 +88,26 @@
   loop_control:
     label: "{{ item.query_id }}"
   changed_when: false
+
+- name: Live DB JSONL | validate rendered service-user MySQL argv
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.argv_policy
+      - --mysql-json
+      - "{{ live_discovery_mysql_json_argv | to_json }}"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  vars:
+    live_discovery_mysql_user: "{{ live_discovery_db_service_credentials[item.schema].user }}"
+    live_discovery_mysql_password: >-
+      {{ (lookup('file', live_discovery_kolla_passwords_file_local) | from_yaml)
+         [live_discovery_db_service_credentials[item.schema].password_key] }}
+  loop: "{{ live_discovery_db_query_plan.queries }}"
+  loop_control:
+    label: "{{ item.query_id }}"
+  changed_when: false
+  no_log: true
 
 - name: Live DB JSONL | execute reviewed SELECT through argv transport
   ansible.builtin.command:

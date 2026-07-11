@@ -190,29 +190,10 @@ live_discovery_db_service_credentials:
   nova: {user: nova, password_key: nova_database_password}
   neutron: {user: neutron, password_key: neutron_database_password}
   cinder: {user: cinder, password_key: cinder_database_password}
-live_discovery_storage_backend_kind: ""
-live_discovery_storage_backend_kinds: []
-live_discovery_source_storage_probe_host: ""
-live_discovery_target_storage_probe_host: ""
-# Backend profiles are deliberately data, not a hard-coded NFS branch. A
-# profile without read_only_probe_argv remains visible as UNKNOWN.
+# Authoritative typed backend map. Empty means storage readiness is UNKNOWN.
+# Every configured entry must declare kind, per-side delegate, allowed scopes
+# and a supported probe template. Vendor templates remain explicit UNKNOWN.
 live_discovery_storage_backends: {}
-live_discovery_storage_backend_templates:
-  nfs:
-    supported: true
-    read_only_probe_argv: [stat, --format, "%s"]
-  rbd:
-    supported: true
-    read_only_probe_argv: [rbd, info, --format, json]
-  lvm:
-    supported: true
-    read_only_probe_argv: [lvs, --reportformat, json, --units, b, --nosuffix]
-  vendor:
-    supported: false
-    read_only_probe_argv: []
-live_discovery_storage_probe_commands:
-  source: []
-  target: []
 live_discovery_target_virsh_command: "virsh"
 live_discovery_target_qemu_command: "qemu-system-x86_64"
 live_discovery_source_virsh_argv: [virsh]
@@ -232,7 +213,8 @@ live_discovery_source_probe_config_file_local: ""
 live_discovery_target_probe_config_file_local: ""
 live_discovery_source_cinder_sensitive_evidence_file_local: ""
 live_discovery_target_cinder_sensitive_evidence_file_local: ""
-live_discovery_glance_token_file_local: ""
+live_discovery_source_glance_token_file_local: ""
+live_discovery_target_glance_token_file_local: ""
 
 # Kolla/container-aware command argv can be overridden per inventory without
 # using shell interpolation. These are version/current/show/inspect probes only.
@@ -241,8 +223,3 @@ live_discovery_nova_cell_db_version_argv: [nova-manage, db, version]
 live_discovery_neutron_db_version_argv: [neutron-db-manage, current, --verbose]
 live_discovery_cinder_db_version_argv: [cinder-manage, db, version]
 live_discovery_container_inspect_argv_prefix: [docker, inspect]
-live_discovery_profile_containers:
-  - nova_api
-  - neutron_server
-  - cinder_api
-  - glance_api
