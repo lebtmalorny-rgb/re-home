@@ -1,0 +1,46 @@
+{
+  "side": "target",
+  "openstack": [
+    {
+      "command": ["image", "show", "image-1", "-f", "json"],
+      "payload": {
+        "id": "image-1",
+        "name": "epoxy-base",
+        "status": "active",
+        "size": 1024,
+        "visibility": "shared",
+        "owner": "project-1",
+        "disk_format": "qcow2",
+        "container_format": "bare",
+        "protected": false,
+        "min_disk": 1,
+        "min_ram": 256,
+        "os_hash_algo": "sha256",
+        "os_hash_value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "checksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tags": ["base", "epoxy"],
+        "stores": ["rbd", "swift"],
+        "locations": [
+          {"url": "rbd://cluster/pool/image-1/snap", "metadata": {"store": "rbd"}},
+          {"url": "swift+https://swift.example/v1/AUTH_project/image-1", "metadata": {"store": "swift"}}
+        ]
+      }
+    },
+    {
+      "command": ["image", "member", "list", "image-1", "-f", "json"],
+      "payload": [
+        {"image_id": "image-1", "member_id": "project-2", "status": "accepted"}
+      ]
+    },
+    {
+      "command": ["image", "stores", "info", "-f", "json"],
+      "payload": {
+        "stores": [
+          {"id": "rbd", "description": "ceph rbd store", "default": true},
+          {"id": "swift", "description": "swift store"}
+        ]
+      }
+    }
+  ],
+  "probe_status": "PASS"
+}
