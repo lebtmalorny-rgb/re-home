@@ -1447,10 +1447,7 @@ def compare_neutron_results(
         reason = f"target Neutron resource identifier invalid: {kind}"
         if reason not in result.blockers:
             result.blockers.append(reason)
-    if (
-        not source_ports
-        and (source.nodes or source.blockers or source.unknowns)
-    ):
+    if not source_ports:
         reason = "source Neutron ports unavailable after identifier validation"
         if reason not in result.unknowns:
             result.unknowns.append(reason)

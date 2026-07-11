@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery"
 
-from live_discovery.contract import CollectorResult, DependencyEdge, ResourceNode
+from live_discovery.contract import (
+    CheckResult, CollectorResult, DependencyEdge, ResourceNode,
+)
 from live_discovery.neutron import NeutronCollector, compare_neutron_results
 
 
@@ -313,6 +315,41 @@ class NeutronCollectorTests(unittest.TestCase):
         )
         self.assertNotIn("all-source-port-secret", json.dumps(result.to_dict()))
         self.assertNotIn("all-source-network-secret", json.dumps(result.to_dict()))
+
+    def test_readiness_empty_source_is_unknown(self):
+        result = compare_neutron_results(
+            CollectorResult(service="neutron", side="source"),
+            CollectorResult(service="neutron", side="target"),
+            CollectorResult(service="runtime", side="source"),
+            CollectorResult(service="runtime", side="target"),
+            "ovs",
+        )
+
+        self.assertIn(
+            "source Neutron ports unavailable after identifier validation",
+            result.unknowns,
+        )
+
+    def test_readiness_evidence_check_and_edge_only_source_is_unknown(self):
+        source = CollectorResult(service="neutron", side="source")
+        source.evidence.append({"kind": "probe", "evidence_id": "safe-probe"})
+        source.checks.append(CheckResult("safe-check", "PASS", "probe passed"))
+        source.edges.append(
+            DependencyEdge("port:safe-source", "network:safe-target", "uses", True)
+        )
+
+        result = compare_neutron_results(
+            source,
+            CollectorResult(service="neutron", side="target"),
+            CollectorResult(service="runtime", side="source"),
+            CollectorResult(service="runtime", side="target"),
+            "ovs",
+        )
+
+        self.assertIn(
+            "source Neutron ports unavailable after identifier validation",
+            result.unknowns,
+        )
 
     def test_readiness_reports_partially_discarded_source_and_target_nodes(self):
         port_id = UUID_ALIASES["port-1"]
