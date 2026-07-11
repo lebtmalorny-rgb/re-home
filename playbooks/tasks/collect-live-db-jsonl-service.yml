@@ -1,0 +1,97 @@
+---
+- name: Live DB JSONL | load generated query plan
+  ansible.builtin.slurp:
+    src: "{{ live_discovery_side_remote_dir }}/api/db-query-plan.json"
+  register: live_discovery_db_query_plan_raw
+  no_log: true
+
+- name: Live DB JSONL | decode exact Task 10 query plan
+  ansible.builtin.set_fact:
+    live_discovery_db_query_plan: >-
+      {{ live_discovery_db_query_plan_raw.content | b64decode | from_json }}
+  no_log: true
+
+- name: Live DB JSONL | validate plan envelope and side
+  ansible.builtin.assert:
+    that:
+      - live_discovery_db_query_plan.schema_version == 'openstack-rehome-db-query-plan/v1alpha1'
+      - live_discovery_db_query_plan.side == live_discovery_schema_side
+      - live_discovery_db_query_plan.queries | length > 0
+
+- name: Live DB JSONL | write exact generated SQL files
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/sql/{{ item.query_id }}.sql"
+    mode: "0600"
+    content: "{{ item.sql }}\n"
+  loop: "{{ live_discovery_db_query_plan.queries }}"
+  loop_control:
+    label: "{{ item.query_id }}"
+  no_log: true
+
+- name: Live DB JSONL | validate every SQL file as SELECT-only
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.mysql_json
+      - --validate-sql
+      - "{{ live_discovery_side_remote_dir }}/sql/{{ item.query_id }}.sql"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  loop: "{{ live_discovery_db_query_plan.queries }}"
+  loop_control:
+    label: "{{ item.query_id }}"
+  changed_when: false
+
+- name: Live DB JSONL | execute reviewed SELECT through argv transport
+  ansible.builtin.command:
+    argv: "{{ live_discovery_mysql_json_argv + ['--execute', item.sql] }}"
+  environment: "{{ live_discovery_mysql_environment }}"
+  vars:
+    live_discovery_mysql_user: "{{ live_discovery_db_service_credentials[item.schema].user }}"
+    live_discovery_mysql_password: >-
+      {{ (lookup('file', live_discovery_kolla_passwords_file_local) | from_yaml)
+         [live_discovery_db_service_credentials[item.schema].password_key] }}
+  loop: "{{ live_discovery_db_query_plan.queries }}"
+  loop_control:
+    label: "{{ item.query_id }}"
+  register: live_discovery_db_query_results
+  changed_when: false
+  failed_when: false
+  no_log: "{{ live_discovery_mysql_no_log | bool }}"
+
+- name: Live DB JSONL | persist exact JSONL output
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/db-jsonl/{{ item.item.jsonl_file }}"
+    mode: "0640"
+    content: "{{ item.stdout }}{{ '\n' if item.stdout | length > 0 else '' }}"
+  loop: "{{ live_discovery_db_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.query_id }}"
+  no_log: true
+
+- name: Live DB JSONL | persist exact return code
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/db-jsonl/{{ item.item.rc_file }}"
+    mode: "0640"
+    content: "{{ item.rc }}\n"
+  loop: "{{ live_discovery_db_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.query_id }}"
+
+- name: Live DB JSONL | persist sanitized stderr separately
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/db-stderr/{{ item.item.query_id }}.stderr"
+    mode: "0600"
+    content: "{{ item.stderr }}\n"
+  loop: "{{ live_discovery_db_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.query_id }}"
+  no_log: true
+
+- name: Live DB JSONL | fail closed after evidence is persisted
+  ansible.builtin.assert:
+    that:
+      - live_discovery_db_query_results.results | map(attribute='rc') | select('ne', 0) | list | length == 0
+    fail_msg: >-
+      At least one scoped DB SELECT failed. Exact .rc and protected .stderr
+      artifacts were retained; combine is intentionally not executed.

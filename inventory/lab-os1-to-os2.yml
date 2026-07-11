@@ -43,6 +43,44 @@ all:
     container_runtime_cli: docker
     network_backend: ovs
     openstack_cli_container: kolla_toolbox
+    live_discovery_storage_backend_kind: nfs
+    live_discovery_storage_backend_kinds: [nfs]
+    live_discovery_source_storage_probe_host: os1-compute-02
+    live_discovery_target_storage_probe_host: os2-ctrl-01
+    # NFS is the current lab profile only. The orchestration accepts the same
+    # command-list shape for RBD, LVM or a reviewed vendor-specific probe.
+    live_discovery_storage_backends:
+      nfs:
+        supported: true
+        source_probe_host: os1-compute-02
+        target_probe_host: os2-ctrl-01
+        read_only_probe_argv: [stat, --format, "%s"]
+    live_discovery_mysql_json_argv:
+      - docker
+      - exec
+      - -e
+      - MYSQL_PWD={{ live_discovery_mysql_password }}
+      - -i
+      - mariadb
+      - mysql
+      - -u{{ live_discovery_mysql_user }}
+      - -h
+      - "{{ schema_compat_mysql_host }}"
+      - --batch
+      - --raw
+      - --skip-column-names
+    live_discovery_mysql_no_log: true
+    live_discovery_nova_api_db_version_argv: [docker, exec, nova_api, nova-manage, api_db, version]
+    live_discovery_nova_cell_db_version_argv: [docker, exec, nova_conductor, nova-manage, db, version]
+    live_discovery_neutron_db_version_argv: [docker, exec, neutron_server, neutron-db-manage, current, --verbose]
+    live_discovery_cinder_db_version_argv: [docker, exec, cinder_api, cinder-manage, db, version]
+    live_discovery_source_virsh_argv: [docker, exec, nova_libvirt, virsh]
+    live_discovery_target_virsh_argv: [docker, exec, nova_libvirt, virsh]
+    live_discovery_target_qemu_argv:
+      - docker
+      - exec
+      - nova_libvirt
+      - /usr/bin/qemu-system-x86_64
     source_cloud_name: kolla-admin
     target_cloud_name: kolla-admin
 

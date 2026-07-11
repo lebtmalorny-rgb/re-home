@@ -1,0 +1,933 @@
+---
+- name: 02B | Freeze live discovery run locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Live discovery | require explicit singleton roles
+      ansible.builtin.assert:
+        that:
+          - groups['source_control'] | length == 1
+          - groups['target_control'] | length == 1
+          - groups['rehome_compute'] | length == 1
+          - groups['target_reference_compute'] | length == 1
+        fail_msg: >-
+          Live discovery never chooses a first host implicitly. Inventory must
+          contain exactly one host in every required role.
+
+    - name: Live discovery | freeze caller run ID or UTC-generated run ID
+      ansible.builtin.set_fact:
+        live_discovery_frozen_run_id: >-
+          {{ live_discovery_run_id if live_discovery_run_id | length > 0
+             else now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}
+
+    - name: Live discovery | validate run ID before constructing paths
+      ansible.builtin.assert:
+        that:
+          - live_discovery_enabled | bool
+          - live_discovery_frozen_run_id is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
+          - live_discovery_target_profile == 'vanilla-openstack-2025.1-epoxy'
+          - live_discovery_fail_on_not_ready | bool
+          - live_discovery_phase_hmac_key_file_local | length > 0
+          - live_discovery_source_probe_config_file_local | length > 0
+          - live_discovery_target_probe_config_file_local | length > 0
+          - live_discovery_glance_token_file_local | length > 0
+
+    - name: Live discovery | publish immutable run paths to localhost facts
+      ansible.builtin.set_fact:
+        live_discovery_local_run_dir: "{{ live_discovery_local_dir }}/{{ live_discovery_frozen_run_id }}"
+        live_discovery_source_controller: "{{ groups['source_control'][0] }}"
+        live_discovery_target_controller: "{{ groups['target_control'][0] }}"
+        live_discovery_target_reference_host: "{{ groups['target_reference_compute'][0] }}"
+        live_discovery_rehome_compute_host: "{{ groups['rehome_compute'][0] }}"
+
+    - name: Live discovery | inspect protected local inputs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ live_discovery_phase_hmac_key_file_local }}"
+        - "{{ live_discovery_source_probe_config_file_local }}"
+        - "{{ live_discovery_target_probe_config_file_local }}"
+        - "{{ live_discovery_glance_token_file_local }}"
+      register: live_discovery_protected_local_inputs
+      no_log: true
+
+    - name: Live discovery | require owned 0600 protected local inputs
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.mode == '0600'
+      loop: "{{ live_discovery_protected_local_inputs.results }}"
+      no_log: true
+
+    - name: Live discovery | require bounded external HMAC anchor
+      ansible.builtin.assert:
+        that:
+          - live_discovery_protected_local_inputs.results[0].stat.size >= 16
+          - live_discovery_protected_local_inputs.results[0].stat.size <= 4096
+        fail_msg: "The external phase HMAC key must contain 16..4096 bytes."
+      no_log: true
+
+    - name: Live discovery | inspect optional raw protected Cinder inputs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}"
+        - "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}"
+      when: item | length > 0
+      register: live_discovery_optional_protected_inputs
+      no_log: true
+
+    - name: Live discovery | require optional Cinder inputs to be protected
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.mode == '0600'
+      loop: "{{ live_discovery_optional_protected_inputs.results }}"
+      when: not item.skipped | default(false)
+      no_log: true
+
+    - name: Live discovery | create normal local artifact directory
+      ansible.builtin.file:
+        path: "{{ live_discovery_local_run_dir }}"
+        state: directory
+        mode: "0750"
+
+- name: 02B | Collect source control-plane evidence
+  hosts: source_control
+  become: true
+  gather_facts: false
+  vars:
+    live_discovery_schema_side: source
+    live_discovery_schema_service: source-control
+    live_discovery_schema_db_names: "{{ source_db_names }}"
+    live_discovery_side_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/source"
+  tasks:
+    - name: Source live discovery | acquire API, schema and scoped DB evidence
+      block:
+        - name: Source live discovery | reset run directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_side_remote_dir }}"
+            state: absent
+
+        - name: Source live discovery | create normal and protected directories
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            mode: "{{ item.mode }}"
+          loop:
+            - {path: "{{ live_discovery_side_remote_dir }}", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/db-jsonl", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/db-stderr", mode: "0700"}
+            - {path: "{{ live_discovery_side_remote_dir }}/sql", mode: "0700"}
+            - {path: "{{ live_discovery_side_remote_dir }}/profile", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/protected", mode: "0700"}
+
+        - name: Source live discovery | install collector package
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../scripts/"
+            dest: "{{ live_discovery_side_remote_dir }}/scripts/"
+            mode: preserve
+
+        - name: Source live discovery | stage protected API trust inputs
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_side_remote_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ source_clouds_file_local }}", dest: clouds.yaml}
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+          no_log: true
+
+        - name: Source live discovery | stage directional schema policy
+          ansible.builtin.copy:
+            src: "{{ live_discovery_schema_policy_file }}"
+            dest: "{{ live_discovery_side_remote_dir }}/live-discovery-schema-policy.json"
+            mode: "0640"
+
+        - name: Source live discovery | load schema-only DB credential
+          ansible.builtin.set_fact:
+            live_discovery_mysql_user: "{{ live_discovery_schema_mysql_user }}"
+            live_discovery_mysql_password: >-
+              {{ (lookup('file', live_discovery_kolla_passwords_file_local) | from_yaml)
+                 [live_discovery_schema_mysql_password_key] }}
+          no_log: true
+
+        # Read-only commands: nova-manage api_db version; nova-manage db version;
+        # neutron-db-manage current --verbose; cinder-manage db version.
+        - name: Source live discovery | collect management DB versions
+          ansible.builtin.command:
+            argv: "{{ item.argv }}"
+          loop:
+            - {name: nova-api-db, argv: "{{ live_discovery_nova_api_db_version_argv }}"}
+            - {name: nova-cell-db, argv: "{{ live_discovery_nova_cell_db_version_argv }}"}
+            - {name: neutron-db, argv: "{{ live_discovery_neutron_db_version_argv }}"}
+            - {name: cinder-db, argv: "{{ live_discovery_cinder_db_version_argv }}"}
+          loop_control:
+            label: "{{ item.name }}"
+          register: live_discovery_source_profile_probes
+          changed_when: false
+          failed_when: false
+
+        - name: Source live discovery | collect Glance Alembic row
+          ansible.builtin.command:
+            argv: "{{ live_discovery_mysql_json_argv + ['--execute', 'SELECT version_num FROM glance.alembic_version;'] }}"
+          environment: "{{ live_discovery_mysql_environment }}"
+          register: live_discovery_source_glance_alembic
+          changed_when: false
+          failed_when: false
+          no_log: "{{ live_discovery_mysql_no_log | bool }}"
+
+        - name: Source live discovery | inspect service container image digests
+          ansible.builtin.command:
+            argv: "{{ live_discovery_container_inspect_argv_prefix + [item] }}"
+          loop: "{{ live_discovery_profile_containers }}"
+          register: live_discovery_source_image_inspects
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Source live discovery | collect information_schema
+          ansible.builtin.include_tasks: tasks/collect-live-schema-service.yml
+
+        - name: Source live discovery | run initial signed API phase
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ live_discovery_side_remote_dir }}/scripts/collect_live_control.py"
+              - --phase
+              - api
+              - --side
+              - source
+              - --rehome-host
+              - "{{ rehome_host }}"
+              - --cloud
+              - "{{ source_cloud_name }}"
+              - --clouds-file
+              - "{{ live_discovery_side_remote_dir }}/protected/clouds.yaml"
+              - --container
+              - "{{ openstack_cli_container }}"
+              - --information-schema
+              - "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+              - --phase-key-file
+              - "{{ live_discovery_side_remote_dir }}/protected/phase-hmac.key"
+              - --out
+              - "{{ live_discovery_side_remote_dir }}/api"
+          register: live_discovery_source_api_phase
+          changed_when: false
+          no_log: true
+
+        - name: Source live discovery | load live API roots for cross-plane handoff
+          ansible.builtin.slurp:
+            src: "{{ live_discovery_side_remote_dir }}/api/api-result.json"
+          register: live_discovery_source_api_result_raw
+          no_log: true
+
+        - name: Source live discovery | publish source and target root documents from live API
+          ansible.builtin.set_fact:
+            live_discovery_source_root_document:
+              schema_version: openstack-rehome-root-manifest/v1alpha1
+              side: source
+              roots: "{{ (live_discovery_source_api_result_raw.content | b64decode | from_json).api_result.roots }}"
+            live_discovery_target_root_document:
+              schema_version: openstack-rehome-root-manifest/v1alpha1
+              side: target
+              roots: "{{ (live_discovery_source_api_result_raw.content | b64decode | from_json).api_result.roots }}"
+          delegate_to: localhost
+          delegate_facts: true
+          no_log: true
+
+        - name: Source live discovery | collect scoped DB JSONL from generated plan
+          ansible.builtin.include_tasks: tasks/collect-live-db-jsonl-service.yml
+
+        - name: Source live discovery | fetch normal schema evidence
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+            dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/source-information-schema.tsv"
+            flat: true
+
+      always:
+        - name: Source live discovery | delete credentials HMAC token and protected configs
+          ansible.builtin.file:
+            path: "{{ live_discovery_side_remote_dir }}/protected"
+            state: absent
+          no_log: true
+
+- name: 02B | Collect target control-plane evidence
+  hosts: target_control
+  become: true
+  gather_facts: false
+  vars:
+    live_discovery_schema_side: target
+    live_discovery_schema_service: target-control
+    live_discovery_schema_db_names: "{{ target_db_names }}"
+    live_discovery_side_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/target"
+  tasks:
+    - name: Target live discovery | acquire API, schema and scoped DB evidence
+      block:
+        - name: Target live discovery | reset run directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_side_remote_dir }}"
+            state: absent
+
+        - name: Target live discovery | create normal and protected directories
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            mode: "{{ item.mode }}"
+          loop:
+            - {path: "{{ live_discovery_side_remote_dir }}", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/db-jsonl", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/db-stderr", mode: "0700"}
+            - {path: "{{ live_discovery_side_remote_dir }}/sql", mode: "0700"}
+            - {path: "{{ live_discovery_side_remote_dir }}/profile", mode: "0750"}
+            - {path: "{{ live_discovery_side_remote_dir }}/protected", mode: "0700"}
+
+        - name: Target live discovery | install collector package
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../scripts/"
+            dest: "{{ live_discovery_side_remote_dir }}/scripts/"
+            mode: preserve
+
+        - name: Target live discovery | stage protected API trust inputs
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_side_remote_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ target_clouds_file_local }}", dest: clouds.yaml}
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+          no_log: true
+
+        - name: Target live discovery | stage directional schema policy
+          ansible.builtin.copy:
+            src: "{{ live_discovery_schema_policy_file }}"
+            dest: "{{ live_discovery_side_remote_dir }}/live-discovery-schema-policy.json"
+            mode: "0640"
+
+        - name: Target live discovery | stage target roots derived from live source API
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_side_remote_dir }}/protected/root-manifest.json"
+            mode: "0600"
+            content: "{{ hostvars['localhost'].live_discovery_target_root_document | to_nice_json }}\n"
+          no_log: true
+
+        - name: Target live discovery | load schema-only DB credential
+          ansible.builtin.set_fact:
+            live_discovery_mysql_user: "{{ live_discovery_schema_mysql_user }}"
+            live_discovery_mysql_password: >-
+              {{ (lookup('file', live_discovery_kolla_passwords_file_local) | from_yaml)
+                 [live_discovery_schema_mysql_password_key] }}
+          no_log: true
+
+        # Read-only commands: nova-manage api_db version; nova-manage db version;
+        # neutron-db-manage current --verbose; cinder-manage db version.
+        - name: Target live discovery | collect management DB versions
+          ansible.builtin.command:
+            argv: "{{ item.argv }}"
+          loop:
+            - {name: nova-api-db, argv: "{{ live_discovery_nova_api_db_version_argv }}"}
+            - {name: nova-cell-db, argv: "{{ live_discovery_nova_cell_db_version_argv }}"}
+            - {name: neutron-db, argv: "{{ live_discovery_neutron_db_version_argv }}"}
+            - {name: cinder-db, argv: "{{ live_discovery_cinder_db_version_argv }}"}
+          loop_control:
+            label: "{{ item.name }}"
+          register: live_discovery_target_profile_probes
+          changed_when: false
+          failed_when: false
+
+        - name: Target live discovery | collect Glance Alembic row
+          ansible.builtin.command:
+            argv: "{{ live_discovery_mysql_json_argv + ['--execute', 'SELECT version_num FROM glance.alembic_version;'] }}"
+          environment: "{{ live_discovery_mysql_environment }}"
+          register: live_discovery_target_glance_alembic
+          changed_when: false
+          failed_when: false
+          no_log: "{{ live_discovery_mysql_no_log | bool }}"
+
+        - name: Target live discovery | inspect service container image digests
+          ansible.builtin.command:
+            argv: "{{ live_discovery_container_inspect_argv_prefix + [item] }}"
+          loop: "{{ live_discovery_profile_containers }}"
+          register: live_discovery_target_image_inspects_raw
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Target live discovery | normalize successful image inspections
+          ansible.builtin.set_fact:
+            live_discovery_target_image_inspects: >-
+              {{ live_discovery_target_image_inspects | default({}) |
+                 combine({item.item: ((item.stdout | from_json) | first)}) }}
+          loop: "{{ live_discovery_target_image_inspects_raw.results }}"
+          when: item.rc == 0
+
+        - name: Target live discovery | collect information_schema
+          ansible.builtin.include_tasks: tasks/collect-live-schema-service.yml
+
+        - name: Target live discovery | run initial signed API phase
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ live_discovery_side_remote_dir }}/scripts/collect_live_control.py"
+              - --phase
+              - api
+              - --side
+              - target
+              - --rehome-host
+              - "{{ rehome_host }}"
+              - --cloud
+              - "{{ target_cloud_name }}"
+              - --clouds-file
+              - "{{ live_discovery_side_remote_dir }}/protected/clouds.yaml"
+              - --container
+              - "{{ openstack_cli_container }}"
+              - --information-schema
+              - "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+              - --root-manifest
+              - "{{ live_discovery_side_remote_dir }}/protected/root-manifest.json"
+              - --phase-key-file
+              - "{{ live_discovery_side_remote_dir }}/protected/phase-hmac.key"
+              - --out
+              - "{{ live_discovery_side_remote_dir }}/api"
+          register: live_discovery_target_api_phase
+          changed_when: false
+          no_log: true
+
+        - name: Target live discovery | collect scoped DB JSONL from generated plan
+          ansible.builtin.include_tasks: tasks/collect-live-db-jsonl-service.yml
+
+        - name: Target live discovery | fetch normal schema evidence
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+            dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/target-information-schema.tsv"
+            flat: true
+
+      always:
+        - name: Target live discovery | delete credentials HMAC token and protected configs
+          ansible.builtin.file:
+            path: "{{ live_discovery_side_remote_dir }}/protected"
+            state: absent
+          no_log: true
+
+- name: 02B | Collect re-home compute runtime evidence
+  hosts: rehome_compute
+  become: true
+  gather_facts: false
+  vars:
+    live_discovery_compute_remote_dir: "{{ live_discovery_remote_dir }}/{{ hostvars['localhost'].live_discovery_frozen_run_id }}/runtime"
+  tasks:
+    - name: Runtime live discovery | create run directory
+      ansible.builtin.file:
+        path: "{{ live_discovery_compute_remote_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Runtime live discovery | install collector package
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/"
+        dest: "{{ live_discovery_compute_remote_dir }}/scripts/"
+        mode: preserve
+
+    - name: Runtime live discovery | collect domain disk interface and dataplane facts
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', live_discovery_compute_remote_dir + '/scripts/collect_live_runtime.py',
+              '--side', 'source', '--out', live_discovery_compute_remote_dir + '/runtime.json',
+              '--network-backend', network_backend, '--virsh-argv'] +
+             live_discovery_source_virsh_argv }}
+      register: live_discovery_runtime_collect
+      changed_when: false
+      failed_when: false
+
+    - name: Runtime live discovery | fetch typed runtime artifact
+      ansible.builtin.fetch:
+        src: "{{ live_discovery_compute_remote_dir }}/runtime.json"
+        dest: "{{ hostvars['localhost'].live_discovery_local_run_dir }}/runtime.json"
+        flat: true
+
+    - name: Runtime live discovery | persist collector rc
+      ansible.builtin.copy:
+        dest: "{{ live_discovery_compute_remote_dir }}/runtime.rc"
+        mode: "0640"
+        content: "{{ live_discovery_runtime_collect.rc }}\n"
+
+- name: 02B | Collect target reference compute capabilities
+  hosts: target_reference_compute
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Target capability | collect live virsh version
+      ansible.builtin.command:
+        argv: "{{ live_discovery_target_virsh_argv + ['version'] }}"
+      register: live_discovery_target_virsh_version
+      changed_when: false
+      failed_when: false
+
+    - name: Target capability | collect live domain capabilities
+      ansible.builtin.command:
+        argv: "{{ live_discovery_target_virsh_argv + ['domcapabilities'] }}"
+      register: live_discovery_target_domcapabilities
+      changed_when: false
+      failed_when: false
+
+    - name: Target capability | collect live QEMU machine list
+      ansible.builtin.command:
+        argv: "{{ live_discovery_target_qemu_argv + ['-machine', 'help'] }}"
+      register: live_discovery_target_qemu_machine_help
+      changed_when: false
+      failed_when: false
+
+    - name: Target capability | build protected capability document from live outputs
+      ansible.builtin.set_fact:
+        live_discovery_target_capability_document:
+          schema_version: openstack-rehome-target-capability-input/v1alpha1
+          target_manage_outputs:
+            release: "2025.1"
+            distribution: vanilla
+            nova_api_db_version: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].stdout }}"
+            nova_cell_db_version: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].stdout }}"
+            neutron_heads: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].stdout }}"
+            cinder_db_version: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].stdout }}"
+            glance_db_version: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.stdout }}"
+            online_migration_evidence: {}
+          target_image_inspects: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_image_inspects | default({}) }}"
+          target_runtime_outputs:
+            runtime-target-virsh-version: "{{ live_discovery_target_virsh_version.stdout }}"
+            runtime-target-domcapabilities: "{{ live_discovery_target_domcapabilities.stdout }}"
+            runtime-target-qemu-machine-help: "{{ live_discovery_target_qemu_machine_help.stdout }}"
+          target_virsh_argv: "{{ live_discovery_target_virsh_argv }}"
+          target_qemu_argv: "{{ live_discovery_target_qemu_argv }}"
+          schema_capabilities:
+            target-profile: "{{ live_discovery_target_profile }}"
+          capability_evidence: []
+      delegate_to: localhost
+      delegate_facts: true
+      no_log: true
+
+- name: 02B | Probe source and target storage read-only
+  hosts: localhost
+  become: false
+  gather_facts: false
+  vars:
+    live_discovery_run: "{{ live_discovery_frozen_run_id }}"
+    live_discovery_source_probe_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/probe-source"
+    live_discovery_target_probe_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/probe-target"
+    live_discovery_source_controller_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/source"
+    live_discovery_target_controller_dir: "{{ live_discovery_remote_dir }}/{{ live_discovery_run }}/target"
+  tasks:
+    - name: Probe live discovery | validate explicit delegates and backend profile
+      ansible.builtin.assert:
+        that:
+          - live_discovery_source_storage_probe_host | length > 0
+          - live_discovery_target_storage_probe_host | length > 0
+          - live_discovery_source_storage_probe_host in groups['all']
+          - live_discovery_target_storage_probe_host in groups['all']
+          - >-
+            live_discovery_storage_backend_kinds | length == 0 or
+            (live_discovery_storage_backend_kinds |
+             difference(live_discovery_storage_backend_templates.keys() | list) |
+             length == 0)
+        fail_msg: >-
+          Probe delegates must be explicit. An empty backend remains UNKNOWN;
+          otherwise declare a reviewed NFS, RBD, LVM or vendor read-only type.
+
+    - name: Probe live discovery | refresh source signed phase and combine
+      block:
+        - name: Source probe | reset run directory on delegate
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_probe_dir }}"
+            state: absent
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source probe | create run-local protected directory on delegate
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_probe_dir }}/protected"
+            state: directory
+            mode: "0700"
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source probe | create normal phase directories on delegate
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0750"
+          loop:
+            - "{{ live_discovery_source_probe_dir }}/scripts"
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source probe | install collector package on explicit delegate
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../scripts/"
+            dest: "{{ live_discovery_source_probe_dir }}/scripts/"
+            mode: preserve
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source probe | stage credentials HMAC root plan and ephemeral token
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_source_probe_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ source_clouds_file_local }}", dest: clouds.yaml}
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+            - {src: "{{ live_discovery_source_probe_config_file_local }}", dest: source-probe-config.json}
+            - {src: "{{ live_discovery_glance_token_file_local }}", dest: glance-token}
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          no_log: true
+
+        - name: Source probe | write roots derived from live source API
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_source_probe_dir }}/protected/root-manifest.json"
+            mode: "0600"
+            content: "{{ live_discovery_source_root_document | to_nice_json }}\n"
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          no_log: true
+
+        - name: Source probe | copy live schema evidence to delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_local_run_dir }}/source-information-schema.tsv"
+            dest: "{{ live_discovery_source_probe_dir }}/information-schema.tsv"
+            mode: "0640"
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source probe | run Task 10 API phase with live storage and Glance probes
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ live_discovery_source_probe_dir }}/scripts/collect_live_control.py"
+              - --phase
+              - api
+              - --side
+              - source
+              - --rehome-host
+              - "{{ rehome_host }}"
+              - --cloud
+              - "{{ source_cloud_name }}"
+              - --clouds-file
+              - "{{ live_discovery_source_probe_dir }}/protected/clouds.yaml"
+              - --container
+              - "{{ openstack_cli_container }}"
+              - --information-schema
+              - "{{ live_discovery_source_probe_dir }}/information-schema.tsv"
+              - --root-manifest
+              - "{{ live_discovery_source_probe_dir }}/protected/root-manifest.json"
+              - --probe-config
+              - "{{ live_discovery_source_probe_dir }}/protected/source-probe-config.json"
+              - --phase-key-file
+              - "{{ live_discovery_source_probe_dir }}/protected/phase-hmac.key"
+              - --out
+              - "{{ live_discovery_source_probe_dir }}/api"
+          environment:
+            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_glance_token_file_local) }}"
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          register: live_discovery_source_probe_phase
+          changed_when: false
+          no_log: true
+
+        - name: Source probe | fetch refreshed signed phase triplet
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_source_probe_dir }}/api/{{ item }}"
+            dest: "{{ live_discovery_local_run_dir }}/source-phase/{{ item }}"
+            flat: true
+          loop:
+            - api-result.json
+            - uuid-filters.json
+            - db-query-plan.json
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+
+        - name: Source combine | replace controller phase triplet exactly
+          ansible.builtin.copy:
+            src: "{{ live_discovery_local_run_dir }}/source-phase/{{ item }}"
+            dest: "{{ live_discovery_source_controller_dir }}/api/{{ item }}"
+            mode: "0640"
+          loop:
+            - api-result.json
+            - uuid-filters.json
+            - db-query-plan.json
+          delegate_to: "{{ live_discovery_source_controller }}"
+
+        - name: Source combine | recreate protected directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_controller_dir }}/protected"
+            state: directory
+            mode: "0700"
+          delegate_to: "{{ live_discovery_source_controller }}"
+
+        - name: Source combine | reset atomic output directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_controller_dir }}/combined"
+            state: absent
+          delegate_to: "{{ live_discovery_source_controller }}"
+
+        - name: Source combine | stage HMAC and optional raw Cinder evidence
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_source_controller_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+            - {src: "{{ live_discovery_source_cinder_sensitive_evidence_file_local }}", dest: cinder-sensitive-evidence.json}
+          when: item.src | length > 0
+          delegate_to: "{{ live_discovery_source_controller }}"
+          no_log: true
+
+        - name: Source combine | combine exact API schema DB and probe evidence
+          ansible.builtin.command:
+            argv: >-
+              {{ ['python3', live_discovery_source_controller_dir + '/scripts/collect_live_control.py',
+                  '--phase', 'combine', '--side', 'source',
+                  '--api-result', live_discovery_source_controller_dir + '/api/api-result.json',
+                  '--db-jsonl-dir', live_discovery_source_controller_dir + '/db-jsonl',
+                  '--information-schema', live_discovery_source_controller_dir + '/information-schema.tsv',
+                  '--schema-policy', live_discovery_source_controller_dir + '/live-discovery-schema-policy.json',
+                  '--phase-key-file', live_discovery_source_controller_dir + '/protected/phase-hmac.key',
+                  '--out', live_discovery_source_controller_dir + '/combined'] +
+                 (['--cinder-sensitive-evidence', live_discovery_source_controller_dir + '/protected/cinder-sensitive-evidence.json']
+                  if live_discovery_source_cinder_sensitive_evidence_file_local | length > 0 else []) }}
+          delegate_to: "{{ live_discovery_source_controller }}"
+          register: live_discovery_source_combine
+          changed_when: false
+          no_log: true
+
+        - name: Source combine | fetch source role artifact
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_source_controller_dir }}/combined/control-result.json"
+            dest: "{{ live_discovery_local_run_dir }}/source-control.json"
+            flat: true
+          delegate_to: "{{ live_discovery_source_controller }}"
+
+      always:
+        - name: Source probe | delete delegate credentials HMAC token and configs
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_probe_dir }}/protected"
+            state: absent
+          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          no_log: true
+
+        - name: Source combine | delete controller HMAC and raw Cinder evidence
+          ansible.builtin.file:
+            path: "{{ live_discovery_source_controller_dir }}/protected"
+            state: absent
+          delegate_to: "{{ live_discovery_source_controller }}"
+          no_log: true
+
+    - name: Probe live discovery | refresh target signed phase and combine
+      block:
+        - name: Target probe | reset run directory on delegate
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_probe_dir }}"
+            state: absent
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target probe | create run-local protected directory on delegate
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_probe_dir }}/protected"
+            state: directory
+            mode: "0700"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target probe | create normal phase directories on delegate
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0750"
+          loop:
+            - "{{ live_discovery_target_probe_dir }}/scripts"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target probe | install collector package on explicit delegate
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../scripts/"
+            dest: "{{ live_discovery_target_probe_dir }}/scripts/"
+            mode: preserve
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target probe | stage credentials HMAC root plan and ephemeral token
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_target_probe_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ target_clouds_file_local }}", dest: clouds.yaml}
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+            - {src: "{{ live_discovery_target_probe_config_file_local }}", dest: target-probe-config.json}
+            - {src: "{{ live_discovery_glance_token_file_local }}", dest: glance-token}
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          no_log: true
+
+        - name: Target probe | write roots derived from live source API
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_target_probe_dir }}/protected/root-manifest.json"
+            mode: "0600"
+            content: "{{ live_discovery_target_root_document | to_nice_json }}\n"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          no_log: true
+
+        - name: Target probe | write live target capability config as protected JSON
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_target_probe_dir }}/protected/target-capability-input.json"
+            mode: "0600"
+            content: "{{ live_discovery_target_capability_document | to_nice_json }}\n"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          no_log: true
+
+        - name: Target probe | copy live schema evidence to delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_local_run_dir }}/target-information-schema.tsv"
+            dest: "{{ live_discovery_target_probe_dir }}/information-schema.tsv"
+            mode: "0640"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target probe | run Task 10 API phase with capabilities storage and Glance
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ live_discovery_target_probe_dir }}/scripts/collect_live_control.py"
+              - --phase
+              - api
+              - --side
+              - target
+              - --rehome-host
+              - "{{ rehome_host }}"
+              - --cloud
+              - "{{ target_cloud_name }}"
+              - --clouds-file
+              - "{{ live_discovery_target_probe_dir }}/protected/clouds.yaml"
+              - --container
+              - "{{ openstack_cli_container }}"
+              - --information-schema
+              - "{{ live_discovery_target_probe_dir }}/information-schema.tsv"
+              - --root-manifest
+              - "{{ live_discovery_target_probe_dir }}/protected/root-manifest.json"
+              - --probe-config
+              - "{{ live_discovery_target_probe_dir }}/protected/target-probe-config.json"
+              - --capability-config
+              - "{{ live_discovery_target_probe_dir }}/protected/target-capability-input.json"
+              - --phase-key-file
+              - "{{ live_discovery_target_probe_dir }}/protected/phase-hmac.key"
+              - --out
+              - "{{ live_discovery_target_probe_dir }}/api"
+          environment:
+            LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_glance_token_file_local) }}"
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          register: live_discovery_target_probe_phase
+          changed_when: false
+          no_log: true
+
+        - name: Target probe | fetch refreshed signed phase triplet
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_target_probe_dir }}/api/{{ item }}"
+            dest: "{{ live_discovery_local_run_dir }}/target-phase/{{ item }}"
+            flat: true
+          loop:
+            - api-result.json
+            - uuid-filters.json
+            - db-query-plan.json
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+
+        - name: Target combine | replace controller phase triplet exactly
+          ansible.builtin.copy:
+            src: "{{ live_discovery_local_run_dir }}/target-phase/{{ item }}"
+            dest: "{{ live_discovery_target_controller_dir }}/api/{{ item }}"
+            mode: "0640"
+          loop:
+            - api-result.json
+            - uuid-filters.json
+            - db-query-plan.json
+          delegate_to: "{{ live_discovery_target_controller }}"
+
+        - name: Target combine | recreate protected directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_controller_dir }}/protected"
+            state: directory
+            mode: "0700"
+          delegate_to: "{{ live_discovery_target_controller }}"
+
+        - name: Target combine | reset atomic output directory
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_controller_dir }}/combined"
+            state: absent
+          delegate_to: "{{ live_discovery_target_controller }}"
+
+        - name: Target combine | stage HMAC and optional raw Cinder evidence
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ live_discovery_target_controller_dir }}/protected/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
+            - {src: "{{ live_discovery_target_cinder_sensitive_evidence_file_local }}", dest: cinder-sensitive-evidence.json}
+          when: item.src | length > 0
+          delegate_to: "{{ live_discovery_target_controller }}"
+          no_log: true
+
+        - name: Target combine | combine exact API schema DB capability and probe evidence
+          ansible.builtin.command:
+            argv: >-
+              {{ ['python3', live_discovery_target_controller_dir + '/scripts/collect_live_control.py',
+                  '--phase', 'combine', '--side', 'target',
+                  '--api-result', live_discovery_target_controller_dir + '/api/api-result.json',
+                  '--db-jsonl-dir', live_discovery_target_controller_dir + '/db-jsonl',
+                  '--information-schema', live_discovery_target_controller_dir + '/information-schema.tsv',
+                  '--schema-policy', live_discovery_target_controller_dir + '/live-discovery-schema-policy.json',
+                  '--phase-key-file', live_discovery_target_controller_dir + '/protected/phase-hmac.key',
+                  '--out', live_discovery_target_controller_dir + '/combined'] +
+                 (['--cinder-sensitive-evidence', live_discovery_target_controller_dir + '/protected/cinder-sensitive-evidence.json']
+                  if live_discovery_target_cinder_sensitive_evidence_file_local | length > 0 else []) }}
+          delegate_to: "{{ live_discovery_target_controller }}"
+          register: live_discovery_target_combine
+          changed_when: false
+          no_log: true
+
+        - name: Target combine | fetch target role artifact
+          ansible.builtin.fetch:
+            src: "{{ live_discovery_target_controller_dir }}/combined/control-result.json"
+            dest: "{{ live_discovery_local_run_dir }}/target-control.json"
+            flat: true
+          delegate_to: "{{ live_discovery_target_controller }}"
+
+      always:
+        - name: Target probe | delete delegate credentials HMAC token and configs
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_probe_dir }}/protected"
+            state: absent
+          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          no_log: true
+
+        - name: Target combine | delete controller HMAC and raw Cinder evidence
+          ansible.builtin.file:
+            path: "{{ live_discovery_target_controller_dir }}/protected"
+            state: absent
+          delegate_to: "{{ live_discovery_target_controller }}"
+          no_log: true
+
+- name: 02B | Assemble live discovery artifacts locally
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Live discovery assembly | invoke Task 10 assembler
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/assemble_live_discovery.py"
+          - --source-control
+          - "{{ live_discovery_local_run_dir }}/source-control.json"
+          - --target-control
+          - "{{ live_discovery_local_run_dir }}/target-control.json"
+          - --runtime
+          - "{{ live_discovery_local_run_dir }}/runtime.json"
+          - --schema-policy
+          - "{{ live_discovery_schema_policy_file }}"
+          - --out-dir
+          - "{{ live_discovery_local_run_dir }}"
+      register: live_discovery_assemble
+      changed_when: false
+      failed_when: live_discovery_assemble.rc not in [0]
+
+    - name: Live discovery assembly | report readiness artifact
+      ansible.builtin.debug:
+        msg: "{{ live_discovery_local_run_dir }}/readiness-report.json"

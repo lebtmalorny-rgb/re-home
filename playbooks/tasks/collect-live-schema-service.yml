@@ -1,0 +1,35 @@
+---
+- name: Live schema | validate service query inputs
+  ansible.builtin.assert:
+    that:
+      - live_discovery_schema_side in ['source', 'target']
+      - live_discovery_schema_service is match('^[a-z][a-z0-9_-]{0,31}$')
+      - live_discovery_schema_db_names | length > 0
+      - live_discovery_mysql_json_argv | length > 0
+
+- name: Live schema | query information_schema columns
+  ansible.builtin.command:
+    argv: >-
+      {{ live_discovery_mysql_json_argv +
+         ['--execute', live_discovery_schema_columns_sql] }}
+  vars:
+    live_discovery_schema_columns_sql: >-
+      SELECT TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME,
+      COLUMN_TYPE, IS_NULLABLE, IFNULL(COLUMN_DEFAULT, '\\N'),
+      IFNULL(EXTRA, '\\N') FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA IN ({{ live_discovery_schema_db_names |
+      map('quote') | join(',') }}) ORDER BY TABLE_SCHEMA, TABLE_NAME,
+      ORDINAL_POSITION;
+  environment: "{{ live_discovery_mysql_environment }}"
+  register: live_discovery_information_schema_columns
+  changed_when: false
+  no_log: "{{ live_discovery_mysql_no_log | bool }}"
+
+- name: Live schema | write run-local information_schema artifact
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+    mode: "0640"
+    content: |
+      SERVICE:{{ live_discovery_schema_service }}
+      SECTION:COLUMNS
+      {{ live_discovery_information_schema_columns.stdout }}

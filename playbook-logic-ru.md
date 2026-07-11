@@ -113,6 +113,37 @@ OVS dataplane и storage helpers.
 - **Guard:** требует `source_clouds_file_local`, `target_clouds_file_local`,
   cloud names и working `runtime_guard_virsh_command`.
 
+### `02b-discover-live-resource-graph.yml`
+
+- **Где выполняется:** `localhost`, ровно по одному узлу из
+  `source_control`, `target_control`, `rehome_compute` и
+  `target_reference_compute`; storage/Glance probes делегируются только на
+  явно заданные source/target probe hosts.
+- **Назначение:** собрать read-only resource graph и readiness verdict по
+  данным живых source/target кластеров перед переносом узла. SQL dump не
+  является источником данных; Masakari/DRS не собираются.
+- **Что читает:** OpenStack API, UUID-scoped `SELECT` из Nova/Neutron/Cinder,
+  `information_schema`, версии и container image digests, libvirt/QEMU,
+  OVS/OVN, Cinder backing storage и один байт Glance image data.
+- **Порядок:** первые controller plays формируют API/schema/DB evidence;
+  compute plays собирают runtime и реальные target capabilities; шестой play
+  выполняет protected storage/Glance probes, обновляет HMAC-связанные phase
+  artifacts и только затем запускает source/target combine; седьмой play
+  вызывает локальный assembler.
+- **Что меняет:** только run-local каталоги и artifacts. Все probe/version/
+  inspect/DB команды имеют `changed_when: false`; SQL валидируется как
+  SELECT-only. Credentials, HMAC key, Glance token, probe/capability configs и
+  raw Cinder evidence имеют режим `0600` внутри каталогов `0700` и удаляются в
+  `always`.
+- **Artifacts:**
+  `{{ local_artifact_dir }}/live-discovery/<run-id>/readiness-report.json` и
+  companion JSON/YAML/Markdown evidence artifacts.
+- **Guard:** inventory roles должны быть singleton; run ID и protected inputs
+  проверяются до построения путей; generic storage backend остаётся пустым и
+  даёт `UNKNOWN`, пока не задан read-only профиль. Поддерживаются профили NFS,
+  RBD, LVM и явно описанный vendor backend. Exit code assembler, отличный от
+  `0` (`UNKNOWN`/`BLOCKED`), завершает playbook ошибкой.
+
 ### `03-backup-databases.yml`
 
 - **Где выполняется:** `source_control[0]`, `target_control[0]`.
