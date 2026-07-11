@@ -74,13 +74,22 @@ def _collector(payload):
 def _bundle(path: Path):
     payload = _read_json(path)
     if isinstance(payload, dict) and payload.get("schema_version") == "openstack-rehome-live-discovery/v1alpha1":
+        refs = sorted({
+            evidence_id
+            for item in [*payload.get("nodes", []), *payload.get("checks", [])]
+            for evidence_id in item.get("evidence_ids", [])
+        })
         empty_bundle = {
             "schema_version": BUNDLE_VERSION,
             "collectors": [payload],
             "checks": [],
             "schema_capabilities": {},
             "uuid_filters": {"source": {}, "target": {}},
-            "evidence_index": [],
+            "evidence_index": [{
+                "evidence_id": evidence_id, "kind": "runtime-command",
+                "side": payload["side"], "service": payload["service"],
+                "command": ["runtime-collector", evidence_id],
+            } for evidence_id in refs],
             "sensitive_evidence": {},
         }
         return [_collector(payload)], [], empty_bundle
@@ -116,6 +125,58 @@ def _validate_role(collectors, role):
     actual = [(result.side, result.service) for result in collectors]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise ValueError(f"{role} artifact role is invalid")
+
+
+def _validate_evidence_entry(entry):
+    common = {"evidence_id", "kind", "side", "service"}
+    shapes = {
+        "openstack-json": common | {"command"},
+        "runtime-command": common | {"command"},
+        "db-jsonl": common | {"schema", "table", "filters"},
+        "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "scope", "expected_size", "observed_size", "status"},
+        "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+    }
+    if not isinstance(entry, dict) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
+        raise ValueError("evidence index entry schema is invalid")
+    if not all(isinstance(entry.get(key), str) and entry[key] for key in ("evidence_id", "side", "service")) or entry["side"] not in {"source", "target"}:
+        raise ValueError("evidence index provenance is invalid")
+    if entry["kind"] in {"openstack-json", "runtime-command"}:
+        if not isinstance(entry["command"], list) or not entry["command"] or not all(isinstance(value, str) and value for value in entry["command"]):
+            raise ValueError("evidence command is invalid")
+    elif entry["kind"] == "db-jsonl":
+        if not all(isinstance(entry[key], str) and entry[key] for key in ("schema", "table")) or not isinstance(entry["filters"], dict) or not entry["filters"]:
+            raise ValueError("DB evidence is invalid")
+    elif entry["kind"] == "storage-probe":
+        if entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]):
+            raise ValueError("storage evidence is invalid")
+    elif entry["kind"] == "glance-range":
+        if entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]:
+            raise ValueError("Glance evidence is invalid")
+
+
+def _validate_evidence_closure(collectors, checks, bundle):
+    entries = bundle.get("evidence_index")
+    if not isinstance(entries, list):
+        raise ValueError("evidence index is invalid")
+    by_id = {}
+    for entry in entries:
+        _validate_evidence_entry(entry)
+        identity = entry["evidence_id"]
+        if identity in by_id:
+            raise ValueError("evidence identity is duplicated")
+        by_id[identity] = entry
+    for result in collectors:
+        for item in [*result.nodes, *result.checks]:
+            for evidence_id in item.evidence_ids:
+                entry = by_id.get(evidence_id)
+                if entry is None:
+                    raise ValueError("graph evidence is missing")
+                if entry["side"] != result.side or entry["service"] != result.service:
+                    raise ValueError("graph evidence provenance conflicts")
+    for check in checks:
+        for evidence_id in check.evidence_ids:
+            if evidence_id not in by_id:
+                raise ValueError("readiness evidence is missing")
 
 
 def _fixture_paths(directory: Path):
@@ -206,6 +267,7 @@ def main(argv=None):
         for path, role in role_paths:
             new_collectors, new_checks, bundle = _bundle(path)
             _validate_role(new_collectors, role)
+            _validate_evidence_closure(new_collectors, new_checks, bundle)
             collectors.extend(new_collectors)
             checks.extend(new_checks)
             bundles.append(bundle)
@@ -246,9 +308,9 @@ def main(argv=None):
                     raise ValueError("sensitive evidence identity is duplicated")
                 sensitive[key] = value
         entries.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
-        canonical_entries = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in entries]
-        if len(canonical_entries) != len(set(canonical_entries)):
-            raise ValueError("evidence index entry is duplicated")
+        evidence_ids = [item.get("evidence_id") for item in entries if isinstance(item, dict)]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("evidence index identity is duplicated")
         mapping = _directional_mapping(policy, capabilities)
         graph = assemble_graph(collectors)
         verdict = compute_verdict(graph, checks, mapping)

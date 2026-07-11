@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from live_discovery.render import _AtomicArtifactWriter, _safe_destination, render_json, render_markdown, write_artifacts
+from live_discovery.render import _AtomicArtifactWriter, _safe_destination, render_json, render_yaml, render_markdown, write_artifacts
 from live_discovery.contract import CollectorResult, ResourceNode
 from live_discovery.graph import assemble_graph
 from live_discovery.verdict import compute_verdict
@@ -45,12 +45,20 @@ class LiveDiscoveryRenderTests(unittest.TestCase):
         self.assertIn("Instances: `1`", markdown)
 
     def test_normal_artifacts_are_resanitized(self):
-        rendered = render_json({"password": "chap-secret-value", "api_key": "api-key-material", "access_key_id": "access-material", "secret_access_key": "secret-access-material", "safe": "ok"})
+        rendered = render_json({"password": "chap-secret-value", "api_key": "api-key-material", "access_key_id": "access-material", "secret_access_key": "secret-access-material", "private-key": "pem-material", "Authorization": "Basic dXNlcjpwYXNz", "header": "Bearer abc.def.ghi", "safe": "ok"})
         self.assertNotIn("chap-secret-value", rendered)
         self.assertNotIn("api-key-material", rendered)
         self.assertNotIn("access-material", rendered)
         self.assertNotIn("secret-access-material", rendered)
+        self.assertNotIn("pem-material", rendered)
+        self.assertNotIn("dXNlcjpwYXNz", rendered)
+        self.assertNotIn("abc.def.ghi", rendered)
         self.assertIn("[REDACTED]", rendered)
+        self.assertIn("ok", rendered)
+        yaml = render_yaml({"private_key":"pem-material","header":"Basic dXNlcjpwYXNz","safe":"Alpha123"})
+        self.assertNotIn("pem-material", yaml)
+        self.assertNotIn("dXNlcjpwYXNz", yaml)
+        self.assertIn("Alpha123", yaml)
 
     def test_markdown_escapes_html_delimiters_and_controls(self):
         verdict = sample_verdict()

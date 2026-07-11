@@ -27,11 +27,13 @@ _MAX_NODES = 100_000
 _MAX_STRING = 64 * 1024
 _RENDER_SENSITIVE_KEY = re.compile(
     r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|credential|"
-    r"connector|connection[_-]?(?:info|data)|api[_-]?key|access[_-]?key",
+    r"connector|connection[_-]?(?:info|data)|api[_-]?key|access[_-]?key|"
+    r"private[\s_-]*key|authorization",
     re.IGNORECASE,
 )
 _RENDER_SENSITIVE_VALUE = re.compile(
     r"api[\s_-]*key\s*[:=]|access[\s_-]*key\s*[:=]|secret[\s_-]*key\s*[:=]|"
+    r"private[\s_-]*key\s*[:=]|authorization\s*[:=]|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+|"
     r"\bAKIA[A-Z0-9]{16}\b",
     re.IGNORECASE,
 )
@@ -300,16 +302,26 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
     if len(evidence["index"]["entries"]) > 100_000:
         raise ValueError("evidence index exceeds safety bounds")
     for entry in evidence["index"]["entries"]:
-        if (
-            not isinstance(entry, Mapping)
-            or set(entry) != {"evidence_id", "kind", "schema", "table", "filters"}
-            or entry.get("kind") != "db-jsonl"
-            or not isinstance(entry.get("evidence_id"), str)
-            or not isinstance(entry.get("schema"), str)
-            or not isinstance(entry.get("table"), str)
-            or not isinstance(entry.get("filters"), Mapping)
-        ):
+        common = {"evidence_id", "kind", "side", "service"}
+        shapes = {
+            "openstack-json": common | {"command"},
+            "runtime-command": common | {"command"},
+            "db-jsonl": common | {"schema", "table", "filters"},
+            "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "scope", "expected_size", "observed_size", "status"},
+            "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+        }
+        if not isinstance(entry, Mapping) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
             raise ValueError("evidence index entry schema is invalid")
+        if entry.get("side") not in {"source", "target"} or not all(isinstance(entry.get(key), str) and entry[key] for key in ("evidence_id", "service")):
+            raise ValueError("evidence index provenance is invalid")
+        if entry["kind"] in {"openstack-json", "runtime-command"} and (not isinstance(entry["command"], list) or not entry["command"] or not all(isinstance(value, str) and value for value in entry["command"])):
+            raise ValueError("evidence command is invalid")
+        if entry["kind"] == "db-jsonl" and (not isinstance(entry["schema"], str) or not isinstance(entry["table"], str) or not isinstance(entry["filters"], Mapping) or not entry["filters"]):
+            raise ValueError("DB evidence is invalid")
+        if entry["kind"] == "storage-probe" and (entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"])):
+            raise ValueError("storage evidence is invalid")
+        if entry["kind"] == "glance-range" and (entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]):
+            raise ValueError("Glance evidence is invalid")
     if not isinstance(evidence["sensitive"], Mapping):
         raise ValueError("sensitive evidence schema is invalid")
     _validate_sensitive(evidence["sensitive"])

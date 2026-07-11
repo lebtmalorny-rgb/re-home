@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -12,13 +13,109 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery" / "full-run"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from live_discovery.contract import CheckResult, CollectorResult, ResourceNode
-from collect_live_control import _CombinedClient, _TABLE_ROOT_FILTERS, _api_phase, _collector_table_catalog, _execute_probe_config, _expected_plan_tables, _integrate_storage_readiness
+from collect_live_control import _CombinedClient, _TABLE_ROOT_FILTERS, _api_phase, _collector_table_catalog, _execute_probe_config, _expected_plan_tables, _integrate_storage_readiness, _phase_binding, _read_protected_json, _root_filter_values
 from live_discovery.cinder import CORE_TABLES as CINDER_CORE, OPTIONAL_TABLES as CINDER_OPTIONAL
 from live_discovery.neutron import CORE_TABLES as NEUTRON_CORE, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL
 from live_discovery.nova import DB_SCHEMAS, DB_TABLES
 
 
 class LiveDiscoveryCliTests(unittest.TestCase):
+    def test_root_manifest_is_merged_before_recursive_api_closure(self):
+        ids = {name: f"{index:08d}-1111-4111-8111-{index:012d}" for index, name in enumerate((
+            "instance","port","network","subnet","security_group","qos","trunk","floating","router","address_group","volume","type","attachment","snapshot","secret","image","flavor"
+        ), start=1)}
+        roots = {
+            "instances":[ids["instance"]],"ports":[ids["port"]],"networks":[ids["network"]],"subnets":[ids["subnet"]],
+            "security_groups":[ids["security_group"]],"qos_policies":[ids["qos"]],"trunks":[ids["trunk"]],"floating_ips":[ids["floating"]],
+            "routers":[ids["router"]],"address_groups":[ids["address_group"]],"volumes":[ids["volume"]],"volume_types":[ids["type"]],
+            "attachments":[ids["attachment"]],"snapshots":[ids["snapshot"]],"barbican_secrets":[ids["secret"]],"images":[ids["image"]],"flavors":[ids["flavor"]],
+        }
+        calls = []
+        class Client:
+            def __init__(self, *args): pass
+            def json(self, command, evidence_id):
+                calls.append(tuple(command))
+                if command[:2] == ["server","list"] or command[:3] == ["compute","service","list"] or command[:3] == ["resource","provider","list"] or command[:3] == ["image","stores","info"] or command[:3] == ["volume","service","list"]:
+                    payload = []
+                elif command[:2] == ["port","list"] or command[:3] == ["server","volume","list"] or command[:3] == ["image","member","list"]:
+                    payload = []
+                elif command[:2] == ["server","show"]:
+                    payload = {"id":ids["instance"],"flavor":{"id":ids["flavor"]},"image":{"id":ids["image"]}}
+                elif command[:2] == ["volume","show"]:
+                    payload = {"id":ids["volume"],"volume_type_id":ids["type"],"snapshot_id":ids["snapshot"],"attachments":[{"id":ids["attachment"]}]}
+                else:
+                    payload = {"id": command[-4] if len(command) > 4 else ids["instance"]}
+                return payload, {"id":evidence_id}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "roots.json"
+            manifest.write_text(json.dumps({"schema_version":"openstack-rehome-root-manifest/v1alpha1","side":"source","roots":roots}),encoding="utf-8")
+            schema = root / "information-schema.tsv"
+            lines = ["SERVICE:all", "SECTION:COLUMNS"]
+            for identity in sorted(set().union(*_collector_table_catalog().values())):
+                schema_name, table = identity.split(".", 1)
+                columns = {"id", *(column for _, column in _TABLE_ROOT_FILTERS[identity])}
+                for ordinal, column in enumerate(sorted(columns), start=1):
+                    lines.append(f"{schema_name}\t{table}\t{ordinal}\t{column}\tvarchar(255)\tYES\tNULL\t\\N")
+            schema.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            args = type("Args",(),{"fixture":None,"rehome_host":"compute-023","cloud":"cloud","clouds_file":Path("/clouds.yaml"),"container":"toolbox","side":"source","information_schema":schema,"root_manifest":manifest,"probe_config":None,"capability_config":None,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_TEST_KEY","out":root/"out"})()
+            with mock.patch("live_discovery.openstack.OpenStackClient",Client), mock.patch.dict("os.environ",{"LIVE_DISCOVERY_TEST_KEY":"test-phase-anchor-at-least-sixteen"}):
+                _api_phase(args)
+        expected = [
+            ("server","show",ids["instance"]),("flavor","show",ids["flavor"]),("port","show",ids["port"]),
+            ("network","show",ids["network"]),("subnet","show",ids["subnet"]),("network","trunk","show",ids["trunk"]),
+            ("router","show",ids["router"]),("floating","ip","show",ids["floating"]),("volume","attachment","show",ids["attachment"]),
+            ("volume","type","show",ids["type"]),("volume","snapshot","show",ids["snapshot"]),("secret","get",ids["secret"]),
+            ("image","show",ids["image"]),("image","member","list",ids["image"]),
+        ]
+        for prefix in expected:
+            self.assertTrue(any(command[:len(prefix)] == prefix for command in calls), prefix)
+
+    def test_phase_binding_is_externally_keyed(self):
+        documents = ({"a": 1}, {"b": 2}, {"c": 3})
+        first = _phase_binding(*documents, key=b"first-trust-anchor")
+        second = _phase_binding(*documents, key=b"second-trust-anchor")
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+
+    def test_db_cache_allows_only_proven_planned_superset(self):
+        one = "11111111-1111-1111-1111-111111111111"
+        two = "22222222-2222-2222-2222-222222222222"
+        records = [{"schema":"neutron","table":"ports","filters":{"id":[one,two]},"rows":[
+            {"_schema":"neutron","_table":"ports","row":{"id":one}},
+            {"_schema":"neutron","_table":"ports","row":{"id":two}},
+        ]}]
+        evidence = [{"evidence_id":"source-db:neutron.ports","kind":"db-jsonl","schema":"neutron","table":"ports","filters":{"id":[one,two]}}]
+        client = _CombinedClient("source", {"openstack":[],"roots":{"ports":[one,two]}}, records, evidence)
+        rows, proof = client.db_records("ports", {"id":[one]})
+        self.assertEqual([one], [item["row"]["id"] for item in rows])
+        self.assertEqual({"id":[one]}, proof["filters"])
+        missing, _ = client.db_records("ports", {"id":["33333333-3333-3333-3333-333333333333"]})
+        self.assertEqual([], missing)
+
+    def test_root_manifest_categories_are_canonical(self):
+        valid = {"roots":{"hosts":["compute-023.example"],"ports":["11111111-1111-1111-1111-111111111111"]}}
+        self.assertEqual(2, len(_root_filter_values(valid)))
+        for invalid in (
+            {"roots":{"ports":[1]}},
+            {"roots":{"ports":["NOT-A-UUID"]}},
+            {"roots":{"hosts":["bad host"]}},
+        ):
+            with self.assertRaises(ValueError):
+                _root_filter_values(invalid)
+
+    def test_protected_json_uses_open_descriptor_not_path_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "protected.json"
+            path.write_text('{"safe":true}', encoding="utf-8")
+            path.chmod(0o600)
+            with mock.patch.object(Path, "open", side_effect=AssertionError("path reopen")), mock.patch.object(Path, "read_text", side_effect=AssertionError("path reopen")):
+                self.assertEqual({"safe": True}, _read_protected_json(path))
+            link = Path(temporary) / "protected-link.json"
+            link.symlink_to(path)
+            with self.assertRaises(ValueError):
+                _read_protected_json(link)
+
     def test_live_like_api_acquisition_builds_complete_nova_plan_from_live_schema(self):
         instance_id = "11111111-1111-1111-1111-111111111111"
         service_id = "88888888-8888-8888-8888-888888888888"
@@ -34,10 +131,16 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     payload = {"uuid": compute_id, "host": "compute-023"}
                 elif command[:3] == ["resource", "provider", "list"]:
                     payload = [{"uuid": compute_id, "name": "compute-023"}]
+                elif command[:4] == ["resource", "provider", "allocation", "show"]:
+                    payload = {"allocations": {compute_id: {"resources": {"VCPU": 1}}}}
                 elif command[:2] == ["server", "show"]:
                     payload = {"id": instance_id, "project_id": "77777777-7777-7777-7777-777777777777", "image": {"id": "44444444-4444-4444-4444-444444444444"}}
                 elif command[:2] == ["port", "list"] or command[:3] == ["server", "volume", "list"]:
                     payload = []
+                elif command[:3] == ["image", "stores", "info"] or command[:2] == ["image", "member"]:
+                    payload = []
+                elif command[:2] == ["image", "show"]:
+                    payload = {"id":"44444444-4444-4444-4444-444444444444"}
                 else:
                     raise AssertionError(command)
                 return payload, {"id": evidence_id}
@@ -47,9 +150,10 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 "clouds_file": Path("/clouds.yaml"), "container": "toolbox",
                 "side": "source", "information_schema": FIXTURES / "control-information-schema.tsv",
                 "root_manifest": None, "probe_config": None, "capability_config": None,
+                "phase_key_file": None, "phase_key_env": "LIVE_DISCOVERY_TEST_KEY",
                 "out": Path(temporary) / "api",
             })()
-            with mock.patch("live_discovery.openstack.OpenStackClient", Client):
+            with mock.patch("live_discovery.openstack.OpenStackClient", Client), mock.patch.dict("os.environ", {"LIVE_DISCOVERY_TEST_KEY":"test-phase-anchor-at-least-sixteen"}):
                 _api_phase(args)
             plan = json.loads((args.out / "db-query-plan.json").read_text())
             self.assertEqual(_collector_table_catalog()["nova"], {f"{item['schema']}.{item['table']}" for item in plan["queries"]})
@@ -72,12 +176,12 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         api_result = {
             "openstack": [],
             "glance_store_capabilities": [{"store_id": "store-1", "backend_type": "rbd"}],
-            "glance_data_probe_results": [{"image_id": image_id, "status": "PASS", "reason": "Glance image data byte is readable"}],
+            "glance_data_probe_results": [{"image_id": image_id, "endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status": "PASS", "reason": "Glance image data byte is readable"}],
             "storage_probe_results": [
-                {"volume_id": volume_id, "scope": "source-compute", "kind": "nfs", "status": "PASS", "reason": "backing object is readable with expected size"},
-                {"volume_id": volume_id, "scope": "target-storage", "kind": "rbd", "status": "PASS", "reason": "backing object is readable with expected size"},
-                {"volume_id": volume_id, "scope": "target-storage", "kind": "lvm", "status": "PASS", "reason": "backing object is readable with expected size"},
-                {"volume_id": volume_id, "scope": "target-storage", "kind": "vendor-san", "status": "UNKNOWN", "reason": "storage driver is unsupported"},
+                {"volume_id": volume_id, "scope": "source-compute", "kind": "nfs", "backend_identity":"rbd-backend","resource_identity":"/srv/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:nfs", "status": "PASS", "reason": "backing object is readable with expected size"},
+                {"volume_id": volume_id, "scope": "target-storage", "kind": "rbd", "backend_identity":"rbd-backend","resource_identity":"volumes/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:rbd", "status": "PASS", "reason": "backing object is readable with expected size"},
+                {"volume_id": volume_id, "scope": "target-storage", "kind": "lvm", "backend_identity":"rbd-backend","resource_identity":"cinder/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:lvm", "status": "PASS", "reason": "backing object is readable with expected size"},
+                {"volume_id": volume_id, "scope": "target-storage", "kind": "vendor-san", "backend_identity":"rbd-backend","resource_identity":"vendor","expected_size":1073741824,"observed_size":None,"evidence_id":"storage:vendor", "status": "UNKNOWN", "reason": "storage driver is unsupported"},
             ],
         }
         client = _CombinedClient("source", api_result, [], [])
@@ -85,10 +189,18 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         self.assertEqual("rbd", capabilities[0]["backend_type"])
         self.assertEqual("glance-source-store-capabilities", evidence["evidence_id"])
         self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
-        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source")])
+        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source", {"size":1,"storage_backend_id":"rbd-backend"})])
         _integrate_storage_readiness(cinder, [volume_id], api_result)
-        self.assertEqual({"nfs", "rbd", "lvm", "vendor-san"}, {check.check_id.rsplit(".", 1)[-1] for check in cinder.checks})
+        self.assertTrue(all(any(f".{kind}." in check.check_id for check in cinder.checks) for kind in {"nfs", "rbd", "lvm", "vendor-san"}))
         self.assertIn("storage driver is unsupported", cinder.unknowns)
+
+    def test_image_pass_cannot_be_reused_for_different_size_or_requirement(self):
+        image_id = "44444444-4444-4444-4444-444444444444"
+        result = {"image_id":image_id,"endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status":"PASS","reason":"ok"}
+        client = _CombinedClient("source", {"openstack":[],"glance_store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}],"glance_data_probe_results":[result]}, [], [])
+        self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
+        self.assertEqual("UNKNOWN", client.probe_image_data(image_id, 2, True).status)
+        self.assertEqual("UNKNOWN", client.probe_image_data(image_id, 1, False).status)
 
     def test_missing_required_storage_and_glance_probe_results_fail_closed(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
@@ -122,10 +234,10 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         config = {
             "schema_version": "openstack-rehome-probe-config/v1alpha1",
             "storage": [
-                {"volume_id":volume_id,"scope":"source-compute","kind":"file","resource":{"path":"/srv/cinder/volume-1","allowed_roots":["/srv/cinder"],"expected_size":1}},
-                {"volume_id":volume_id,"scope":"target-storage","kind":"rbd","resource":{"pool":"volumes","allowed_pools":["volumes"],"image":"volume-1","expected_size":1}},
-                {"volume_id":volume_id,"scope":"target-storage","kind":"lvm","resource":{"vg":"cinder-volumes","allowed_vgs":["cinder-volumes"],"lv":"volume-1","expected_size":1}},
-                {"volume_id":volume_id,"scope":"target-storage","kind":"vendor-san","resource":{"expected_size":1}}
+                {"volume_id":volume_id,"scope":"source-compute","kind":"file","backend_id":"rbd-backend","resource":{"path":"/srv/cinder/volume-1","allowed_roots":["/srv/cinder"],"expected_size":1}},
+                {"volume_id":volume_id,"scope":"target-storage","kind":"rbd","backend_id":"rbd-backend","resource":{"pool":"volumes","allowed_pools":["volumes"],"image":"volume-1","expected_size":1}},
+                {"volume_id":volume_id,"scope":"target-storage","kind":"lvm","backend_id":"rbd-backend","resource":{"vg":"cinder-volumes","allowed_vgs":["cinder-volumes"],"lv":"volume-1","expected_size":1}},
+                {"volume_id":volume_id,"scope":"target-storage","kind":"vendor-san","backend_id":"rbd-backend","resource":{"expected_size":1}}
             ],
             "glance": {"endpoint_url":"https://glance.example","token_file":"/secure/token","images":[{"image_id":image_id,"expected_size":1,"required":True}],"store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}]}
         }
@@ -148,6 +260,18 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     self.assertEqual(code, proc.returncode, proc.stderr)
                     self.assertTrue((out / "readiness-report.md").is_file())
                     self.assertEqual(code, json.loads((out / "readiness-report.json").read_text())["exit_code"])
+
+    def test_assembler_rejects_missing_or_wrong_service_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("source-control.json", "target-control.json", "runtime.json"):
+                (root / name).write_text((FIXTURES / "ready" / name).read_text(), encoding="utf-8")
+            source = json.loads((root / "source-control.json").read_text())
+            source["evidence_index"] = []
+            (root / "source-control.json").write_text(json.dumps(source), encoding="utf-8")
+            proc = subprocess.run([sys.executable,"scripts/assemble_live_discovery.py","--source-control",str(root/"source-control.json"),"--target-control",str(root/"target-control.json"),"--runtime",str(root/"runtime.json"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out-dir",str(root/"out")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(3, proc.returncode)
+            self.assertFalse((root / "out").exists())
 
     def test_fixture_and_live_arguments_are_mutually_exclusive(self):
         proc = subprocess.run([sys.executable, "scripts/assemble_live_discovery.py", "--fixture-dir", str(FIXTURES / "ready"), "--source-control", "a", "--target-control", "b", "--runtime", "c", "--schema-policy", "d", "--out-dir", "/tmp/no-write"], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -194,6 +318,31 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             proc = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "api", "--side", "source", "--fixture", str(FIXTURES / "api-input.json"), "--rehome-host", "compute-023", "--cloud", "cloud", "--clouds-file", "/clouds.yaml", "--container", "toolbox", "--out", str(Path(temporary) / "out")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, proc.returncode)
+
+    def test_fixture_rejects_probe_capability_root_and_phase_key_inputs(self):
+        for option in ("--probe-config", "--capability-config", "--root-manifest", "--phase-key-file", "--phase-key-env"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as temporary:
+                proc = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","api","--side","source","--fixture",str(FIXTURES/"api-input.json"),option,"UNTRUSTED_VALUE","--out",str(Path(temporary)/"out")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+                self.assertEqual(3, proc.returncode)
+
+    def test_coordinated_plain_hash_substitution_cannot_replace_hmac(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api_dir = root / "api"
+            create = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","api","--side","source","--fixture",str(FIXTURES/"api-input.json"),"--out",str(api_dir)],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(0, create.returncode, create.stderr)
+            names = ("api-result.json","uuid-filters.json","db-query-plan.json")
+            documents = [json.loads((api_dir/name).read_text()) for name in names]
+            documents[0]["api_result"]["rehome_host"] = "coordinated-substitution"
+            bases = [{key:value for key,value in document.items() if key != "binding_sha256"} for document in documents]
+            plain = hashlib.sha256(json.dumps({"api_result":bases[0],"uuid_filters":bases[1],"db_query_plan":bases[2]},ensure_ascii=True,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+            for name, document in zip(names, documents):
+                document["binding_sha256"] = plain
+                (api_dir/name).write_text(json.dumps(document),encoding="utf-8")
+            db = root / "db"
+            db.mkdir()
+            proc = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--side","source","--api-result",str(api_dir/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"combined")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(3, proc.returncode)
 
     def test_combine_rejects_query_plan_sql_tampering(self):
         with tempfile.TemporaryDirectory() as temporary:
