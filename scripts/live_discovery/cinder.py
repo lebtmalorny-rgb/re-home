@@ -24,6 +24,11 @@ _SENSITIVE = re.compile(
     r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|"
     r"credential|connector|connection[_-]?(?:info|data)", re.IGNORECASE,
 )
+_SUPPORTED_ATTACHMENT_DRIVERS = {
+    "iscsi", "fibre_channel", "rbd", "nfs", "file", "lvm",
+}
+_SAFE_NETLOC = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
+_ENCRYPTION_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$")
 
 _TABLE_ID_FIELDS = {
     "volumes": (
@@ -157,6 +162,25 @@ def _safe_value(value: object) -> Any:
     return None
 
 
+def _safe_nonempty_string(value: object) -> Optional[str]:
+    if (
+        isinstance(value, str)
+        and value != ""
+        and _SAFE_TEXT.fullmatch(value)
+    ):
+        return value
+    return None
+
+
+def _safe_nonempty_string_list(value: object) -> Optional[List[str]]:
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        return None
+    normalized = [_safe_nonempty_string(item) for item in value]
+    if any(item is None for item in normalized):
+        return None
+    return [item for item in normalized if item is not None]
+
+
 def _typed_bool(value: object) -> Optional[bool]:
     if isinstance(value, bool):
         return value
@@ -209,21 +233,22 @@ def _parse_mapping(value: object) -> Optional[Mapping[str, Any]]:
 def _connection_summary(value: object) -> Dict[str, Any]:
     payload = _parse_mapping(value) or {}
     driver = _field(payload, "driver_volume_type", "driver_type")
-    driver_type = driver if isinstance(driver, str) and _FIXTURE_ALIAS.fullmatch(driver) else None
+    driver_type = (
+        driver
+        if isinstance(driver, str)
+        and driver in _SUPPORTED_ATTACHMENT_DRIVERS
+        else None
+    )
     data = _field(payload, "data")
     data = data if isinstance(data, Mapping) else {}
     target_count = 0
-    for name in (
-        "target_portals", "target_iqns", "targets", "target_wwn",
-        "target_wwns", "hosts", "mon_hosts",
-    ):
+    for name in ("target_portals", "target_iqns", "target_wwns", "hosts", "mon_hosts"):
         candidate = _field(data, name)
-        if isinstance(candidate, (list, tuple)):
-            target_count = max(target_count, len(candidate))
-        elif isinstance(candidate, str) and candidate:
-            target_count = max(target_count, 1)
+        normalized = _safe_nonempty_string_list(candidate)
+        if normalized is not None:
+            target_count = max(target_count, len(normalized))
     if target_count == 0 and any(
-        isinstance(_field(data, name), str) and bool(_field(data, name))
+        _safe_nonempty_string(_field(data, name)) is not None
         for name in (
             "target_portal", "target_iqn", "export", "device_path",
             "path", "name",
@@ -234,7 +259,7 @@ def _connection_summary(value: object) -> Dict[str, Any]:
     return {
         "driver_type": driver_type,
         "target_count": target_count,
-        "multipath": multipath if isinstance(multipath, bool) else False,
+        "multipath": multipath if isinstance(multipath, bool) else None,
     }
 
 
@@ -243,22 +268,33 @@ def _active_connection_evidence_valid(
 ) -> bool:
     connection = _parse_mapping(connection_info)
     connector_payload = _parse_mapping(connector)
-    if not connection or not connector_payload:
+    if (
+        connection is None
+        or len(connection) == 0
+        or connector_payload is None
+        or len(connector_payload) == 0
+    ):
         return False
-    connector_identity = any(
-        key in connector_payload and connector_payload[key] not in (None, "", [], {})
-        for key in ("host", "initiator", "wwpns", "ip", "platform", "os_type")
-    )
-    if not connector_identity:
+    connector_identity = False
+    for key in ("host", "initiator", "ip", "platform", "os_type"):
+        if key in connector_payload:
+            if _safe_nonempty_string(connector_payload[key]) is None:
+                return False
+            connector_identity = True
+    if "wwpns" in connector_payload:
+        if _safe_nonempty_string_list(connector_payload["wwpns"]) is None:
+            return False
+        connector_identity = True
+    if connector_identity is False:
         return False
     data = _field(connection, "data")
-    if not isinstance(data, Mapping) or not data:
+    if not isinstance(data, Mapping) or len(data) == 0:
         return False
     driver = summary.get("driver_type")
     target_count = summary.get("target_count")
     base_valid = (
         isinstance(driver, str)
-        and bool(driver)
+        and driver != ""
         and isinstance(target_count, int)
         and not isinstance(target_count, bool)
         and target_count > 0
@@ -273,23 +309,94 @@ def _active_connection_evidence_valid(
             portals = [_field(data, "target_portal")]
         if iqns is None:
             iqns = [_field(data, "target_iqn")]
+        normalized_portals = _safe_nonempty_string_list(portals)
+        normalized_iqns = _safe_nonempty_string_list(iqns)
         return (
-            isinstance(portals, (list, tuple))
-            and isinstance(iqns, (list, tuple))
-            and bool(portals)
-            and len(portals) == len(iqns)
-            and all(isinstance(item, str) and item for item in [*portals, *iqns])
+            normalized_portals is not None
+            and normalized_iqns is not None
+            and len(normalized_portals) == len(normalized_iqns)
         )
-    if driver in {"fibre_channel", "fc"}:
+    if driver == "fibre_channel":
         targets = _field(data, "target_wwn", "target_wwns")
-        return isinstance(targets, (list, tuple)) and bool(targets)
+        return _safe_nonempty_string_list(targets) is not None
     if driver == "rbd":
-        return bool(_field(data, "name")) and bool(
-            _field(data, "hosts", "mon_hosts")
+        return (
+            _safe_nonempty_string(_field(data, "name")) is not None
+            and _safe_nonempty_string_list(
+                _field(data, "hosts", "mon_hosts")
+            ) is not None
         )
-    if driver in {"nfs", "file", "lvm", "local"}:
-        return bool(_field(data, "export", "device_path", "path", "name"))
+    if driver in {"nfs", "file", "lvm"}:
+        return _safe_nonempty_string(
+            _field(data, "export", "device_path", "path", "name")
+        ) is not None
     return False
+
+
+def _normalized_encryption_facts(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    provider = _safe_nonempty_string(_field(row, "provider"))
+    control_location = _field(row, "control_location")
+    key_size = _field(row, "key_size")
+    cipher = _field(row, "cipher")
+    if (
+        provider is None
+        or _ENCRYPTION_PROVIDER.fullmatch(provider) is None
+        or _SENSITIVE.search(provider) is not None
+        or control_location not in {"front-end", "back-end"}
+        or not isinstance(key_size, int)
+        or isinstance(key_size, bool)
+        or key_size <= 0
+        or (
+            cipher is not None
+            and (
+                _safe_nonempty_string(cipher) is None
+                or _SENSITIVE.search(cipher) is not None
+            )
+        )
+    ):
+        return None
+    facts = {
+        "provider": provider,
+        "control_location": control_location,
+        "key_size": key_size,
+    }
+    if cipher is not None:
+        facts["cipher"] = cipher
+    return facts
+
+
+def _barbican_href_identity(
+    href: object, allow_fixture_aliases: bool
+) -> Optional[str]:
+    if _safe_nonempty_string(href) is None:
+        return None
+    try:
+        parsed = urlparse(href)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or _SAFE_NETLOC.fullmatch(parsed.netloc) is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.hostname is None
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        # Access validates bracketed IPv6 and port syntax.
+        parsed.port
+        path_parts = parsed.path.split("/")
+        if len(path_parts) != 4 or path_parts[:3] != ["", "v1", "secrets"]:
+            return None
+        identity = _openstack_id(
+            path_parts[3], allow_fixture_aliases
+        )
+        if identity is None or parsed.path != f"/v1/secrets/{identity}":
+            return None
+        return identity
+    except Exception:
+        return None
 
 
 class CinderCollector:
@@ -540,10 +647,42 @@ class CinderCollector:
             facts["connection_summary"] = summary
             add_node("volume_attachment", attachment_id, facts, [evidence_id] if evidence_id else [])
 
-        encryption_type_ids = {
-            value for row in encryptions
-            if (value := _row_id(row, "volume_type_id")) is not None
-        }
+        encryption_rows_by_type: Dict[str, List[Mapping[str, Any]]] = {}
+        for encryption_row in encryptions:
+            encryption_type_id = _row_id(encryption_row, "volume_type_id")
+            if encryption_type_id is not None:
+                encryption_rows_by_type.setdefault(
+                    encryption_type_id, []
+                ).append(encryption_row)
+        valid_encryption_facts: Dict[str, Dict[str, Any]] = {}
+        for encryption_type_id in sorted(
+            {*encryption_rows_by_type, *key_volume_type_ids}
+        ):
+            active_rows = [
+                item for item in encryption_rows_by_type.get(
+                    encryption_type_id, []
+                )
+                if not _is_deleted(item)
+            ]
+            if not active_rows:
+                if encryption_type_id in key_volume_type_ids:
+                    result.blockers.append(
+                        f"required encryption definition missing: {encryption_type_id}"
+                    )
+                continue
+            if len(active_rows) != 1:
+                result.blockers.append(
+                    f"encryption definition ambiguous: {encryption_type_id}"
+                )
+                continue
+            normalized_encryption = _normalized_encryption_facts(active_rows[0])
+            if normalized_encryption is None:
+                result.blockers.append(
+                    f"encryption definition invalid: {encryption_type_id}"
+                )
+                continue
+            valid_encryption_facts[encryption_type_id] = normalized_encryption
+        encryption_type_ids = set(valid_encryption_facts)
         type_rows = {_row_id(row, "id"): row for row in types if not _is_deleted(row)}
         service_rows_by_id: Dict[str, List[Mapping[str, Any]]] = {}
         for service_row in services:
@@ -769,15 +908,11 @@ class CinderCollector:
                                 f"required QoS specifications missing: {qos_id}"
                             )
                         type_facts["qos_specs"].append(qos_facts)
-                    encryption_rows = [item for item in encryptions if _row_id(item, "volume_type_id") == type_id]
-                    if type_id in key_volume_type_ids and not encryption_rows:
-                        result.blockers.append(
-                            f"required encryption definition missing: {type_id}"
-                        )
-                    type_facts["encryption"] = [
-                        _allowlisted(item, ("provider", "control_location", "key_size"))
-                        for item in encryption_rows
-                    ]
+                    normalized_encryption = valid_encryption_facts.get(type_id)
+                    type_facts["encryption"] = (
+                        [deepcopy(normalized_encryption)]
+                        if normalized_encryption is not None else []
+                    )
                     add_node("volume_type", type_id, type_facts, [type_evidence] if type_evidence else [])
                 add_edge(volume.key, f"volume_type:{type_id}", "uses_volume_type")
             else:
@@ -793,20 +928,56 @@ class CinderCollector:
                     service_host = _field(service_row, "host")
                     volume_cluster = _field(row, "cluster_name")
                     service_cluster = _field(service_row, "cluster_name")
+                    service_backend_name = _field(service_row, "backend_name")
+                    volume_backend_name = self._backend_name_from_host(
+                        volume_host
+                    )
                     if (
                         service_host != volume_host
-                        or self._backend_from_host(service_host)
-                        != self._backend_from_host(volume_host)
+                        or self._backend_name_from_host(service_host)
+                        != volume_backend_name
                         or service_cluster != volume_cluster
+                        or self._backend_name_from_cluster(service_cluster)
+                        != volume_backend_name
+                        or service_backend_name != volume_backend_name
                     ):
                         result.blockers.append(
                             f"Cinder service backend mismatch: {service_id}"
                         )
-                    if _typed_bool(_field(service_row, "disabled")) is not False:
+                    if (
+                        _typed_bool(_field(service_row, "disabled")) is not False
+                        or _field(service_row, "binary") != "cinder-volume"
+                    ):
                         result.blockers.append(
                             f"Cinder service not ready: {service_id}"
                         )
-                    add_node("cinder_service", service_id, _allowlisted(service_row, _SERVICE_FIELDS))
+                    service_facts: Dict[str, Any] = {"uuid": service_id}
+                    if (
+                        service_host == volume_host
+                        and volume_backend_name is not None
+                        and isinstance(service_host, str)
+                        and _SENSITIVE.search(service_host) is None
+                    ):
+                        service_facts["host"] = service_host
+                    if (
+                        service_cluster == volume_cluster
+                        and self._backend_name_from_cluster(service_cluster)
+                        is not None
+                        and isinstance(service_cluster, str)
+                        and _SENSITIVE.search(service_cluster) is None
+                    ):
+                        service_facts["cluster_name"] = service_cluster
+                    if _field(service_row, "binary") == "cinder-volume":
+                        service_facts["binary"] = "cinder-volume"
+                    disabled = _typed_bool(_field(service_row, "disabled"))
+                    if disabled is not None:
+                        service_facts["disabled"] = disabled
+                    if service_backend_name == volume_backend_name:
+                        service_facts["backend_name"] = service_backend_name
+                    topic = _safe_nonempty_string(_field(service_row, "topic"))
+                    if topic == "cinder-volume":
+                        service_facts["topic"] = topic
+                    add_node("cinder_service", service_id, service_facts)
                 add_edge(volume.key, f"cinder_service:{service_id}", "managed_by")
             else:
                 result.blockers.append(f"Cinder service UUID missing: {volume_id}")
@@ -827,7 +998,10 @@ class CinderCollector:
                 result.blockers.append(f"encrypted volume {volume_id} has no key UUID")
             if key_id:
                 key_api, key_evidence, failure = self._secret_metadata(key_id, result)
-                key_facts = _allowlisted(key_api, ("status", "secret_type", "content_types"))
+                key_facts = (
+                    {"status": "ACTIVE"}
+                    if _field(key_api, "status") == "ACTIVE" else {}
+                )
                 add_node("encryption_key_ref", key_id, key_facts, [key_evidence] if key_evidence else [])
                 add_edge(volume.key, f"encryption_key_ref:{key_id}", "uses_encryption_key")
                 if failure:
@@ -945,8 +1119,8 @@ class CinderCollector:
                                 f"Cinder service API/DB {field} mismatch: {service_id}"
                             )
                     if (
-                        self._backend_from_host(api_host)
-                        != self._backend_from_host(db_host)
+                        self._backend_name_from_host(api_host)
+                        != self._backend_name_from_host(db_host)
                     ):
                         result.blockers.append(
                             f"Cinder service backend mismatch: {service_id}"
@@ -958,15 +1132,36 @@ class CinderCollector:
                         or status.lower() != "enabled"
                         or not isinstance(state, str)
                         or state.lower() != "up"
+                        or _field(matches[0], "binary") != "cinder-volume"
                     ):
                         result.blockers.append(
                             f"Cinder service not ready: {service_id}"
                         )
                     service_node = nodes.get(f"cinder_service:{service_id}")
                     if service_node is not None:
-                        service_node.facts["api_observed"] = _allowlisted(
-                            matches[0], ("host", "binary", "status", "state")
-                        )
+                        api_observed: Dict[str, Any] = {}
+                        api_cluster = _field(matches[0], "cluster_name")
+                        api_binary = _field(matches[0], "binary")
+                        if api_host == db_host:
+                            api_observed["host"] = api_host
+                        if api_binary == "cinder-volume":
+                            api_observed["binary"] = "cinder-volume"
+                        if isinstance(status, str) and status.lower() == "enabled":
+                            api_observed["status"] = "enabled"
+                        if isinstance(state, str) and state.lower() == "up":
+                            api_observed["state"] = "up"
+                        if api_cluster == _field(db_service, "cluster_name"):
+                            api_observed["cluster_name"] = api_cluster
+                        api_backend_name = self._backend_name_from_host(api_host)
+                        if (
+                            api_backend_name is not None
+                            and api_backend_name
+                            == _field(db_service, "backend_name")
+                            and api_backend_name
+                            == self._backend_name_from_cluster(api_cluster)
+                        ):
+                            api_observed["backend_name"] = api_backend_name
+                        service_node.facts["api_observed"] = api_observed
                         service_node.evidence_ids[:] = _dedupe([
                             *service_node.evidence_ids,
                             *([service_evidence] if service_evidence else []),
@@ -1082,18 +1277,19 @@ class CinderCollector:
                 _openstack_id(direct_identity, self._allow_fixture_aliases)
             )
         href = _field(payload, "secret_href", "secret_ref", "href")
-        if isinstance(href, str):
-            path_parts = [item for item in urlparse(href).path.split("/") if item]
-            if path_parts:
-                identities.append(
-                    _openstack_id(
-                        path_parts[-1], self._allow_fixture_aliases
-                    )
+        if href not in (None, ""):
+            identities.append(
+                _barbican_href_identity(
+                    href, self._allow_fixture_aliases
                 )
+            )
         if not identities or any(identity != key_id for identity in identities):
             result.blockers.append(
-                f"encryption key metadata identity mismatch: {key_id}"
+                "encryption key metadata identity invalid"
             )
+            return _PolicyMapping({}, self._allow_fixture_aliases), None, True
+        if _field(payload, "status") != "ACTIVE":
+            result.blockers.append("encryption key metadata state invalid")
             return _PolicyMapping({}, self._allow_fixture_aliases), None, True
         result.evidence.append({
             "evidence_id": evidence_id, "kind": "openstack-json", "command": command,
@@ -1119,6 +1315,21 @@ class CinderCollector:
         if not isinstance(value, str) or "@" not in value:
             return None
         backend = value.split("@", 1)[1]
+        return backend if _BACKEND_ID.fullmatch(backend) else None
+
+    @staticmethod
+    def _backend_name_from_host(value: object) -> Optional[str]:
+        backend = CinderCollector._backend_from_host(value)
+        if backend is None:
+            return None
+        name = backend.split("#", 1)[0]
+        return name if _BACKEND_ID.fullmatch(name) else None
+
+    @staticmethod
+    def _backend_name_from_cluster(value: object) -> Optional[str]:
+        if not isinstance(value, str) or "@" not in value:
+            return None
+        backend = value.rsplit("@", 1)[1]
         return backend if _BACKEND_ID.fullmatch(backend) else None
 
     @staticmethod

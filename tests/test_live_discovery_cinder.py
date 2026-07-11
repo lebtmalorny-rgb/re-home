@@ -164,6 +164,31 @@ class CinderCollectorTests(unittest.TestCase):
                 result, _ = collect_from_fixture(fixture)
                 self.assertIn(f"Cinder service API/DB {field} mismatch: service-1", result.blockers)
 
+    def test_referenced_database_service_must_be_cinder_volume(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["tables"]["services"][0]["binary"] = "cinder-backup"
+        result, _ = collect_from_fixture(fixture)
+        self.assertIn("Cinder service not ready: service-1", result.blockers)
+
+    def test_database_backend_name_must_match_host_and_cluster(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["tables"]["services"][0]["backend_name"] = "other"
+        result, _ = collect_from_fixture(fixture)
+        self.assertIn("Cinder service backend mismatch: service-1", result.blockers)
+
+    def test_service_api_observed_contains_compared_backend_cluster_only(self):
+        result, _ = collect_from_fixture(self.source_fixture)
+        service = next(node for node in result.nodes if node.key == "cinder_service:service-1")
+        self.assertEqual("backend", service.facts["backend_name"])
+        self.assertEqual(
+            {
+                "host": "cinder@backend#nfs", "binary": "cinder-volume",
+                "status": "enabled", "state": "up",
+                "cluster_name": "cluster@backend", "backend_name": "backend",
+            },
+            service.facts["api_observed"],
+        )
+
     def test_backend_mismatch_and_ambiguity_block(self):
         mismatch = deepcopy(self.source_fixture)
         mismatch["tables"]["services"][0]["host"] = "cinder@other#pool"
@@ -207,6 +232,26 @@ class CinderCollectorTests(unittest.TestCase):
                 fixture["tables"][table] = []
                 result, _ = collect_from_fixture(fixture)
                 self.assertIn(expected, result.blockers)
+
+    def test_encryption_requires_one_active_complete_typed_row(self):
+        base = self.source_fixture["tables"]["encryption"][0]
+        cases = (
+            ([], "required encryption definition missing: type-1"),
+            ([{**base, "deleted": True}], "required encryption definition missing: type-1"),
+            ([deepcopy(base), deepcopy(base)], "encryption definition ambiguous: type-1"),
+            ([{**base, "provider": 123}], "encryption definition invalid: type-1"),
+            ([{**base, "provider": ""}], "encryption definition invalid: type-1"),
+            ([{**base, "control_location": "somewhere"}], "encryption definition invalid: type-1"),
+            ([{**base, "key_size": "256"}], "encryption definition invalid: type-1"),
+        )
+        for rows, expected in cases:
+            with self.subTest(rows=rows):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["encryption"] = rows
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn(expected, result.blockers)
+                volume_type = next(node for node in result.nodes if node.kind == "volume_type")
+                self.assertEqual([], volume_type.facts["encryption"])
 
     def test_group_and_group_snapshot_dependency_closure(self):
         fixture = deepcopy(self.source_fixture)
@@ -267,7 +312,27 @@ class CinderCollectorTests(unittest.TestCase):
         fixture = deepcopy(self.source_fixture)
         fixture["openstack"][4]["payload"]["Secret href"] = "https://barbican.example/v1/secrets/key-other"
         result, _ = collect_from_fixture(fixture)
-        self.assertIn("encryption key metadata identity mismatch: key-1", result.blockers)
+        self.assertIn("encryption key metadata identity invalid", result.blockers)
+
+    def test_barbican_href_is_defensive_and_sanitized(self):
+        hrefs = (
+            "https://[::1/v1/secrets/key-1",
+            "file://barbican.example/v1/secrets/key-1",
+            "https:///v1/secrets/key-1",
+            "https://user:pass@barbican.example/v1/secrets/key-1",
+            "https://barbican.example/v1/secrets/key-1/extra",
+            "https://barbican.example/v2/secrets/key-1",
+            "https://barbican.example/v1/secrets/key-other?token=must-not-leak",
+        )
+        for href in hrefs:
+            with self.subTest(href=href):
+                fixture = deepcopy(self.source_fixture)
+                fixture["openstack"][4]["payload"]["Secret href"] = href
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("encryption key metadata identity invalid", result.blockers)
+                serialized = json.dumps(result.to_dict())
+                self.assertNotIn(href, serialized)
+                self.assertNotIn("must-not-leak", serialized)
 
     def test_active_attachment_requires_nonempty_driver_evidence(self):
         cases = (
@@ -286,6 +351,59 @@ class CinderCollectorTests(unittest.TestCase):
                     fixture["tables"]["volume_attachment"][0]["connector"] = json.dumps(connector)
                 result, _ = collect_from_fixture(fixture)
                 self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
+
+    def test_attachment_driver_fields_require_exact_types(self):
+        valid_connector = {"host": "compute-1", "initiator": "iqn.connector"}
+        cases = (
+            ({"driver_volume_type": "fibre_channel", "data": {"target_wwns": ["wwn1", None], "multipath": False}}, valid_connector),
+            ({"driver_volume_type": "rbd", "data": {"name": 123, "hosts": ["mon1"], "multipath": False}}, valid_connector),
+            ({"driver_volume_type": "rbd", "data": {"name": "pool/image", "hosts": ["mon1", 2], "multipath": False}}, valid_connector),
+            ({"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": [123], "multipath": False}}, valid_connector),
+            ({"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"], "multipath": "false"}}, valid_connector),
+            ({"driver_volume_type": "iscsi", "data": {"target_portals": ["p1"], "target_iqns": ["i1"], "multipath": False}}, {"host": 123}),
+            ({"driver_volume_type": "fibre_channel", "data": {"target_wwns": ["wwn1"], "multipath": False}}, {"wwpns": ["connector-1", None]}),
+        )
+        for connection_info, connector in cases:
+            with self.subTest(connection_info=connection_info, connector=connector):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0]["connection_info"] = json.dumps(connection_info)
+                fixture["tables"]["volume_attachment"][0]["connector"] = json.dumps(connector)
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
+
+    def test_unsupported_driver_value_is_never_serialized(self):
+        fixture = deepcopy(self.source_fixture)
+        raw_driver = "vendor-secret-driver-token-must-not-leak"
+        fixture["tables"]["volume_attachment"][0]["connection_info"] = json.dumps({
+            "driver_volume_type": raw_driver,
+            "data": {"targets": ["secret-target"], "multipath": False},
+        })
+        result, _ = collect_from_fixture(fixture)
+        self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
+        serialized = json.dumps(result.to_dict())
+        self.assertNotIn(raw_driver, serialized)
+        self.assertNotIn("secret-target", serialized)
+        attachment = next(node for node in result.nodes if node.kind == "volume_attachment")
+        self.assertIsNone(attachment.facts["connection_summary"]["driver_type"])
+
+    def test_raw_sensitive_service_encryption_and_key_fields_never_serialize(self):
+        mutations = (
+            ("service", "backend-secret-token"),
+            ("encryption", "provider-secret-token"),
+            ("key", "status-secret-token"),
+        )
+        for kind, sentinel in mutations:
+            with self.subTest(kind=kind):
+                fixture = deepcopy(self.source_fixture)
+                if kind == "service":
+                    fixture["tables"]["services"][0]["backend_name"] = sentinel
+                elif kind == "encryption":
+                    fixture["tables"]["encryption"][0]["provider"] = sentinel
+                else:
+                    fixture["openstack"][4]["payload"]["status"] = sentinel
+                result, _ = collect_from_fixture(fixture)
+                self.assertNotIn(sentinel, json.dumps(result.to_dict()))
+                self.assertTrue(result.blockers)
 
     def test_missing_encryption_key_uuid_is_blocker(self):
         fixture = deepcopy(self.source_fixture)
