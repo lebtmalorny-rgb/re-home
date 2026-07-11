@@ -104,6 +104,17 @@ TABLE_FACT_FIELDS = {
     ),
 }
 
+_INVALID_FACT = object()
+_BOOLEAN_FACT_FIELDS = {
+    "admin_state_up", "port_security_enabled", "shared", "enable_dhcp",
+    "is_dynamic", "stateful", "is_default",
+}
+_INTEGER_FACT_FIELDS = {
+    "mtu", "ip_version", "provider_segmentation_id", "segmentation_id",
+    "segment_index", "level", "port_range_min", "port_range_max", "order",
+    "internal_port", "external_port",
+}
+
 
 def _field(payload: object, *names: str) -> Any:
     if not isinstance(payload, Mapping):
@@ -138,7 +149,11 @@ def _identifiers(value: object) -> List[str]:
 
 def _row_id(row: Mapping[str, Any], *names: str) -> Optional[str]:
     value = _field(row, *names)
-    return str(value) if value not in (None, "") else None
+    if isinstance(value, str):
+        return value if value else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
 
 
 def _schema_table_names(schema: object) -> Set[str]:
@@ -161,6 +176,24 @@ def _dedupe(values: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def _normalize_fact_value(field: str, value: object) -> object:
+    if field == "security_group_ids":
+        if not isinstance(value, (list, tuple, set)):
+            return _INVALID_FACT
+        return _identifiers(value)
+    if value is None:
+        return None
+    if field in _BOOLEAN_FACT_FIELDS:
+        return value if isinstance(value, bool) else _INVALID_FACT
+    if field in _INTEGER_FACT_FIELDS:
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool)
+            else _INVALID_FACT
+        )
+    return value if isinstance(value, str) else _INVALID_FACT
+
+
 def _allowlisted(payload: Mapping[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
     facts = {}
     normalized = {
@@ -168,10 +201,13 @@ def _allowlisted(payload: Mapping[str, Any], fields: Sequence[str]) -> Dict[str,
         for key, value in payload.items()
     }
     for field in fields:
+        value = _INVALID_FACT
         if field in payload:
-            facts[field] = deepcopy(payload[field])
+            value = _normalize_fact_value(field, payload[field])
         elif field in normalized:
-            facts[field] = deepcopy(normalized[field])
+            value = _normalize_fact_value(field, normalized[field])
+        if value is not _INVALID_FACT:
+            facts[field] = deepcopy(value)
     return facts
 
 
@@ -268,9 +304,13 @@ class NeutronCollector:
                 api_value = _field(api, field)
                 db_value = _field(db_port, field)
                 if (
-                    api_value not in (None, "")
-                    and db_value not in (None, "")
-                    and api_value != db_value
+                    (api_value not in (None, ""))
+                    != (db_value not in (None, ""))
+                    or (
+                        api_value not in (None, "")
+                        and db_value not in (None, "")
+                        and api_value != db_value
+                    )
                 ):
                     reason = (
                         f"port API/DB network mismatch: {port_id}"
@@ -460,7 +500,7 @@ class NeutronCollector:
         for port_id in selected_ports:
             api_groups = api_security_groups_by_port.get(port_id, set())
             db_groups = db_security_groups_by_port[port_id]
-            if api_groups and api_groups != db_groups:
+            if api_groups != db_groups:
                 result.blockers.append(
                     f"security group API/DB binding mismatch: {port_id}"
                 )
@@ -555,20 +595,39 @@ class NeutronCollector:
         active_ports = list(initial_port_ids)
         while True:
             fetch("trunks", {"port_id": active_ports})
+            fetch("subports", {"port_id": active_ports})
+            parent_trunk_ids = _dedupe(
+                trunk_id
+                for row in rows["subports"]
+                if _row_id(row, "port_id") in active_ports
+                and (trunk_id := _row_id(row, "trunk_id")) is not None
+            )
+            fetch("trunks", {"id": parent_trunk_ids})
             trunk_ids = _dedupe(
                 trunk_id
                 for row in rows["trunks"]
-                if _row_id(row, "port_id") in active_ports
+                if (
+                    _row_id(row, "port_id") in active_ports
+                    or _row_id(row, "id") in parent_trunk_ids
+                )
                 and (trunk_id := _row_id(row, "id")) is not None
             )
             fetch("subports", {"trunk_id": trunk_ids})
+            parent_ports = _dedupe(
+                parent_port
+                for row in rows["trunks"]
+                if _row_id(row, "id") in trunk_ids
+                and (parent_port := _row_id(row, "port_id")) is not None
+            )
             child_ports = _dedupe(
                 child_port
                 for row in rows["subports"]
                 if _row_id(row, "trunk_id") in trunk_ids
                 and (child_port := _row_id(row, "port_id")) is not None
             )
-            expanded = _dedupe([*active_ports, *child_ports])
+            expanded = _dedupe(
+                [*active_ports, *parent_ports, *child_ports]
+            )
             if expanded == active_ports:
                 break
             active_ports = expanded
@@ -1018,6 +1077,14 @@ def _port_segments(result: CollectorResult, port_id: str) -> List[ResourceNode]:
 def _segment_signature(
     node: ResourceNode,
 ) -> Optional[Tuple[str, Optional[str], Optional[int]]]:
+    normalized_keys = {
+        str(key).lower().replace("-", "_").replace(" ", "_")
+        for key in node.facts
+    }
+    if not {
+        "network_type", "physical_network", "segmentation_id"
+    }.issubset(normalized_keys):
+        return None
     network_type = _field(node.facts, "network_type")
     physical_network = _field(node.facts, "physical_network")
     segmentation_id = _field(node.facts, "segmentation_id")
@@ -1261,6 +1328,37 @@ def _compare_ovs_port(port_id, source_runtime, target_runtime, check) -> None:
             f"target OVS port missing for port {port_id}", [f"port:{port_id}"],
         )
         return
+
+    def malformed(
+        ports: Sequence[ResourceNode], interfaces: Sequence[ResourceNode]
+    ) -> bool:
+        for node in [*ports, *interfaces]:
+            if not isinstance(node.id, str) or not node.id:
+                return True
+        for node in interfaces:
+            bridge = _field(node.facts, "source", "bridge")
+            if bridge not in (None, "") and not isinstance(bridge, str):
+                return True
+        for node in ports:
+            bridge = _field(node.facts, "bridge", "source")
+            if bridge not in (None, "") and not isinstance(bridge, str):
+                return True
+        return False
+
+    if malformed(source_ports, source_interfaces):
+        check(
+            f"neutron.ovs-source-malformed.{port_id}", "UNKNOWN",
+            f"source OVS dataplane evidence malformed for port {port_id}",
+            [f"port:{port_id}"],
+        )
+        return
+    if malformed(target_ports, target_interfaces):
+        check(
+            f"neutron.ovs-target-malformed.{port_id}", "BLOCKED",
+            f"target OVS dataplane evidence malformed for port {port_id}",
+            [f"port:{port_id}"],
+        )
+        return
     if not source_interfaces or not target_interfaces:
         check(
             f"neutron.ovs-bridge.{port_id}", "UNKNOWN",
@@ -1330,6 +1428,39 @@ def _compare_ovn_port(port_id, source_runtime, target_runtime, check) -> None:
             f"neutron.ovn-binding.{port_id}", "BLOCKED",
             f"target OVN logical binding missing for port {port_id}",
             [f"port:{port_id}"],
+        )
+        return
+
+    def malformed(bindings: Sequence[ResourceNode]) -> bool:
+        for node in bindings:
+            logical_port = _field(node.facts, "logical_port")
+            chassis = _field(node.facts, "chassis")
+            if (
+                not isinstance(node.id, str)
+                or not node.id
+                or not isinstance(logical_port, str)
+                or not logical_port
+                or logical_port != node.id
+                or (
+                    chassis not in (None, "")
+                    and not isinstance(chassis, str)
+                )
+            ):
+                return True
+        return False
+
+    if malformed(source_bindings):
+        check(
+            f"neutron.ovn-source-malformed.{port_id}", "UNKNOWN",
+            f"source OVN binding evidence malformed for port {port_id}",
+            [f"port:{port_id}", *(node.key for node in source_bindings)],
+        )
+        return
+    if malformed(target_bindings):
+        check(
+            f"neutron.ovn-target-malformed.{port_id}", "BLOCKED",
+            f"target OVN binding evidence malformed for port {port_id}",
+            [f"port:{port_id}", *(node.key for node in target_bindings)],
         )
         return
     target_chassis = {
