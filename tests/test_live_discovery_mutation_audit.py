@@ -21,7 +21,11 @@ from live_discovery.argv_policy import (  # noqa: E402
     validate_inventory_commands,
     validate_mysql_argv,
 )
-from live_discovery.runner import MutationRejected, ReadOnlyRunner  # noqa: E402
+from live_discovery.runner import (  # noqa: E402
+    MutationRejected,
+    ReadOnlyRunner,
+    classify_mutation,
+)
 
 
 ENTRYPOINTS = (
@@ -46,7 +50,8 @@ _INCLUDE_MODULE = re.compile(
     r"(?m)^\s*(?:ansible\.builtin\.)?(?:include_tasks|import_tasks|import_playbook):"
 )
 _MODULE = re.compile(
-    r"^(\s*)ansible\.builtin\.(command|shell|raw):(?:\s*(.*))?$"
+    r"^(\s*)(?:(?:[A-Za-z_][A-Za-z0-9_-]*\.)+)?"
+    r"(command|shell|raw):(?:\s*(.*))?$"
 )
 _DYNAMIC_ARGV = re.compile(r"\blive_discovery_[a-z0-9_]*argv(?:_prefix)?\b")
 _ALLOWED_DYNAMIC_ARGV = {
@@ -70,12 +75,13 @@ _FORBIDDEN_COMMAND_PATTERNS = (
     ),
     re.compile(
         r"\bopenstack\b[^\n]*(?:\bcreate\b|\bset\b|\bdelete\b|\bsave\b|"
-        r"\bmap\b|\bmount\b|\bactivate\b)",
+        r"\bmap\b|\bmount\b|\bactivate\b|\block\b|\bunlock\b|\brestore\b|"
+        r"\bmanage\b|\bextend\b)",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:nova-manage|cinder-manage|neutron-db-manage)\b[^\n]*"
-        r"(?:\bsync\b|\bmigrate\b|\bupgrade\b)",
+        r"(?:\bsync\b|\bmigrate\b|\bupgrade\b|\bstamp\b|\bdiscover_hosts\b)",
         re.IGNORECASE,
     ),
     re.compile(
@@ -135,6 +141,86 @@ def _call_name(call, aliases):
     return ".".join([head, *parts[1:]])
 
 
+def _expression_name(value, aliases):
+    parts = []
+    while isinstance(value, ast.Attribute):
+        parts.append(value.attr)
+        value = value.value
+    if isinstance(value, ast.Name):
+        parts.append(value.id)
+    if not parts:
+        return ""
+    parts.reverse()
+    return ".".join([aliases.get(parts[0], parts[0]), *parts[1:]])
+
+
+def _assert_python_source_safe(source, label, *, allow_subprocess):
+    tree = ast.parse(source, filename=str(label))
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    aliases = _import_aliases(tree)
+    imported_modules = {target.split(".", 1)[0] for target in aliases.values()}
+    forbidden_imports = {"commands", "ctypes", "importlib", "multiprocessing", "pexpect", "pty", "runpy"}
+    if imported_modules & forbidden_imports:
+        raise AssertionError(f"alternate execution module imported by {label}")
+    if not allow_subprocess and "subprocess" in imported_modules:
+        raise AssertionError(f"subprocess imported outside runner: {label}")
+
+    bypass_prefixes = (
+        "os.exec", "os.fork", "os.popen", "os.posix_spawn", "os.spawn", "os.system",
+        "posix.system", "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+        "subprocess.check_output", "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell", "asyncio.subprocess.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_shell", "commands.getoutput",
+        "commands.getstatusoutput", "pty.spawn",
+    )
+    dynamic_execution = {"eval", "exec", "compile", "__import__"}
+    subprocess_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        name = _expression_name(node, aliases)
+        if name == "subprocess.run":
+            parent = parents.get(node)
+            if not isinstance(parent, ast.Call) or parent.func is not node:
+                raise AssertionError(f"indirect subprocess.run in {label}:{node.lineno}")
+        if name.startswith(("os.exec", "os.spawn", "os.posix_spawn", "os.fork")):
+            raise AssertionError(f"indirect process API in {label}:{node.lineno}: {name}")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node, aliases)
+        if name in dynamic_execution or name.startswith(bypass_prefixes):
+            raise AssertionError(f"command execution bypass in {label}:{node.lineno}: {name}")
+        if name == "getattr" and node.args:
+            owner = _expression_name(node.args[0], aliases)
+            attribute = (
+                node.args[1].value
+                if len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                else ""
+            )
+            dangerous_attribute = (
+                attribute in {"run", "Popen", "call", "check_call", "check_output", "system", "popen"}
+                or attribute.startswith(("exec", "spawn", "posix_spawn", "create_subprocess"))
+            )
+            if owner.split(".", 1)[0] in {"asyncio", "os", "posix", "subprocess"} and dangerous_attribute:
+                raise AssertionError(f"dynamic process API in {label}:{node.lineno}")
+        if name == "vars" and node.args:
+            owner = _expression_name(node.args[0], aliases)
+            if owner.split(".", 1)[0] in {"asyncio", "os", "posix", "subprocess"}:
+                raise AssertionError(f"dynamic process namespace in {label}:{node.lineno}")
+        if name.startswith("subprocess."):
+            if not allow_subprocess or name != "subprocess.run":
+                raise AssertionError(f"subprocess bypass in {label}:{node.lineno}: {name}")
+            subprocess_calls.append(node)
+    return subprocess_calls
+
+
 def _reachable_playbook_paths():
     playbooks_root = (ROOT / "playbooks").resolve()
     pending = [PLAYBOOK.resolve()]
@@ -162,20 +248,128 @@ def _reachable_playbook_paths():
     return sorted(seen)
 
 
-def _module_blocks(path):
-    lines = path.read_text(encoding="utf-8").splitlines()
+def _module_blocks_from_text(text):
+    lines = text.splitlines()
     for index, line in enumerate(lines):
         match = _MODULE.match(line)
         if match is None:
             continue
         indent = len(match.group(1))
-        end = index + 1
+        task_start = None
+        task_indent = None
+        for candidate_index in range(index, -1, -1):
+            candidate = lines[candidate_index]
+            task = re.match(r"^(\s*)-\s+(?:name:|(?:(?:[A-Za-z_][A-Za-z0-9_-]*\.)+)?(?:command|shell|raw):)", candidate)
+            if task is not None and len(task.group(1)) < indent:
+                task_start = candidate_index
+                task_indent = len(task.group(1))
+                break
+        if task_start is None or indent != task_indent + 2:
+            continue
+        end = task_start + 1
         while end < len(lines):
             candidate = lines[end]
-            if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= indent:
+            if (
+                end > task_start
+                and candidate.strip()
+                and re.match(rf"^\s{{{task_indent}}}-\s+", candidate)
+            ):
                 break
             end += 1
-        yield match.group(2), match.group(3) or "", "\n".join(lines[index:end])
+        yield match.group(2), match.group(3) or "", "\n".join(lines[task_start:end])
+
+
+def _module_blocks(path):
+    yield from _module_blocks_from_text(path.read_text(encoding="utf-8"))
+
+
+def _static_argv(block):
+    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    if value.startswith("[") and value.endswith("]"):
+        tokens = [item.strip().strip("'\"") for item in value[1:-1].split(",")]
+        return tokens if tokens and all(tokens) and not any("{{" in item for item in tokens) else None
+    if value:
+        return None
+    lines = block[match.end():].splitlines()
+    tokens = []
+    for line in lines:
+        item = re.match(r"^\s+-\s+(.+?)\s*$", line)
+        if item is None:
+            if tokens and line.strip():
+                break
+            continue
+        token = item.group(1).strip().strip("'\"")
+        if "{{" in token or not token:
+            return None
+        tokens.append(token)
+    return tokens or None
+
+
+def _argv_shape_is_reviewed(block):
+    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
+    if match is None:
+        return False
+    value = match.group(1).strip().strip("'\"")
+    if _static_argv(block):
+        return True
+    if "{{" not in block[match.start():]:
+        return True
+    if value.startswith("{{") or value in {">-", "|"}:
+        dynamic = set(_DYNAMIC_ARGV.findall(block))
+        if dynamic - _ALLOWED_DYNAMIC_ARGV:
+            return False
+        if "item.argv" in block:
+            return all(name in block for name in (
+                "live_discovery_nova_api_db_version_argv",
+                "live_discovery_nova_cell_db_version_argv",
+                "live_discovery_neutron_db_version_argv",
+                "live_discovery_cinder_db_version_argv",
+            ))
+        if "['python3'" in block or '["python3"' in block:
+            return True
+        if dynamic:
+            exact_suffixes = (
+                "['version']", "['domcapabilities']", "['-machine', 'help']",
+                "['--execute'", "[item]",
+            )
+            return any(suffix in block for suffix in exact_suffixes)
+        return False
+    first_item = re.search(r"(?m)^[ \t]+-\s+([^\n]+)$", block[match.end():])
+    if first_item is None:
+        return False
+    executable = first_item.group(1).strip().strip("'\"")
+    return "{{" not in executable and executable in {"python3", "mkdir", "/usr/bin/true"}
+
+
+def _audit_command_text(text, label):
+    command_count = 0
+    dynamic_argv = set()
+    for module, inline, block in _module_blocks_from_text(text):
+        if module != "command":
+            raise AssertionError(f"{label}: {module} bypasses argv audit")
+        if inline.strip():
+            raise AssertionError(f"{label}: free-form command is forbidden")
+        if not _argv_shape_is_reviewed(block):
+            raise AssertionError(f"{label}: argv shape is not reviewed")
+        static = _static_argv(block)
+        if static and static[0] in {
+            "openstack", "nova-manage", "neutron-db-manage", "cinder-manage",
+            "virsh", "ovs-vsctl", "ovs-ofctl", "ovn-nbctl", "ovn-sbctl",
+            "rbd", "lvs", "stat", "docker", "qemu-system-x86_64",
+        }:
+            rejection = classify_mutation(static)
+            if rejection is not None:
+                raise AssertionError(f"{label}: mutating argv: {rejection}")
+        normalized = re.sub(r"\s+", " ", block)
+        for pattern in _FORBIDDEN_COMMAND_PATTERNS:
+            if pattern.search(normalized):
+                raise AssertionError(f"{label}: {pattern.pattern}")
+        command_count += 1
+        dynamic_argv.update(_DYNAMIC_ARGV.findall(block))
+    return command_count, dynamic_argv
 
 
 def _inventory_payload(path):
@@ -212,48 +406,53 @@ def _concrete_mysql_argv(argv):
 
 
 class LiveDiscoveryMutationAuditTests(unittest.TestCase):
+    def test_ansible_audit_rejects_alternate_modules_templates_and_multiline_mutation(self):
+        unsafe = (
+            "---\n- name: bare\n  command:\n    argv:\n      - openstack\n      - server\n      - lock\n      - server-1\n",
+            "---\n- name: legacy\n  ansible.legacy.shell: openstack server lock server-1\n",
+            "---\n- name: fqcn\n  ansible.builtin.command:\n    argv: [openstack, server, lock, server-1]\n",
+            "---\n- name: raw\n  ansible.builtin.raw: docker stop nova_compute\n",
+            "---\n- name: template\n  ansible.builtin.command:\n    argv: \"{{ arbitrary_inventory_argv }}\"\n",
+        )
+        for source in unsafe:
+            with self.subTest(source=source):
+                with self.assertRaises(AssertionError):
+                    _audit_command_text(source, "synthetic")
+
+    def test_python_ast_audit_rejects_alias_getattr_spawn_exec_and_dynamic_import(self):
+        unsafe = (
+            ("import asyncio.subprocess as asp\nasp.create_subprocess_exec('id')\n", False),
+            ("from asyncio.subprocess import create_subprocess_shell as launch\nlaunch('id')\n", False),
+            ("import os\nos.spawnv(os.P_WAIT, '/bin/id', ['id'])\n", False),
+            ("import os\nos.execve('/bin/id', ['id'], {})\n", False),
+            ("import subprocess\ngetattr(subprocess, 'run')(['id'])\n", False),
+            ("import os\ngetattr(os, 'system')('id')\n", False),
+            ("import importlib\nimportlib.import_module('subprocess').run(['id'])\n", False),
+            ("import multiprocessing\nmultiprocessing.Process(target=lambda: None).start()\n", False),
+            ("import subprocess\nvars(subprocess)['run'](['id'])\n", True),
+            ("import subprocess\nlaunch = subprocess.run\nlaunch(['id'])\n", True),
+        )
+        for source, allow_subprocess in unsafe:
+            with self.subTest(source=source):
+                with self.assertRaises(AssertionError):
+                    _assert_python_source_safe(
+                        source, "synthetic.py", allow_subprocess=allow_subprocess
+                    )
+
     def test_python_command_execution_has_one_argv_only_boundary(self):
         paths = _production_python_paths()
         self.assertEqual(3, len(ENTRYPOINTS))
         self.assertTrue(TASK11_HELPERS.issubset({path.name for path in paths}))
         self.assertEqual(len(paths), len(set(paths)))
 
-        bypass_prefixes = (
-            "os.system", "os.popen", "posix.system", "subprocess.Popen",
-            "subprocess.call", "subprocess.check_call", "subprocess.check_output",
-            "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
-            "commands.getoutput", "commands.getstatusoutput", "pty.spawn",
-        )
-        dynamic_execution = {"eval", "exec", "compile", "__import__", "runpy.run_path"}
         runner_calls = []
         for path in paths:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            aliases = _import_aliases(tree)
-            imported_modules = {
-                target.split(".", 1)[0]
-                for target in aliases.values()
-            }
-            if path == PACKAGE / "runner.py":
-                self.assertIn("subprocess", imported_modules)
-            else:
-                self.assertNotIn("subprocess", imported_modules, str(path))
-            self.assertFalse(
-                imported_modules & {"commands", "pexpect", "pty"},
-                f"alternate command-execution module imported by {path}",
+            calls = _assert_python_source_safe(
+                path.read_text(encoding="utf-8"),
+                path,
+                allow_subprocess=path == PACKAGE / "runner.py",
             )
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                name = _call_name(node, aliases)
-                self.assertNotIn(name, dynamic_execution, f"{path}:{node.lineno}")
-                self.assertFalse(
-                    name.startswith(bypass_prefixes),
-                    f"command execution bypass in {path}:{node.lineno}: {name}",
-                )
-                if name.startswith("subprocess."):
-                    self.assertEqual(PACKAGE / "runner.py", path, f"{path}:{node.lineno}")
-                    self.assertEqual("subprocess.run", name, f"{path}:{node.lineno}")
-                    runner_calls.append(node)
+            runner_calls.extend(calls)
 
         self.assertEqual(2, len(runner_calls))
         for call in runner_calls:
@@ -274,14 +473,9 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
         for path in paths:
             text = path.read_text(encoding="utf-8")
             combined.append(text)
-            for module, inline, block in _module_blocks(path):
-                self.assertEqual("command", module, f"{path}: {module} bypasses argv audit")
-                self.assertEqual("", inline.strip(), f"{path}: free-form command is forbidden")
-                self.assertRegex(block, r"(?m)^\s+argv:")
-                command_count += 1
-                dynamic_argv.update(_DYNAMIC_ARGV.findall(block))
-                for pattern in _FORBIDDEN_COMMAND_PATTERNS:
-                    self.assertIsNone(pattern.search(block), f"{path}: {pattern.pattern}")
+            count, variables = _audit_command_text(text, path)
+            command_count += count
+            dynamic_argv.update(variables)
 
         self.assertGreaterEqual(command_count, 30)
         self.assertLessEqual(dynamic_argv, _ALLOWED_DYNAMIC_ARGV)
@@ -367,6 +561,81 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
                     with self.assertRaises(MutationRejected):
                         runner.run(command, "mutation-audit")
             execute.assert_not_called()
+
+    def test_runner_uses_contextual_read_only_grammars_not_a_blacklist(self):
+        rejected = (
+            ["rbd", "rm", "pool/volume-1"],
+            ["rbd", "mv", "pool/volume-1", "pool/volume-2"],
+            ["virsh", "undefine", "instance-1"],
+            ["openstack", "server", "lock", "server-1"],
+            ["openstack", "server", "unlock", "server-1"],
+            ["openstack", "volume", "backup", "restore", "backup-1", "volume-1"],
+            ["openstack", "volume", "snapshot", "manage", "host@backend#pool", "ref"],
+            ["openstack", "volume", "extend", "volume-1", "20"],
+            ["nova-manage", "cell_v2", "discover_hosts"],
+            ["neutron-db-manage", "stamp", "heads"],
+        )
+        allowed = (
+            ["rbd", "info", "--format", "json", "pool/archive"],
+            ["virsh", "dominfo", "shutdown"],
+            ["openstack", "server", "show", "archive"],
+            ["openstack", "resource", "provider", "show", "set"],
+        )
+        runner = ReadOnlyRunner()
+        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch(
+            "live_discovery.runner.subprocess.run", return_value=completed
+        ) as execute:
+            for command in rejected:
+                with self.subTest(rejected=command):
+                    with self.assertRaises(MutationRejected):
+                        runner.run(command, "contextual-reject")
+            for command in allowed:
+                with self.subTest(allowed=command):
+                    runner.run(command, "contextual-allow")
+        self.assertEqual(len(allowed), execute.call_count)
+
+    def test_runner_contextual_grammar_preserves_every_live_probe_family(self):
+        commands = (
+            ["nova-manage", "api_db", "version"],
+            ["nova-manage", "db", "version"],
+            ["neutron-db-manage", "current", "--verbose"],
+            ["cinder-manage", "db", "version"],
+            ["virsh", "list", "--uuid", "--name"],
+            ["virsh", "dominfo", "instance-1"],
+            ["virsh", "dumpxml", "instance-1", "--security-info"],
+            ["virsh", "domblklist", "instance-1", "--details"],
+            ["virsh", "domiflist", "instance-1"],
+            ["virsh", "version"],
+            ["virsh", "domcapabilities"],
+            ["ovs-vsctl", "--format=json", "list", "Interface"],
+            ["ovs-vsctl", "--format=json", "list", "Port"],
+            ["ovn-sbctl", "--format=json", "list", "Port_Binding"],
+            ["rbd", "info", "--format", "json", "pool/volume-1"],
+            ["lvs", "--reportformat", "json", "--units", "b", "--nosuffix", "vg/lv"],
+            ["stat", "--format", "%s", "/srv/volume-1"],
+            ["qemu-system-x86_64", "-machine", "help"],
+            ["openstack", "server", "list", "--all-projects", "--host", "compute-1"],
+            ["openstack", "server", "show", "instance-1", "-f", "json"],
+            ["openstack", "resource", "provider", "allocation", "show", "instance-1"],
+            ["openstack", "port", "list", "--server", "instance-1"],
+            ["openstack", "server", "volume", "list", "instance-1"],
+            ["openstack", "network", "qos", "policy", "show", "policy-1"],
+            ["openstack", "volume", "group", "snapshot", "show", "snapshot-1"],
+            ["openstack", "image", "member", "list", "image-1"],
+            ["openstack", "image", "stores", "info"],
+            ["openstack", "catalog", "show", "glance"],
+            ["docker", "exec", "nova_api", "nova-manage", "api_db", "version"],
+            ["docker", "exec", "kolla_toolbox", "openstack", "--os-cloud", "source", "server", "show", "archive"],
+        )
+        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch(
+            "live_discovery.runner.subprocess.run", return_value=completed
+        ) as execute:
+            for command in commands:
+                with self.subTest(command=command):
+                    ReadOnlyRunner().run(command, "read-only-probe")
+        self.assertEqual(len(commands), execute.call_count)
 
     def test_runner_rejects_sql_dml_ddl_and_exfiltration(self):
         statements = (

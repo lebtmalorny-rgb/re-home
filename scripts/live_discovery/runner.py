@@ -5,16 +5,6 @@ import subprocess
 from typing import Any, Dict, List, Optional, Sequence
 
 
-MUTATING_TOKENS = {
-    "activate", "add", "archive", "attach", "clear", "create", "deactivate",
-    "define", "delete", "destroy", "detach", "disable", "enable", "evacuate",
-    "heal", "import", "managedsave", "map", "migrate", "pause", "promote",
-    "purge", "rebind", "reboot", "rebuild", "remove", "rescue", "resize",
-    "restart", "resume", "save", "set", "shelve", "shutdown", "start", "stop",
-    "suspend", "sync", "unmap", "unpause", "unrescue", "unshelve", "unset",
-    "update", "upgrade", "upload",
-}
-
 READ_ONLY_EXECUTABLES = {
     "openstack", "nova-manage", "neutron-db-manage", "cinder-manage",
     "mysql", "mariadb", "virsh", "ovs-vsctl", "ovs-ofctl", "ovn-nbctl",
@@ -53,10 +43,46 @@ _FORBIDDEN_SQL = (
     (r"\bINTO\s+DUMPFILE\b", "INTO DUMPFILE"),
     (r"\bLOAD_FILE\b", "LOAD_FILE"),
 )
-_MUTATING_COMPOUND_TOKEN = re.compile(
-    r"(?:^|[-_])(?:activate|add|clear|create|deactivate|delete|destroy|insert|"
-    r"map|mod|mutate|remove|set|unmap|update)(?:$|[-_])",
-    flags=re.IGNORECASE,
+_OPENSTACK_GLOBAL_OPTIONS_WITH_VALUE = {
+    "--os-cloud", "--os-client-config", "--os-password", "--os-username",
+    "--os-project-id", "--os-project-name", "--os-auth-url",
+    "--os-interface", "--os-region-name",
+}
+_OPENSTACK_READ_ONLY_PREFIXES = (
+    ("address", "group", "show"),
+    ("catalog", "show"),
+    ("compute", "service", "list"),
+    ("flavor", "show"),
+    ("floating", "ip", "show"),
+    ("hypervisor", "show"),
+    ("image", "member", "list"),
+    ("image", "show"),
+    ("image", "stores", "info"),
+    ("network", "qos", "policy", "show"),
+    ("network", "show"),
+    ("network", "trunk", "show"),
+    ("port", "list"),
+    ("port", "show"),
+    ("resource", "provider", "allocation", "show"),
+    ("resource", "provider", "list"),
+    ("resource", "provider", "show"),
+    ("router", "show"),
+    ("security", "group", "show"),
+    ("server", "list"),
+    ("server", "show"),
+    ("server", "volume", "list"),
+    ("subnet", "show"),
+    ("volume", "attachment", "show"),
+    ("volume", "backup", "list"),
+    ("volume", "backup", "show"),
+    ("volume", "group", "show"),
+    ("volume", "group", "snapshot", "show"),
+    ("volume", "qos", "show"),
+    ("volume", "service", "list"),
+    ("volume", "show"),
+    ("volume", "snapshot", "list"),
+    ("volume", "snapshot", "show"),
+    ("volume", "type", "show"),
 )
 
 
@@ -102,31 +128,89 @@ def unwrap_docker_exec(argv: Sequence[object]) -> List[str]:
     return values[index + 1:]
 
 
+def _openstack_command(values: Sequence[str]) -> Optional[List[str]]:
+    index = 1
+    while index < len(values) and values[index].startswith("-"):
+        option = values[index]
+        lowered = option.lower()
+        if "=" in option:
+            index += 1
+        elif lowered in _OPENSTACK_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+        else:
+            return None
+    if index >= len(values):
+        return None
+    return [value.lower() for value in values[index:]]
+
+
+def _matches_prefix(values: Sequence[str], prefix: Sequence[str]) -> bool:
+    return len(values) >= len(prefix) and tuple(values[:len(prefix)]) == tuple(prefix)
+
+
+def _read_only_shape_rejection(values: Sequence[str]) -> Optional[str]:
+    executable = values[0].lower() if values else ""
+    args = list(values[1:])
+    lowered = [value.lower() for value in args]
+    if executable == "openstack":
+        command = _openstack_command(values)
+        if command is not None and any(
+            _matches_prefix(command, prefix) for prefix in _OPENSTACK_READ_ONLY_PREFIXES
+        ):
+            return None
+        return " ".join((command or lowered)[:2]) or "openstack command"
+    if executable == "nova-manage":
+        return None if lowered in (["api_db", "version"], ["db", "version"]) else " ".join(lowered[:2])
+    if executable == "neutron-db-manage":
+        return None if lowered == ["current", "--verbose"] else " ".join(lowered[:2])
+    if executable == "cinder-manage":
+        return None if lowered == ["db", "version"] else " ".join(lowered[:2])
+    if executable == "virsh":
+        valid = (
+            lowered == ["list", "--uuid", "--name"]
+            or lowered in (["version"], ["domcapabilities"])
+            or (len(args) == 2 and lowered[0] in {"dominfo", "domiflist"})
+            or (len(args) == 3 and lowered[0] == "dumpxml" and lowered[2] == "--security-info")
+            or (len(args) == 3 and lowered[0] == "domblklist" and lowered[2] == "--details")
+        )
+        return None if valid else " ".join(lowered[:2])
+    if executable == "ovs-vsctl":
+        valid = len(args) == 3 and lowered[:2] == ["--format=json", "list"] and args[2] in {"Interface", "Port"}
+        return None if valid else " ".join(lowered[:2])
+    if executable == "ovn-sbctl":
+        valid = args == ["--format=json", "list", "Port_Binding"]
+        return None if valid else " ".join(lowered[:2])
+    if executable in {"ovs-ofctl", "ovn-nbctl"}:
+        return "no reviewed read-only grammar"
+    if executable == "rbd":
+        valid = len(args) == 4 and lowered[:3] == ["info", "--format", "json"] and bool(args[3])
+        return None if valid else " ".join(lowered[:2])
+    if executable == "lvs":
+        valid = len(args) == 6 and lowered[:5] == [
+            "--reportformat", "json", "--units", "b", "--nosuffix",
+        ] and bool(args[5])
+        return None if valid else " ".join(lowered[:2])
+    if executable == "stat":
+        valid = len(args) == 3 and lowered[:2] == ["--format", "%s"] and args[2].startswith("/")
+        return None if valid else " ".join(lowered[:2])
+    if executable == "qemu-system-x86_64":
+        return None if lowered == ["-machine", "help"] else "qemu command"
+    if executable == "false":
+        return None if not args else "false arguments"
+    if executable in {"printf", "test"}:
+        return None
+    return f"no reviewed read-only grammar for {executable}"
+
+
 def classify_mutation(argv: Sequence[object]) -> Optional[str]:
-    lowered = [str(value).lower() for value in unwrap_docker_exec(argv)]
+    nested = [str(value) for value in unwrap_docker_exec(argv)]
+    lowered = [value.lower() for value in nested]
     phrase = " ".join(lowered)
     if "online_data_migrations" in phrase:
         return "online_data_migrations"
     if lowered and lowered[0] in {"mysql", "mariadb"}:
         return "mysql requires run_sql"
-    if lowered:
-        command_index = next(
-            (
-                index
-                for index, token in enumerate(lowered[1:], start=1)
-                if token != "--" and not token.startswith("-")
-            ),
-            None,
-        )
-        for index, token in enumerate(lowered[1:], start=1):
-            if token in MUTATING_TOKENS or (
-                index == command_index and _MUTATING_COMPOUND_TOKEN.search(token)
-            ):
-                if lowered[0] == "openstack":
-                    return " ".join(lowered[1:3])
-                start = max(1, index - 1)
-                return " ".join(lowered[start:index + 1])
-    return None
+    return _read_only_shape_rejection(nested) if nested else "empty nested command"
 
 
 @dataclass(frozen=True)
@@ -569,11 +653,6 @@ class ReadOnlyRunner:
                 raise MutationRejected(f"unknown executable rejected: {nested_executable}")
         else:
             nested_executable = executable
-
-        if nested_executable == "qemu-system-x86_64" and nested[1:] != [
-            "-machine", "help",
-        ]:
-            raise MutationRejected("only qemu -machine help is allowed")
 
         if not allow_sql and nested_executable in {"mysql", "mariadb"}:
             raise MutationRejected("mysql requires run_sql")
