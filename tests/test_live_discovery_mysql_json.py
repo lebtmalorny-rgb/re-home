@@ -19,6 +19,27 @@ from live_discovery.runner import MutationRejected
 
 
 class MysqlJsonTransportTests(unittest.TestCase):
+    def assert_cli_rejects(self, sql):
+        with tempfile.TemporaryDirectory() as directory:
+            sql_path = Path(directory) / "query.sql"
+            sql_path.write_text(sql, encoding="utf-8")
+            env = dict(os.environ, PYTHONPATH=str(ROOT / "scripts"))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "live_discovery.mysql_json",
+                    "--validate-sql",
+                    str(sql_path),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=env,
+            )
+        self.assertNotEqual(0, completed.returncode, completed.stdout)
+
     def test_json_object_transport_preserves_text_fields(self):
         sql = build_json_row_query(
             "nova",
@@ -78,9 +99,54 @@ class MysqlJsonTransportTests(unittest.TestCase):
             validate_select_only_sql("SELECT ';' AS delimiter;"),
         )
 
+    def test_select_validator_ignores_clause_tokens_inside_string_literal(self):
+        sql = "SELECT 'FROM, WHERE, IN';"
+
+        self.assertEqual(sql, validate_select_only_sql(sql))
+
     def test_select_validator_rejects_unterminated_string_literal(self):
         with self.assertRaisesRegex(MutationRejected, "malformed"):
             validate_select_only_sql("SELECT 'unterminated;")
+
+    def test_select_validator_rejects_into_dumpfile(self):
+        with self.assertRaisesRegex(MutationRejected, "INTO DUMPFILE"):
+            validate_select_only_sql("SELECT 1 INTO DUMPFILE '/tmp/result';")
+
+    def test_cli_rejects_into_dumpfile(self):
+        self.assert_cli_rejects("SELECT 1 INTO DUMPFILE '/tmp/result';")
+
+    def test_select_validator_rejects_incomplete_clauses(self):
+        malformed = (
+            "SELECT * FROM;",
+            "SELECT 1 WHERE;",
+            "SELECT 1 IN;",
+            "SELECT 1,;",
+            "SELECT ,1;",
+            "SELECT 1,,2;",
+            "SELECT ();",
+            "SELECT (1,);",
+        )
+
+        for sql in malformed:
+            with self.subTest(sql=sql):
+                with self.assertRaisesRegex(MutationRejected, "malformed"):
+                    validate_select_only_sql(sql)
+
+    def test_cli_rejects_incomplete_clauses(self):
+        malformed = (
+            "SELECT * FROM;",
+            "SELECT 1 WHERE;",
+            "SELECT 1 IN;",
+            "SELECT 1,;",
+            "SELECT ,1;",
+            "SELECT 1,,2;",
+            "SELECT ();",
+            "SELECT (1,);",
+        )
+
+        for sql in malformed:
+            with self.subTest(sql=sql):
+                self.assert_cli_rejects(sql)
 
     def test_cli_validates_with_shared_select_only_validator(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -45,6 +45,7 @@ _FORBIDDEN_SQL = (
     (r"\bDO\b", "DO"),
     (r"\bSET\b", "SET"),
     (r"\bINTO\s+OUTFILE\b", "INTO OUTFILE"),
+    (r"\bINTO\s+DUMPFILE\b", "INTO DUMPFILE"),
     (r"\bLOAD_FILE\b", "LOAD_FILE"),
 )
 
@@ -116,30 +117,41 @@ def validate_select_only_sql(sql: str) -> str:
         if re.search(pattern, statement, flags=re.IGNORECASE):
             raise MutationRejected(f"SQL token {label} is not allowed")
     semicolons = []
+    structural_sql = []
     quote = None
     parentheses = 0
     index = 0
     while index < len(statement):
         character = statement[index]
         if quote is not None:
+            structural_sql.append(" ")
             if character == "\\":
+                if index + 1 < len(statement):
+                    structural_sql.append(" ")
                 index += 2
                 continue
             if character == quote:
                 if index + 1 < len(statement) and statement[index + 1] == quote:
+                    structural_sql.append(" ")
                     index += 2
                     continue
                 quote = None
         elif character in {"'", '"', "`"}:
+            structural_sql.append("x")
             quote = character
         elif character == "(":
+            structural_sql.append(character)
             parentheses += 1
         elif character == ")":
+            structural_sql.append(character)
             parentheses -= 1
             if parentheses < 0:
                 raise MutationRejected("malformed SELECT statement")
         elif character == ";":
+            structural_sql.append(character)
             semicolons.append(index)
+        else:
+            structural_sql.append(character)
         index += 1
     if quote is not None or parentheses != 0:
         raise MutationRejected("malformed SELECT statement")
@@ -147,9 +159,24 @@ def validate_select_only_sql(sql: str) -> str:
         r"SELECT\b[\s\S]*;", statement, flags=re.IGNORECASE
     ):
         raise MutationRejected("run_sql accepts one SELECT statement ending with ';'")
-    body = statement[:-1]
-    if re.fullmatch(r"SELECT\s*", body, flags=re.IGNORECASE) or re.match(
-        r"SELECT\s+FROM\b", body, flags=re.IGNORECASE
+    body = "".join(structural_sql[:-1]).rstrip()
+    incomplete_tail = re.search(
+        r"(?:\bFROM|\bWHERE|\bIN|,)\s*$", body, flags=re.IGNORECASE
+    )
+    incomplete_parentheses = re.search(
+        r"(?:\bSELECT|\bFROM|\bWHERE|\bIN)\s*\(\s*\)|\(\s*,|,\s*\)",
+        body,
+        flags=re.IGNORECASE,
+    )
+    incomplete_separators = re.search(
+        r"\bSELECT\s*,|,\s*,", body, flags=re.IGNORECASE
+    )
+    if (
+        re.fullmatch(r"SELECT\s*", body, flags=re.IGNORECASE)
+        or re.match(r"SELECT\s+FROM\b", body, flags=re.IGNORECASE)
+        or incomplete_tail
+        or incomplete_parentheses
+        or incomplete_separators
     ):
         raise MutationRejected("malformed SELECT statement")
     return statement
