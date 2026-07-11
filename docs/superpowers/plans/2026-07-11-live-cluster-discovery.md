@@ -1309,12 +1309,19 @@ live_discovery_target_profile: vanilla-openstack-2025.1-epoxy
 live_discovery_remote_dir: "{{ rehome_stage_dir }}/live-discovery"
 live_discovery_local_dir: "{{ local_artifact_dir }}/live-discovery"
 live_discovery_schema_policy_file: "{{ playbook_dir }}/../inventory/live-discovery-schema-policy.json"
-live_discovery_mysql_json_command: "mysql --batch --raw --skip-column-names"
-live_discovery_storage_backend_kind: ""
-live_discovery_source_storage_probe_host: ""
-live_discovery_target_storage_probe_host: ""
-live_discovery_target_virsh_command: "virsh"
-live_discovery_target_qemu_command: "qemu-system-x86_64"
+live_discovery_mysql_json_argv: [mysql, --batch, --raw, --skip-column-names]
+live_discovery_storage_backends: {}
+live_discovery_source_probe_config_file_local: ""
+live_discovery_target_probe_config_file_local: ""
+live_discovery_phase_hmac_key_file_local: ""
+live_discovery_source_glance_token_file_local: ""
+live_discovery_target_glance_token_file_local: ""
+live_discovery_source_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_online_migration_evidence_file_local: ""
+live_discovery_source_virsh_argv: [virsh]
+live_discovery_target_virsh_argv: [virsh]
+live_discovery_target_qemu_argv: [qemu-system-x86_64]
 live_discovery_glance_range_probe_enabled: true
 live_discovery_fail_on_not_ready: true
 ```
@@ -1326,17 +1333,21 @@ Channel and vendor backends remain explicit `UNKNOWN` without a reviewed
 backend-specific probe. Generic inventory leaves the backend map empty, which
 also yields `UNKNOWN` for required storage evidence.
 
-- [ ] **Step 4: Implement four-play orchestration**
+- [ ] **Step 4: Implement seven-play orchestration**
 
-The playbook has exactly seven plays:
+The actual data-dependent sequence has exactly seven plays:
 
-1. localhost setup and frozen run ID;
-2. source controller API/profile/schema/JSONL collection and combine, with credential copy inside `block` and deletion in `always`;
-3. target controller API/profile/schema/JSONL collection and combine, with the same cleanup boundary;
+1. localhost setup, protected-input freeze, owner lock and frozen run ID;
+2. source controller API/schema acquisition, public verify-before-SQL and UUID-scoped JSONL collection;
+3. target controller API/schema acquisition, public verify-before-SQL and UUID-scoped JSONL collection;
 4. re-home compute domain/disk/interface/dataplane collection;
 5. target reference compute libvirt/QEMU capability collection;
-6. source and target storage probes delegated to the two explicitly configured storage probe hosts;
-7. localhost assembly with `failed_when: live_discovery_assemble.rc not in [0]`.
+6. source and target Cinder/Glance probes on typed-map delegates, signed API refresh, exact phase-triplet return and both controller combines;
+7. localhost assembly, artifact publication and owner completion; only assembler rc `0` is accepted.
+
+In short: plays 2-3 acquire API/schema/DB evidence, play 5 supplies target
+capabilities, play 6 performs both probe families plus signed refresh and both
+combines, and play 7 performs final assembly.
 
 `collect-live-schema-service.yml` reuses the existing service-user credential model but writes a run-local information-schema artifact. `collect-live-db-jsonl-service.yml` accepts only generated `.sql` files, runs `python3 -m live_discovery.mysql_json --validate-sql <file>` before MySQL, records `.rc`/`.stderr`, and never suppresses failure during combine.
 

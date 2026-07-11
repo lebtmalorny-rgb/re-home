@@ -11,6 +11,8 @@ Assembler записывает набор атомарно. При ошибке 
 sibling lock, а orchestration отдельно владеет
 `.control/owners/<run-id>`. Успешный run сохраняет completion marker без
 секретных bytes. Повторный или concurrent запуск с тем же `run-id` отклоняется.
+После atomic install финальный run-каталог — `0700`, восемь normal files —
+`0644`. Опциональный `sensitive/` остаётся `0700`, а его файл — `0600`.
 
 ## Обычные файлы
 
@@ -34,6 +36,24 @@ sibling lock, а orchestration отдельно владеет
 `openstack-rehome-live-discovery/v1alpha1` и control bundle
 `openstack-rehome-control-bundle/v1alpha1`. Версии нельзя угадывать или
 смешивать: неизвестная/лишняя структура отклоняется fail-closed.
+
+## Точный evidence index
+
+Каждый entry всегда содержит common fields `evidence_id`, `kind`, `side`,
+`service`. Допустимы только следующие kinds и exact дополнительные поля:
+
+| Kind | Обязательные дополнительные поля |
+| --- | --- |
+| `openstack-json` | `command` (непустой argv list) |
+| `runtime-command` | `command` (непустой argv list) |
+| `db-jsonl` | `schema`, `table`, непустой `filters` |
+| `storage-probe` | `resource_id`, `backend_kind`, `backend_identity`, `resource_identity`, `resource_fingerprint`, `scope`, `expected_size`, `observed_size`, `status` |
+| `glance-range` | `resource_id`, `endpoint_origin`, `expected_size`, `observed_size`, `required`, непустой `store_ids`, `status` |
+| `cinder-connection` | `volume_id`, `attachment_id`, `backend_kind`, `backend_id`, `resource_identity`, `resource_fingerprint` |
+
+`side` равен только `source` или `target`; storage `scope` — только
+`source-compute`/`target-storage`. Status probe — `PASS`, `WARN`, `UNKNOWN` или
+`BLOCKED`. Raw stdout/stderr, tokens и connection data в index отсутствуют.
 
 ## Защищённый файл
 
@@ -77,8 +97,10 @@ services и не запускает `online_data_migrations`.
   политике аудита.
 - `sensitive/evidence.json` хранить минимально необходимое время в защищённом
   хранилище, отдельно от normal archive; удаление фиксировать в change record.
-- HMAC key, clouds files, Glance tokens, probe configs и frozen protected
-  inputs удаляются orchestration после success либо ownership-checked cleanup.
+- HMAC key, clouds files, Glance tokens, probe configs и другие caller-owned
+  originals никогда не изменяются и не удаляются. Orchestration удаляет только
+  собственные frozen/staged owned copies после success либо
+  ownership-checked cleanup.
 - Незавершённый owned lock можно удалить только штатным cleanup; не применять
   рекурсивное удаление к общему `live-discovery` каталогу.
 - Runtime/generated `artifacts/` не коммитить.

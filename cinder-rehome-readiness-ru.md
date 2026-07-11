@@ -41,6 +41,14 @@ Collector сверяет instance, host, mode/state, driver kind, backend ID,
 `0700`. Значения password, token, CHAP secret, secret UUID и аналогичные поля в
 обычных артефактах запрещены.
 
+`live_discovery_source_cinder_sensitive_evidence_file_local` и target-аналог
+условно обязательны: если на стороне есть active attachment, защищённый
+envelope `openstack-rehome-cinder-sensitive-evidence/v1alpha1` должен содержать
+отдельный entry для каждой пары volume/attachment. Пустой path допустим только
+когда таких attachments действительно нет; иначе readiness закрывается
+fail-closed. Caller-owned файл не удаляется — cleanup касается только
+замороженной/staged копии текущего run.
+
 ## Backing object и типы хранилищ
 
 NFS не является обязательным или единственным backend. Переменная

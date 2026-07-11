@@ -49,10 +49,13 @@ image; наличие таблицы само по себе не являетс�
 Range: bytes=0-0
 ```
 
-Ожидается корректный `206`, `Content-Range`, один байт и согласованный полный
-размер. Полный image не скачивается. `403`, `404`, `416` и `204` для
-обязательного image дают `BLOCKED`; transport/TLS/endpoint uncertainty даёт
-`UNKNOWN`. Source и target используют разные token files:
+HTTP 206 с exact `Content-Range: bytes 0-0/<expected_size>`,
+`Content-Length: 1` и одним прочитанным байтом даёт `PASS`. Если сервер
+игнорирует Range и отвечает HTTP 200, exact `Content-Length: <expected_size>`
+плюс один прочитанный байт дают `WARN`, а не `PASS`: collector не считывает
+оставшееся тело. Несогласованный 200/206 даёт `BLOCKED`. `403`, `404`, `416` и
+`204` для обязательного image дают `BLOCKED`; transport/TLS/endpoint
+uncertainty даёт `UNKNOWN`. Source и target используют разные token files:
 `live_discovery_source_glance_token_file_local` и
 `live_discovery_target_glance_token_file_local`; их содержимое не должно
 совпадать и не попадает в normal artifacts.

@@ -113,8 +113,19 @@ runtime ВМ. Это не только Masakari: на других класте�
 
 ```bash
 cd /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible
-ansible-playbook -i inventory/lab-os1-to-os2.yml playbooks/02b-discover-live-resource-graph.yml
+ansible-playbook -i inventory/lab-os1-to-os2.yml \
+  playbooks/02b-discover-live-resource-graph.yml \
+  --ask-vault-pass \
+  -e @/secure/live-discovery-paths.vault.yml \
+  -e live_discovery_run_id=rehome-20260712-review01
 ```
+
+Vault/extra-vars file должен задавать непустые paths HMAC key, обоих probe
+JSON, двух разных Glance tokens, source/target clouds и per-controller Kolla
+passwords. Точные inventory/Vault примеры приведены во
+[входных данных оператора](operator-inputs-ru.md). Cinder sensitive paths
+условно обязательны при active attachments; свежий target migration envelope
+нужен, чтобы target profile не остался `UNKNOWN`.
 
 Для другого окружения заменить inventory, но не порядок. Живые source/target
 API, БД, compute runtime, target capability, Cinder backing и Glance store
@@ -150,7 +161,7 @@ SELECT и `--phase combine`. Masakari/DRS не входят в этот graph/ve
 - опциональное online-migration evidence свежее (не старше 24 часов) и содержит
   exact current revisions. Сам playbook `online_data_migrations` не запускает.
 
-Для NFS текущего lab используется map из inventory. Это не NFS-only решение:
+Для NFS текущего lab используется map из inventory. Решение не ограничено NFS:
 NFS/file, RBD и LVM имеют read-only size probes. iSCSI, Fibre Channel или
 vendor backend должны быть объявлены фактическим kind с
 `probe_template: unsupported` и дадут `UNKNOWN`, пока нет reviewed безопасного
@@ -211,7 +222,18 @@ inventory revision и change record.
 `syntax-check`. Это не утверждение о выполненном live deployment: операторский
 запуск на конкретном кластере и review его evidence остаются обязательными.
 
-## Legacy manifest и последующие фазы
+## Короткая последовательность
+
+1. Сначала обязательный
+   `02b-discover-live-resource-graph.yml`: live graph, verdict и authoritative
+   resource-scoped directional mapping в `schema-mapping.json`.
+2. Только после rc `0` при необходимости выполнить необязательный legacy
+   `02a-build-rehome-manifest.yml` для старых helper-фаз.
+3. `03a`/`03b` запускать только как необязательную legacy-диагностику полного
+   schema diff; полное равенство Keystack и Epoxy не требуется.
+4. Затем выполнять reviewed planning/import/cutover фазы ниже.
+
+## Необязательный legacy manifest и последующие фазы
 
 Следующий старый шаг собирает host-scoped manifest по re-home host и ВМ. Он не
 заменяет `02b` и запускается только в согласованном общем порядке. Выполняется
@@ -241,8 +263,12 @@ artifacts/os1-compute-02/rehome_manifest.yml
 artifacts/os1-compute-02/rehome_manifest.json
 ```
 
-Перед любыми импортами metadata и перед cutover нужно выполнить read-only
-проверку совместимости схем БД:
+`03a`/`03b` — только необязательная legacy-диагностика полного schema diff для
+близких/same-schema сред. Authoritative gate уже сформирован `02b` как
+resource-scoped directional mapping в `schema-mapping.json`. Для Keystack →
+Epoxy полное равенство schema не требуется.
+
+Если дополнительная полная диагностика полезна, выполнить:
 
 ```bash
 cd /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible
@@ -264,8 +290,9 @@ Playbook собирает:
 artifacts/schema-compat/os1-to-os2/
 ```
 
-Если версии migrations или `information_schema` отличаются, playbook падает и
-re-home нельзя продолжать до ручного разбора diff.
+Если версии migrations или полный `information_schema` отличаются, сам legacy
+playbook падает. Это повод изучить diagnostic diff, но его rc не заменяет и не
+усиливает verdict `02b` для vendor → vanilla направления.
 
 После `03a` можно запустить локальную нормализацию уже собранных artifacts:
 
@@ -281,9 +308,10 @@ artifacts/schema-compat/os1-to-os2/normalized-diffs/
 artifacts/schema-compat/os1-to-os2/normalization-summary.txt
 ```
 
-Нормализация пока консервативная: удаляет пустые строки и известный command
-noise, затем сортирует normalized lines. Если normalized diff остается
-непустым, metadata import и cutover все равно запрещены.
+Нормализация консервативная: удаляет пустые строки и известный command noise,
+затем сортирует normalized lines. Непустой полный diff ожидаем между Keystack и
+Epoxy; обязательным остаётся отсутствие blocker-ов в directional mapping и
+общий rc `0` от `02b`.
 
 После успешной проверки схем нужно построить target API prep report. Этот шаг
 не является cutover и по умолчанию ничего не создает:

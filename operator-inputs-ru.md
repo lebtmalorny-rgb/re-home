@@ -145,8 +145,9 @@ live_discovery_target_online_migration_evidence_file_local: ""
 HMAC key — 16..4096 bytes. Probe JSON — не более 1 MiB; clouds/passwords и
 migration evidence — не более 1 MiB; Cinder sensitive evidence — не более
 8 MiB. Source и target Glance tokens должны быть отдельными файлами с разными
-checksums. Token value задаётся только через `token_file`/`token_env`, не
-встраивается в JSON. Root manifest не является операторским input: его выводит
+checksums. В orchestration-supported probe JSON допустим только
+`token_env: LIVE_DISCOVERY_GLANCE_TOKEN`; token value не встраивается в JSON.
+Root manifest не является операторским input: его выводит
 первая live source API phase.
 
 Inputs открываются один раз через `O_NOFOLLOW`, копируются в owned каталог
@@ -193,6 +194,207 @@ Probe configs имеют contract `openstack-rehome-probe-config/v1alpha1` и
 mount-ит NFS, не map-ит RBD, не активирует LV и не устанавливает iSCSI/FC
 session.
 
+### Копируемые source/target probe JSON
+
+Ниже полные структурно валидные примеры. Перед запуском заменить UUID, paths,
+pool/VG names, sizes, endpoints и store IDs реальными live значениями. Каждый
+`backend_id` должен существовать в `live_discovery_storage_backends`; allowlist
+должен быть узким и включать фактический resource.
+
+<!-- source-probe-config.json -->
+```json
+{
+  "schema_version": "openstack-rehome-probe-config/v1alpha1",
+  "storage": [
+    {
+      "volume_id": "11111111-1111-4111-8111-111111111111",
+      "scope": "source-compute",
+      "kind": "nfs",
+      "backend_id": "shared-nfs",
+      "resource": {
+        "path": "/var/lib/nova/mnt/cinder/volume-11111111-1111-4111-8111-111111111111",
+        "allowed_roots": ["/var/lib/nova/mnt/cinder"],
+        "expected_size": 1073741824
+      }
+    },
+    {
+      "volume_id": "22222222-2222-4222-8222-222222222222",
+      "scope": "source-compute",
+      "kind": "rbd",
+      "backend_id": "ceph-rbd",
+      "resource": {
+        "pool": "volumes",
+        "allowed_pools": ["volumes"],
+        "image": "volume-22222222-2222-4222-8222-222222222222",
+        "expected_size": 1073741824
+      }
+    },
+    {
+      "volume_id": "33333333-3333-4333-8333-333333333333",
+      "scope": "source-compute",
+      "kind": "lvm",
+      "backend_id": "local-lvm",
+      "resource": {
+        "vg": "cinder-volumes",
+        "allowed_vgs": ["cinder-volumes"],
+        "lv": "volume-33333333-3333-4333-8333-333333333333",
+        "expected_size": 1073741824
+      }
+    }
+  ],
+  "glance": {
+    "endpoint_url": "https://glance-source.example",
+    "token_env": "LIVE_DISCOVERY_GLANCE_TOKEN",
+    "images": [
+      {
+        "image_id": "44444444-4444-4444-8444-444444444444",
+        "expected_size": 2147483648,
+        "required": true,
+        "store_ids": ["rbd-images"]
+      }
+    ],
+    "store_capabilities": [
+      {"store_id": "rbd-images", "backend_type": "rbd"}
+    ]
+  }
+}
+```
+
+<!-- target-probe-config.json -->
+```json
+{
+  "schema_version": "openstack-rehome-probe-config/v1alpha1",
+  "storage": [
+    {
+      "volume_id": "11111111-1111-4111-8111-111111111111",
+      "scope": "target-storage",
+      "kind": "nfs",
+      "backend_id": "shared-nfs",
+      "resource": {
+        "path": "/srv/cinder/volume-11111111-1111-4111-8111-111111111111",
+        "allowed_roots": ["/srv/cinder"],
+        "expected_size": 1073741824
+      }
+    },
+    {
+      "volume_id": "22222222-2222-4222-8222-222222222222",
+      "scope": "target-storage",
+      "kind": "rbd",
+      "backend_id": "ceph-rbd",
+      "resource": {
+        "pool": "volumes",
+        "allowed_pools": ["volumes"],
+        "image": "volume-22222222-2222-4222-8222-222222222222",
+        "expected_size": 1073741824
+      }
+    },
+    {
+      "volume_id": "33333333-3333-4333-8333-333333333333",
+      "scope": "target-storage",
+      "kind": "lvm",
+      "backend_id": "local-lvm",
+      "resource": {
+        "vg": "cinder-volumes",
+        "allowed_vgs": ["cinder-volumes"],
+        "lv": "volume-33333333-3333-4333-8333-333333333333",
+        "expected_size": 1073741824
+      }
+    }
+  ],
+  "glance": {
+    "endpoint_url": "https://glance-target.example",
+    "token_env": "LIVE_DISCOVERY_GLANCE_TOKEN",
+    "images": [
+      {
+        "image_id": "44444444-4444-4444-8444-444444444444",
+        "expected_size": 2147483648,
+        "required": true,
+        "store_ids": ["rbd-images"]
+      }
+    ],
+    "store_capabilities": [
+      {"store_id": "rbd-images", "backend_type": "rbd"}
+    ]
+  }
+}
+```
+
+Один configured delegate на стороне выполняет обе семьи: Cinder backing probes
+и Glance Range probes. Поэтому endpoint/token также должны быть доступны с
+`source_delegate`/`target_delegate`, а не только с controller.
+
+### Inventory, Vault и extra-vars для protected paths
+
+Inventory связывает общий Kolla variable с отдельным path каждого controller и
+задаёт authoritative typed backend map:
+
+```yaml
+all:
+  vars:
+    live_discovery_kolla_passwords_file_local: >-
+      {{ live_discovery_kolla_passwords_files[inventory_hostname] }}
+    live_discovery_storage_backends:
+      shared-nfs:
+        kind: nfs
+        source_delegate: os1-compute-02
+        target_delegate: os2-ctrl-01
+        allowed_scopes: [source-compute, target-storage]
+        probe_template: nfs
+      ceph-rbd:
+        kind: rbd
+        source_delegate: os1-compute-02
+        target_delegate: os2-ctrl-01
+        allowed_scopes: [source-compute, target-storage]
+        probe_template: rbd
+      local-lvm:
+        kind: lvm
+        source_delegate: os1-compute-02
+        target_delegate: os2-ctrl-01
+        allowed_scopes: [source-compute, target-storage]
+        probe_template: lvm
+```
+
+Файл `/secure/live-discovery-paths.vault.yml` содержит все caller-owned paths:
+
+```yaml
+live_discovery_kolla_passwords_files:
+  os1-ctrl-01: /secure/os1/passwords.yml
+  os2-ctrl-01: /secure/os2/passwords.yml
+source_clouds_file_local: /secure/os1/clouds.yaml
+target_clouds_file_local: /secure/os2/clouds.yaml
+live_discovery_phase_hmac_key_file_local: /secure/live-discovery/phase-hmac.key
+live_discovery_source_probe_config_file_local: /secure/live-discovery/source-probe-config.json
+live_discovery_target_probe_config_file_local: /secure/live-discovery/target-probe-config.json
+live_discovery_source_glance_token_file_local: /secure/live-discovery/source-glance.token
+live_discovery_target_glance_token_file_local: /secure/live-discovery/target-glance.token
+live_discovery_source_cinder_sensitive_evidence_file_local: /secure/live-discovery/source-cinder-sensitive.json
+live_discovery_target_cinder_sensitive_evidence_file_local: /secure/live-discovery/target-cinder-sensitive.json
+live_discovery_target_online_migration_evidence_file_local: /secure/live-discovery/target-online-migrations.json
+```
+
+Подготовка и запуск:
+
+```bash
+chmod 0600 /secure/os1/clouds.yaml /secure/os1/passwords.yml
+chmod 0600 /secure/os2/clouds.yaml /secure/os2/passwords.yml
+chmod 0600 /secure/live-discovery/*
+chmod 0600 /secure/live-discovery-paths.vault.yml
+ansible-vault encrypt /secure/live-discovery-paths.vault.yml
+ansible-playbook -i inventory/lab-os1-to-os2.yml \
+  playbooks/02b-discover-live-resource-graph.yml \
+  --ask-vault-pass \
+  -e @/secure/live-discovery-paths.vault.yml \
+  -e live_discovery_run_id=rehome-20260712-review01
+```
+
+Пути Cinder evidence условно обязательны: если selected volume имеет active
+attachment, для каждой пары `(volume_uuid, attachment_uuid)` нужен защищённый
+entry, иначе closure останется `BLOCKED/UNKNOWN`. Если активных attachments на
+стороне нет, соответствующий path можно оставить `""`. Migration envelope
+формально optional input, но свежий matching файл фактически обязателен, чтобы
+canonical target profile не остался `UNKNOWN`; playbook его не генерирует и
+`online_data_migrations` не запускает.
+
 ### Итоговые verdict
 
 ```text
@@ -208,6 +410,12 @@ retention описаны в
 а Cinder/Glance детали — в
 [`cinder-rehome-readiness-ru.md`](cinder-rehome-readiness-ru.md) и
 [`glance-rehome-readiness-ru.md`](glance-rehome-readiness-ru.md).
+
+Authoritative schema gate — resource-scoped directional mapping из
+`schema-mapping.json`, созданный `02b`. Для `keystack-2025.1` →
+`vanilla-openstack-2025.1-epoxy` полное равенство source/target schema не
+требуется. `03a`/`03b` — необязательная legacy-диагностика полного diff для
+близких/same-schema кластеров, а не prerequisite или hard gate.
 
 ## Inventory
 
@@ -360,8 +568,10 @@ schema_compat_db_names:
 
 ## DB credentials
 
-Для `03a-check-db-schema-compat.yml` нужен read-only доступ к `information_schema`
-по критичным БД. Есть два рабочих варианта.
+Для необязательной legacy-диагностики
+`03a-check-db-schema-compat.yml` нужен read-only доступ к `information_schema`
+по критичным БД. Этот full-schema tool не заменяет directional mapping `02b`.
+Есть два рабочих варианта.
 
 ### Вариант 1: общий DB admin/read-only user
 
@@ -727,8 +937,8 @@ cutover.
 - Cinder, Glance, Neutron и target Epoxy capability не содержат
   `UNKNOWN`/`BLOCKED`; Masakari/DRS не ожидаются в графе.
 - Только после live discovery можно переходить к следующим пунктам.
-- `03a-check-db-schema-compat.yml` проходит.
-- `03b-normalize-schema-diff.yml` проходит или diff вручную классифицирован.
+- Если нужна дополнительная диагностика, необязательные legacy `03a`/`03b`
+  выполнены и их полный diff сохранён; их rc не заменяет gate `02b`.
 - `04a-plan-target-api-prep.yml` сформировал target API prep report.
 - `04b-plan-db-metadata-import.yml` сформировал DB metadata import review-pack.
 - `04c-collect-source-db-rows.yml` собрал source DB rows для review.

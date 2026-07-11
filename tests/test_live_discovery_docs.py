@@ -1,9 +1,14 @@
 import pathlib
+import json
 import re
+import sys
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from live_discovery.probe_plan import validate_probe_contract
 
 
 def read(relative_path):
@@ -122,11 +127,137 @@ class LiveDiscoveryDocumentationTests(unittest.TestCase):
             "первый реализованный шаг",
             "Generic inventory leaves backend kind empty",
             "NFS backend kind and actual storage probe delegate",
+            "live_discovery_storage_backend_kind",
+            "live_discovery_source_storage_probe_host",
+            "live_discovery_target_storage_probe_host",
+            "four-play orchestration",
+            "NFS-only",
+            "token_file:",
         ):
             self.assertNotIn(stale, combined)
         sql_readme = read("sql-skeleton/README.md")
         self.assertTrue(sql_readme.startswith("# Каркас импорта SQL"))
         self.assertIn("02b-discover-live-resource-graph.yml", sql_readme)
+
+    def test_directional_mapping_is_gate_and_full_schema_tools_are_diagnostic(self):
+        for document in (
+            "operator-inputs-ru.md", "playbook-logic-ru.md",
+            "lab-rehome-runbook-ru.md",
+        ):
+            text = read(document)
+            with self.subTest(document=document):
+                self.assertIn("resource-scoped directional mapping", text)
+                self.assertIn("schema-mapping.json", text)
+                self.assertIn("legacy-диагностика", text)
+                self.assertIn("полное равенство", text)
+                self.assertRegex(text, r"полное равенство[\s\S]{0,160}не\s+требуется")
+
+    def test_all_execution_docs_put_02b_before_optional_02a(self):
+        sections = {
+            "README.md": read("README.md").split("## Рекомендуемый порядок выполнения", 1)[1],
+            "lab-rehome-runbook-ru.md": read("lab-rehome-runbook-ru.md").split("## Короткая последовательность", 1)[1],
+            "playbook-logic-ru.md": read("playbook-logic-ru.md").split("## Короткая последовательность", 1)[1],
+            "kolla-image-tags.md": read("kolla-image-tags.md").split("## Порядок фаз", 1)[1],
+        }
+        for document, section in sections.items():
+            with self.subTest(document=document):
+                self.assertLess(
+                    section.index("02b-discover-live-resource-graph.yml"),
+                    section.index("02a-build-rehome-manifest.yml"),
+                )
+                self.assertIn("необязатель", section.lower())
+
+    def test_probe_examples_are_exact_per_side_and_token_env_only(self):
+        text = read("operator-inputs-ru.md")
+        configs = {}
+        for side in ("source", "target"):
+            match = re.search(
+                rf"<!-- {side}-probe-config.json -->\s*```json\s*(.*?)\s*```",
+                text,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, side)
+            configs[side] = json.loads(match.group(1))
+        for side, expected_scope in (("source", "source-compute"), ("target", "target-storage")):
+            config = configs[side]
+            self.assertEqual("openstack-rehome-probe-config/v1alpha1", config["schema_version"])
+            self.assertEqual("LIVE_DISCOVERY_GLANCE_TOKEN", config["glance"]["token_env"])
+            self.assertNotIn("token_file", config["glance"])
+            self.assertTrue(config["storage"])
+            self.assertTrue(all(item["scope"] == expected_scope for item in config["storage"]))
+            stores = {item["store_id"] for item in config["glance"]["store_capabilities"]}
+            self.assertTrue(stores)
+            self.assertTrue(all(set(image["store_ids"]) <= stores for image in config["glance"]["images"]))
+            resources = [item["resource"] for item in config["storage"]]
+            self.assertTrue(any("allowed_roots" in resource for resource in resources))
+            self.assertTrue(any("allowed_pools" in resource for resource in resources))
+            self.assertTrue(any("allowed_vgs" in resource for resource in resources))
+        backends = {
+            backend_id: {
+                "kind": kind,
+                "source_delegate": "source-probe",
+                "target_delegate": "target-probe",
+                "allowed_scopes": ["source-compute", "target-storage"],
+                "probe_template": kind,
+            }
+            for backend_id, kind in (
+                ("shared-nfs", "nfs"), ("ceph-rbd", "rbd"),
+                ("local-lvm", "lvm"),
+            )
+        }
+        result = validate_probe_contract(
+            backends, configs["source"], configs["target"], True,
+            "source-control", "target-control",
+            {"source-control", "target-control", "source-probe", "target-probe"},
+        )
+        self.assertEqual(["lvm", "nfs", "rbd"], result["backend_kinds"])
+
+    def test_protected_path_examples_cover_inventory_vault_and_lab_command(self):
+        text = read("operator-inputs-ru.md") + read("lab-rehome-runbook-ru.md")
+        for needle in (
+            "live_discovery_kolla_passwords_files[inventory_hostname]",
+            "ansible-vault encrypt",
+            "--ask-vault-pass",
+            "-e @/secure/live-discovery-paths.vault.yml",
+            "live_discovery_source_cinder_sensitive_evidence_file_local",
+            "live_discovery_target_cinder_sensitive_evidence_file_local",
+            "live_discovery_target_online_migration_evidence_file_local",
+            "условно обязатель",
+        ):
+            self.assertIn(needle, text)
+
+    def test_artifact_doc_has_exact_modes_evidence_shapes_and_cleanup_boundary(self):
+        text = read("docs/live-discovery-artifacts-ru.md")
+        self.assertRegex(text, r"финальный run-каталог — `0700`,\s+восемь normal files —\s+`0644`")
+        for needle in (
+            "openstack-json", "runtime-command", "db-jsonl", "storage-probe",
+            "glance-range", "cinder-connection", "resource_fingerprint",
+            "endpoint_origin", "caller-owned", "никогда не изменяются",
+        ):
+            self.assertIn(needle, text)
+
+    def test_glance_200_warn_and_delegates_run_both_probe_families(self):
+        glance = read("glance-rehome-readiness-ru.md")
+        flow = read("docs/live-discovery-data-flow-ru.md")
+        self.assertIn("HTTP 206", glance)
+        self.assertIn("PASS", glance)
+        self.assertIn("HTTP 200", glance)
+        self.assertIn("WARN", glance)
+        self.assertIn("Cinder backing probes и Glance Range probes", flow)
+
+    def test_implementation_plan_uses_current_variables_and_seven_play_sequence(self):
+        text = read("docs/superpowers/plans/2026-07-11-live-cluster-discovery.md")
+        for current in (
+            "live_discovery_storage_backends", "live_discovery_source_probe_config_file_local",
+            "live_discovery_target_probe_config_file_local", "seven-play orchestration",
+            "plays 2-3", "play 5", "play 6", "play 7",
+        ):
+            self.assertIn(current, text)
+        for stale in (
+            "live_discovery_storage_backend_kind", "live_discovery_source_storage_probe_host",
+            "live_discovery_target_storage_probe_host", "four-play orchestration",
+        ):
+            self.assertNotIn(stale, text)
 
     def test_docs_state_profiles_and_live_source_of_truth(self):
         combined = "\n".join(read(path) for path in (

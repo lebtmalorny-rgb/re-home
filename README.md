@@ -89,16 +89,18 @@ Top-level Ansible play принимает только rc `0`.
 change review и явных apply flags:
 
 ```bash
-ansible-playbook -i inventory/hosts.yml playbooks/00-preflight.yml
-ansible-playbook -i inventory/hosts.yml playbooks/01-freeze-source.yml
-ansible-playbook -i inventory/hosts.yml playbooks/02-collect-inventory.yml
-ansible-playbook -i inventory/hosts.yml playbooks/02a-build-rehome-manifest.yml
 ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
 
 # Продолжать только при READY/READY_WITH_WARNINGS и инженерном review.
-ansible-playbook -i inventory/hosts.yml playbooks/03-backup-databases.yml
+# Следующие manifest/full-schema инструменты необязательны и являются legacy-диагностикой.
+ansible-playbook -i inventory/hosts.yml playbooks/02a-build-rehome-manifest.yml
 ansible-playbook -i inventory/hosts.yml playbooks/03a-check-db-schema-compat.yml
 ansible-playbook -i inventory/hosts.yml playbooks/03b-normalize-schema-diff.yml
+
+ansible-playbook -i inventory/hosts.yml playbooks/00-preflight.yml
+ansible-playbook -i inventory/hosts.yml playbooks/01-freeze-source.yml
+ansible-playbook -i inventory/hosts.yml playbooks/02-collect-inventory.yml
+ansible-playbook -i inventory/hosts.yml playbooks/03-backup-databases.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04a-plan-target-api-prep.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04b-plan-db-metadata-import.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04c-collect-source-db-rows.yml
@@ -120,6 +122,12 @@ ansible-playbook -i inventory/hosts.yml playbooks/07-rebind-network-ports.yml
 ansible-playbook -i inventory/hosts.yml playbooks/08-heal-and-validate.yml
 ansible-playbook -i inventory/hosts.yml playbooks/09-enable-target-service.yml
 ```
+
+Обязательное решение о совместимости берётся из resource-scoped directional
+mapping в `schema-mapping.json`, созданного `02b`. Для vendor Keystack и vanilla
+Epoxy полное равенство service schema не требуется. `03a`/`03b` сравнивают
+полные schema и поэтому являются только необязательной legacy-диагностикой,
+полезной для близких/same-schema сред, но не hard gate этого направления.
 
 Rollback до необратимых target-side операций:
 

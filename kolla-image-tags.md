@@ -29,6 +29,9 @@ target-tag containers с конфигурацией CP-B.
 Для развертываний Kolla используем такой порядок:
 
 ```text
+Сначала  Обязательный 02b-discover-live-resource-graph.yml: live readiness и directional mapping
+Затем   Необязательный legacy 02a-build-rehome-manifest.yml для старых helper-фаз
+Затем   Необязательная legacy-диагностика 03a/03b полного schema diff
 Фаза 0   Предварительные проверки
 Фаза 1   Заморозка source scheduling
 Фаза 2   Backup и инвентаризация
@@ -46,6 +49,10 @@ target-tag containers с конфигурацией CP-B.
 Фаза 10  Burn-in / стабилизация
 Фаза 11  Очистка старых source images и containers
 ```
+
+Именно `02b` идёт первым и является gate. После него `02a` и `03a`/`03b`
+необязательны. Authoritative `schema-mapping.json` содержит resource-scoped
+directional mapping; полное равенство Keystack и Epoxy не требуется.
 
 ## Политика по компонентам
 
@@ -163,9 +170,10 @@ re-home для непустого compute-хоста. Kolla upgrade workflow с�
 metadata должны быть подготовлены заранее, а во время cutover должны
 переключаться только control-plane agents выбранного compute-хоста.
 
-Если CP-A и CP-B отличаются не только image tag policy внутри одной серии
-OpenStack, сначала нужно выровнять CP-B и проверить совместимость DB schema, а
-уже потом пытаться делать compute re-home.
+Если CP-A и CP-B отличаются не только image tag policy, target сначала должен
+быть доказан как canonical vanilla Epoxy, а resource-scoped directional mapping
+`02b` не должен содержать blocker-ов. Полное равенство vendor и target DB schema
+не ожидается; `03a`/`03b` остаются legacy-диагностикой, а не hard gate.
 
 ## Очистка
 

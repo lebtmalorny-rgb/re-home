@@ -97,8 +97,8 @@ OVS dataplane и storage helpers.
 - **Что меняет:** только пишет inventory artifacts.
 - **Artifacts:** `compute-inventory.tar.gz` и JSON/API exports в
   `local_artifact_dir`.
-- **Комментарий:** для текущего lab основным manifest entrypoint стал
-  `02a-build-rehome-manifest.yml`.
+- **Комментарий:** для старых helper-фаз manifest entrypoint — необязательный
+  `02a-build-rehome-manifest.yml`; обязательный gate всего workflow — `02b`.
 
 ### `02a-build-rehome-manifest.yml`
 
@@ -126,6 +126,10 @@ OVS dataplane и storage helpers.
   Он строит graph по живому source `keystack-2025.1` и canonical target
   `vanilla-openstack-2025.1-epoxy`. SQL dump не является источником данных и
   может быть только fixture. Masakari/DRS исключены.
+- **Schema gate:** authoritative результат — resource-scoped directional
+  mapping из `schema-mapping.json`. Для Keystack → Epoxy полное равенство
+  source/target schema не требуется. `03a`/`03b` — необязательная
+  legacy-диагностика полного diff, а не hard gate.
 - **Порядок фаз:** первая подписанная `--phase api` определяет roots и UUID
   filters. Публичная `--phase verify` сверяет HMAC, API/filter/plan envelopes,
   live `information_schema`, exact query coverage, SQL и plan digest до записи
@@ -184,18 +188,23 @@ OVS dataplane и storage helpers.
 
 - **Где выполняется:** `source_control[0]`, `target_control[0]`, затем
   `localhost`.
-- **Назначение:** read-only проверка совместимости DB schema и migration heads.
+- **Назначение:** legacy-диагностика полного DB schema diff и migration heads
+  для близких/same-schema кластеров. Authoritative resource-scoped directional
+  mapping создаёт `02b` в `schema-mapping.json`; полное равенство Keystack и
+  Epoxy не требуется.
 - **Что читает:** Nova/Neutron/Cinder migration versions и
   `information_schema`.
 - **Что меняет:** только local artifacts.
 - **Artifacts:** `artifacts/schema-compat/<source>-to-<target>/`.
-- **Guard:** падает, если migration versions или `information_schema`
-  отличаются.
+- **Guard:** сам legacy-инструмент падает, если migration versions или полный
+  `information_schema` отличаются. Этот rc не является hard gate для
+  Keystack → Epoxy и не заменяет verdict `02b`.
 
 ### `03b-normalize-schema-diff.yml`
 
 - **Где выполняется:** `localhost`.
-- **Назначение:** убрать шум из schema diff после `03a`.
+- **Назначение:** необязательная legacy-диагностика: убрать шум из полного
+  schema diff после `03a`.
 - **Что читает:** artifacts `03a`.
 - **Что меняет:** только normalized artifacts.
 - **Artifacts:** `normalized/`, `normalized-diffs/`,
@@ -646,31 +655,35 @@ OVS dataplane и storage helpers.
 - **Guard:** рассчитан на ранний rollback. После target-side операций с ВМ
   rollback требует отдельного ручного плана.
 
-## Короткая последовательность для текущего lab
+## Короткая последовательность
 
-1. `02a` - собрать manifest.
-2. `03a`/`03b` - проверить schema.
-3. `04a`-`04h` - подготовить target metadata и нормализовать target-specific
+1. `02b-discover-live-resource-graph.yml` — обязательный live gate и
+   authoritative resource-scoped directional mapping.
+2. Необязательный legacy `02a-build-rehome-manifest.yml` — дополнительный
+   manifest для старых helper-фаз.
+3. Необязательные `03a`/`03b` — legacy-диагностика полного schema diff; полное
+   равенство Keystack/Epoxy не требуется.
+4. `04a`-`04h` - подготовить target metadata и нормализовать target-specific
    identifiers.
-4. `04j` - проверить/добавить target Neutron ML2 binding levels для ports ВМ.
-5. `04k` - проверить/добавить target Nova compute service row для re-home host.
-6. `04l` - нормализовать target project/user visibility для Horizon, если
+5. `04j` - проверить/добавить target Neutron ML2 binding levels для ports ВМ.
+6. `04k` - проверить/добавить target Nova compute service row для re-home host.
+7. `04l` - нормализовать target project/user visibility для Horizon, если
    выбран target project/user normalization.
-7. `04i` - скачать target-tag images на re-home host и сохранить digests.
-8. `05` - подготовить safe overlays/staging на compute.
-9. `05b` - подготовить full target Kolla config bundle в
+8. `04i` - скачать target-tag images на re-home host и сохранить digests.
+9. `05` - подготовить safe overlays/staging на compute.
+10. `05b` - подготовить full target Kolla config bundle в
    `target-config-stage/kolla/`.
-10. `05a` - остановить source-only non-runtime сервисы.
-11. `06 -e cutover_apply=true` - выполнить guarded cutover.
-12. Проверить target admin/API visibility:
+11. `05a` - остановить source-only non-runtime сервисы.
+12. `06 -e cutover_apply=true` - выполнить guarded cutover.
+13. Проверить target admin/API visibility:
     `openstack server show <uuid>` и
     `openstack server list --all-projects --long --name <name>`.
-13. Проверить target project-level visibility:
+14. Проверить target project-level visibility:
     `openstack project show <server.project_id>` и role assignments. Если
     project отсутствует, target `/project/instances/` не покажет ВМ до
     Keystone import или target project/user normalization.
-14. `07`, `08`, `09` - network rebind, heal/validate, enable target service.
-15. `10` - source API quarantine после принятия ВМ target-кластером.
-16. `11` - report/cleanup старых source runtime images.
-17. `12` - привести оставшиеся host containers к target image tags; штатно
+15. `07`, `08`, `09` - network rebind, heal/validate, enable target service.
+16. `10` - source API quarantine после принятия ВМ target-кластером.
+17. `11` - report/cleanup старых source runtime images.
+18. `12` - привести оставшиеся host containers к target image tags; штатно
     только `fluentd`. `nova_libvirt` и OVS только отдельными флагами и окнами.

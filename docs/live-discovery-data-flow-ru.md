@@ -64,6 +64,11 @@ Playbook содержит ровно семь plays; этот порядок о�
 `verified-plan.json` привязан к canonical plan SHA-256 непосредственно перед
 SQL. SQL разрешён только как SELECT; API/SQL mutations отсутствуют.
 
+Каждый configured source/target storage delegate выполняет обе семьи:
+Cinder backing probes и Glance Range probes. Поэтому delegate должен иметь
+сетевой доступ к соответствующему Glance endpoint/token и локальный read-only
+доступ к заявленным NFS/file, RBD или LVM resources.
+
 ## Доверие и границы
 
 - Root manifest выводится из первой source API phase, а не подаётся оператором
