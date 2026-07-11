@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .contract import CheckResult, CollectorResult, ResourceNode
@@ -32,6 +33,24 @@ def _sanitized_probe_failure(
     evidence: object,
     reason: Optional[str] = None,
 ) -> ProbeFailed:
+    raw_stderr = getattr(evidence, "stderr", "")
+    failure_status = None
+    endpoint_missing = False
+    if isinstance(raw_stderr, str):
+        status_match = re.search(r"(?<!\d)(403|404)(?!\d)", raw_stderr)
+        if status_match is not None:
+            failure_status = int(status_match.group(1))
+        lowered = raw_stderr.lower()
+        mentions_key_service = "key-manager" in lowered or "barbican" in lowered
+        mentions_endpoint = "endpoint" in lowered or "public url" in lowered
+        mentions_absence = (
+            "not found" in lowered
+            or "missing" in lowered
+            or "no public" in lowered
+        )
+        endpoint_missing = (
+            mentions_key_service and mentions_endpoint and mentions_absence
+        )
     sanitized = CommandEvidence(
         evidence_id=str(getattr(evidence, "evidence_id", "unknown")),
         argv=["[REDACTED]"],
@@ -40,6 +59,10 @@ def _sanitized_probe_failure(
         stderr="[REDACTED]",
     )
     failure = ProbeFailed(sanitized)
+    if failure_status is not None:
+        failure.status_code = failure_status
+    if endpoint_missing:
+        failure.reason = "endpoint-missing"
     if reason is not None:
         failure.reason = reason
         failure.args = (

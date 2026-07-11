@@ -148,6 +148,48 @@ class OpenStackClientTests(unittest.TestCase):
         self.assertIsNone(raised.exception.__cause__)
         self.assertIsNone(raised.exception.__context__)
 
+    def test_client_preserves_only_allowlisted_http_failure_status(self):
+        failure_evidence = CommandEvidence(
+            "barbican-failure",
+            ["openstack", "secret", "get", "secret-uuid"],
+            1,
+            "",
+            "ForbiddenException: 403 Client Error token=must-not-leak",
+        )
+
+        class FailingRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                raise ProbeFailed(failure_evidence)
+
+        client = OpenStackClient(FailingRunner(), "cloud", "toolbox", "/clouds.yaml")
+        with self.assertRaises(ProbeFailed) as raised:
+            client.json(["secret", "get", "secret-uuid"], "barbican-failure")
+
+        self.assertEqual(403, raised.exception.status_code)
+        self.assertNotIn("must-not-leak", str(raised.exception.__dict__))
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stderr)
+
+    def test_client_classifies_missing_endpoint_without_raw_error(self):
+        failure_evidence = CommandEvidence(
+            "barbican-endpoint",
+            ["openstack", "secret", "get", "secret-uuid"],
+            1,
+            "",
+            "public endpoint for key-manager service in RegionOne not found token=must-not-leak",
+        )
+
+        class FailingRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                raise ProbeFailed(failure_evidence)
+
+        client = OpenStackClient(FailingRunner(), "cloud", "toolbox", "/clouds.yaml")
+        with self.assertRaises(ProbeFailed) as raised:
+            client.json(["secret", "get", "secret-uuid"], "barbican-endpoint")
+
+        self.assertEqual("endpoint-missing", raised.exception.reason)
+        self.assertNotIn("must-not-leak", str(raised.exception.__dict__))
+        self.assertEqual("[REDACTED]", raised.exception.evidence.stderr)
+
     def test_client_sanitizes_raw_stdout_and_stderr_from_evidence(self):
         class SecretEvidenceRunner:
             def run(self, argv, evidence_id, sensitive_stdout=False):
