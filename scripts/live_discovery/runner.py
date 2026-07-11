@@ -108,18 +108,55 @@ def classify_mutation(argv: Sequence[object]) -> Optional[str]:
     return None
 
 
-def _validate_select_only_sql(sql: str) -> str:
+def validate_select_only_sql(sql: str) -> str:
     statement = sql.strip()
     if any(marker in statement for marker in ("--", "#", "/*", "*/")):
         raise MutationRejected("SQL comments are not allowed")
     for pattern, label in _FORBIDDEN_SQL:
         if re.search(pattern, statement, flags=re.IGNORECASE):
             raise MutationRejected(f"SQL token {label} is not allowed")
-    if statement.count(";") != 1 or not re.fullmatch(
+    semicolons = []
+    quote = None
+    parentheses = 0
+    index = 0
+    while index < len(statement):
+        character = statement[index]
+        if quote is not None:
+            if character == "\\":
+                index += 2
+                continue
+            if character == quote:
+                if index + 1 < len(statement) and statement[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif character in {"'", '"', "`"}:
+            quote = character
+        elif character == "(":
+            parentheses += 1
+        elif character == ")":
+            parentheses -= 1
+            if parentheses < 0:
+                raise MutationRejected("malformed SELECT statement")
+        elif character == ";":
+            semicolons.append(index)
+        index += 1
+    if quote is not None or parentheses != 0:
+        raise MutationRejected("malformed SELECT statement")
+    if semicolons != [len(statement) - 1] or not re.fullmatch(
         r"SELECT\b[\s\S]*;", statement, flags=re.IGNORECASE
     ):
         raise MutationRejected("run_sql accepts one SELECT statement ending with ';'")
+    body = statement[:-1]
+    if re.fullmatch(r"SELECT\s*", body, flags=re.IGNORECASE) or re.match(
+        r"SELECT\s+FROM\b", body, flags=re.IGNORECASE
+    ):
+        raise MutationRejected("malformed SELECT statement")
     return statement
+
+
+# Compatibility for Task 1 callers that may have imported the private helper.
+_validate_select_only_sql = validate_select_only_sql
 
 
 def _reject_sql_bearing_argv(argv: Sequence[str]) -> None:
@@ -238,7 +275,7 @@ class ReadOnlyRunner:
         if not nested or nested[0].lower() not in {"mysql", "mariadb"}:
             raise MutationRejected("run_sql requires mysql or mariadb")
         _reject_sql_bearing_argv(nested)
-        _validate_select_only_sql(sql)
+        validate_select_only_sql(sql)
 
         completed = subprocess.run(
             values,
