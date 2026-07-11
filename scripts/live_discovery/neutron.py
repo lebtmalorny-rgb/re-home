@@ -1,4 +1,5 @@
 from copy import deepcopy
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .contract import CheckResult, CollectorResult, DependencyEdge, ResourceNode
@@ -114,6 +115,10 @@ _INTEGER_FACT_FIELDS = {
     "segment_index", "level", "port_range_min", "port_range_max", "order",
     "internal_port", "external_port",
 }
+_MAX_BINDING_LEVEL = 255
+_RUNTIME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_MAC_ADDRESS = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+_PORT_IDENTITY_FIELDS = {"network_id", "device_id", "device_owner", "mac_address"}
 
 
 def _field(payload: object, *names: str) -> Any:
@@ -133,24 +138,29 @@ def _field(payload: object, *names: str) -> Any:
     return None
 
 
-def _identifiers(value: object) -> List[str]:
+def _identifier_list(value: object) -> Optional[List[str]]:
     if isinstance(value, str):
-        return [value] if value else []
+        return [value] if _RUNTIME_NAME.fullmatch(value) else None
     if not isinstance(value, (list, tuple, set)):
-        return []
+        return None
     values = []
     for item in value:
         if isinstance(item, Mapping):
             item = _field(item, "id", "uuid")
-        if isinstance(item, str) and item:
-            values.append(item)
+        if not isinstance(item, str) or not _RUNTIME_NAME.fullmatch(item):
+            return None
+        values.append(item)
     return list(dict.fromkeys(values))
+
+
+def _identifiers(value: object) -> List[str]:
+    return _identifier_list(value) or []
 
 
 def _row_id(row: Mapping[str, Any], *names: str) -> Optional[str]:
     value = _field(row, *names)
     if isinstance(value, str):
-        return value if value else None
+        return value if _RUNTIME_NAME.fullmatch(value) else None
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
     return None
@@ -176,13 +186,25 @@ def _dedupe(values: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def _port_identity(field: str, value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    if field == "mac_address":
+        return value.lower() if _MAC_ADDRESS.fullmatch(value) else None
+    return value if _RUNTIME_NAME.fullmatch(value) else None
+
+
 def _normalize_fact_value(field: str, value: object) -> object:
     if field == "security_group_ids":
         if not isinstance(value, (list, tuple, set)):
             return _INVALID_FACT
-        return _identifiers(value)
+        identifiers = _identifier_list(value)
+        return identifiers if identifiers is not None else _INVALID_FACT
     if value is None:
         return None
+    if field in _PORT_IDENTITY_FIELDS:
+        normalized = _port_identity(field, value)
+        return normalized if normalized is not None else _INVALID_FACT
     if field in _BOOLEAN_FACT_FIELDS:
         return value if isinstance(value, bool) else _INVALID_FACT
     if field in _INTEGER_FACT_FIELDS:
@@ -215,6 +237,23 @@ def _table_facts(table: str, row: Mapping[str, Any]) -> Dict[str, Any]:
     return _allowlisted(row, TABLE_FACT_FIELDS.get(table, ()))
 
 
+def _binding_level(value: object) -> Optional[int]:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > _MAX_BINDING_LEVEL
+    ):
+        return None
+    return value
+
+
+def _runtime_name(value: object) -> Optional[str]:
+    if not isinstance(value, str) or not _RUNTIME_NAME.fullmatch(value):
+        return None
+    return value
+
+
 class NeutronCollector:
     def __init__(self, client, side: str, schema) -> None:
         self.client = client
@@ -224,12 +263,16 @@ class NeutronCollector:
 
     def collect(self, port_ids: Sequence[str]) -> CollectorResult:
         result = CollectorResult(service="neutron", side=self.side)
-        selected_ports = _dedupe(
-            str(value) for value in port_ids if isinstance(value, str) and value
-        )
-        if not selected_ports:
+        if not port_ids:
             result.blockers.append("Neutron port roots missing")
             return result
+        normalized_ports = [_runtime_name(value) for value in port_ids]
+        if any(value is None for value in normalized_ports):
+            result.blockers.append("Neutron port roots invalid")
+            return result
+        selected_ports = _dedupe(
+            value for value in normalized_ports if value is not None
+        )
 
         rows, selected_ports = self._acquire_rows(selected_ports, result)
 
@@ -301,14 +344,19 @@ class NeutronCollector:
                 result.blockers.append(f"Neutron DB port {qualifier}: {port_id}")
             db_port = matching_rows[0] if matching_rows else {}
             for field in ("network_id", "mac_address", "device_id", "device_owner"):
-                api_value = _field(api, field)
-                db_value = _field(db_port, field)
+                api_raw = _field(api, field)
+                db_raw = _field(db_port, field)
+                api_value = _port_identity(field, api_raw)
+                db_value = _port_identity(field, db_raw)
+                api_present = api_raw not in (None, "")
+                db_present = db_raw not in (None, "")
                 if (
-                    (api_value not in (None, ""))
-                    != (db_value not in (None, ""))
+                    (api_present and api_value is None)
+                    or (db_present and db_value is None)
+                    or (api_present != db_present)
                     or (
-                        api_value not in (None, "")
-                        and db_value not in (None, "")
+                        api_value is not None
+                        and db_value is not None
                         and api_value != db_value
                     )
                 ):
@@ -333,11 +381,18 @@ class NeutronCollector:
                 add_edge(node.key, f"network:{network_id}", "uses_network")
             else:
                 result.blockers.append(f"network UUID missing for port {port_id}")
-            api_security_groups = set(
-                _identifiers(
-                    _field(api, "security_group_ids", "security_groups")
-                )
+            api_security_group_raw = _field(
+                api, "security_group_ids", "security_groups"
             )
+            api_security_group_ids = _identifier_list(api_security_group_raw)
+            if (
+                api_security_group_raw is not None
+                and api_security_group_ids is None
+            ):
+                result.blockers.append(
+                    f"security group API identifiers invalid: {port_id}"
+                )
+            api_security_groups = set(api_security_group_ids or [])
             api_security_groups_by_port[port_id] = api_security_groups
             security_group_ids.extend(api_security_groups)
 
@@ -458,11 +513,16 @@ class NeutronCollector:
             if port_id not in selected_port_set:
                 continue
             host = _row_id(row, "host") or "unbound"
-            level = _field(row, "level")
-            level_text = str(level) if level is not None else "unknown"
+            level = _binding_level(_field(row, "level"))
+            if level is None:
+                result.blockers.append(
+                    f"binding level invalid for port {port_id}"
+                )
+                continue
+            facts = _table_facts("ml2_port_binding_levels", row)
+            facts["level"] = level
             binding_level = add_node(
-                "binding_level", f"{port_id}:{host}:{level_text}",
-                _table_facts("ml2_port_binding_levels", row),
+                "binding_level", f"{port_id}:{host}:{level}", facts,
             )
             if binding_level is None:
                 continue
@@ -1333,15 +1393,15 @@ def _compare_ovs_port(port_id, source_runtime, target_runtime, check) -> None:
         ports: Sequence[ResourceNode], interfaces: Sequence[ResourceNode]
     ) -> bool:
         for node in [*ports, *interfaces]:
-            if not isinstance(node.id, str) or not node.id:
+            if _runtime_name(node.id) is None:
                 return True
         for node in interfaces:
             bridge = _field(node.facts, "source", "bridge")
-            if bridge not in (None, "") and not isinstance(bridge, str):
+            if bridge not in (None, "") and _runtime_name(bridge) is None:
                 return True
         for node in ports:
             bridge = _field(node.facts, "bridge", "source")
-            if bridge not in (None, "") and not isinstance(bridge, str):
+            if bridge not in (None, "") and _runtime_name(bridge) is None:
                 return True
         return False
 
@@ -1436,14 +1496,12 @@ def _compare_ovn_port(port_id, source_runtime, target_runtime, check) -> None:
             logical_port = _field(node.facts, "logical_port")
             chassis = _field(node.facts, "chassis")
             if (
-                not isinstance(node.id, str)
-                or not node.id
-                or not isinstance(logical_port, str)
-                or not logical_port
+                _runtime_name(node.id) is None
+                or _runtime_name(logical_port) is None
                 or logical_port != node.id
                 or (
                     chassis not in (None, "")
-                    and not isinstance(chassis, str)
+                    and _runtime_name(chassis) is None
                 )
             ):
                 return True

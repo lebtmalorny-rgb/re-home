@@ -182,6 +182,32 @@ class NeutronCollectorTests(unittest.TestCase):
             result.blockers,
         )
 
+    def test_malformed_api_security_group_identifier_fails_closed(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["openstack"][0]["payload"]["security_group_ids"] = [
+            "sg-identifier-secret malformed"
+        ]
+
+        result = collect_from_fixture(fixture, ["port-1"])
+        serialized = json.dumps(result.to_dict())
+
+        self.assertIn(
+            "security group API identifiers invalid: port-1",
+            result.blockers,
+        )
+        self.assertNotIn("sg-identifier-secret", serialized)
+
+    def test_malformed_selected_port_root_fails_before_acquisition(self):
+        client = FixtureClient(self.source_fixture)
+
+        result = NeutronCollector(
+            client, "source", schema_from_fixture(self.source_fixture)
+        ).collect(["port-root-secret malformed"])
+
+        self.assertIn("Neutron port roots invalid", result.blockers)
+        self.assertEqual([], client.queries)
+        self.assertNotIn("port-root-secret", json.dumps(result.to_dict()))
+
     def test_missing_qos_policy_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)
         fixture["tables"]["qos_policies"] = []
@@ -208,6 +234,33 @@ class NeutronCollectorTests(unittest.TestCase):
         result = collect_from_fixture(fixture, ["port-1"])
 
         self.assertIn("binding level segment missing for port port-1", result.blockers)
+
+    def test_binding_level_is_normalized_before_node_id_and_facts(self):
+        cases = (
+            ("dict", {"token": "binding-level-dict-secret"}),
+            ("list", ["binding-level-list-secret"]),
+            ("missing", None),
+            ("negative", -1),
+            ("too-large", 256),
+        )
+        for name, value in cases:
+            with self.subTest(name=name):
+                fixture = deepcopy(self.source_fixture)
+                level_row = fixture["tables"]["ml2_port_binding_levels"][0]
+                if name == "missing":
+                    level_row.pop("level")
+                else:
+                    level_row["level"] = value
+
+                result = collect_from_fixture(fixture, ["port-1"])
+                serialized = json.dumps(result.to_dict())
+
+                self.assertIn("binding level invalid for port port-1", result.blockers)
+                self.assertFalse(
+                    any(node.kind == "binding_level" for node in result.nodes)
+                )
+                self.assertNotIn("binding-level-dict-secret", serialized)
+                self.assertNotIn("binding-level-list-secret", serialized)
 
     def test_missing_router_node_blocks_required_edge(self):
         fixture = deepcopy(self.source_fixture)
@@ -596,6 +649,30 @@ class NeutronCollectorTests(unittest.TestCase):
 
                 self.assertIn(reason, result.blockers)
 
+    def test_equal_malformed_api_db_identity_values_still_block(self):
+        cases = (
+            ("network_id", {"token": "identity-network-secret"}),
+            ("device_id", ["identity-device-secret"]),
+            ("device_owner", "compute nova"),
+            ("mac_address", "not-a-mac"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                fixture = deepcopy(self.source_fixture)
+                fixture["openstack"][0]["payload"][field] = deepcopy(value)
+                fixture["tables"]["ports"][0][field] = deepcopy(value)
+
+                result = collect_from_fixture(fixture, ["port-1"])
+                serialized = json.dumps(result.to_dict())
+                reason_field = "network" if field == "network_id" else field
+
+                self.assertIn(
+                    f"port API/DB {reason_field} mismatch: port-1",
+                    result.blockers,
+                )
+                self.assertNotIn("identity-network-secret", serialized)
+                self.assertNotIn("identity-device-secret", serialized)
+
     def test_target_requires_exact_port_and_network_uuid(self):
         target = deepcopy(self.ovs_target_fixture)
         target["openstack"][0]["payload"]["id"] = "port-other"
@@ -764,6 +841,43 @@ class NeutronCollectorTests(unittest.TestCase):
                     reasons,
                 )
 
+    def test_malformed_ovs_scalar_strings_fail_closed(self):
+        cases = (
+            (0, "source", "   "),
+            (0, "source", "br int"),
+            (1, "bridge", "br/int"),
+        )
+        for node_index, field, value in cases:
+            with self.subTest(field=field, value=value):
+                target = deepcopy(self.ovs_target_fixture)
+                target["runtime"]["nodes"][node_index]["facts"][field] = value
+
+                result = compare_source_target(self.source_fixture, target)
+
+                self.assertIn(
+                    "target OVS dataplane evidence malformed for port port-1",
+                    result.blockers,
+                )
+
+    def test_malformed_ovs_port_and_interface_names_fail_closed(self):
+        for node_index, value in ((0, "tap/port-1"), (1, "tap port-1")):
+            with self.subTest(node_index=node_index, value=value):
+                target = deepcopy(self.ovs_target_fixture)
+                node = target["runtime"]["nodes"][node_index]
+                old_id = node["id"]
+                old_key = f"{node['kind']}:{old_id}"
+                node["id"] = value
+                for edge in target["runtime"]["edges"]:
+                    if edge["source"] == old_key:
+                        edge["source"] = f"{node['kind']}:{value}"
+
+                result = compare_source_target(self.source_fixture, target)
+
+                self.assertIn(
+                    "target OVS dataplane evidence malformed for port port-1",
+                    result.blockers,
+                )
+
     def test_ovn_logical_binding_and_chassis_are_ready(self):
         source = deepcopy(self.source_fixture)
         source["runtime"] = deepcopy(self.ovn_target_fixture["runtime"])
@@ -825,6 +939,42 @@ class NeutronCollectorTests(unittest.TestCase):
                     f"{side} OVN binding evidence malformed for port port-1",
                     reasons,
                 )
+
+    def test_malformed_ovn_scalar_strings_fail_closed(self):
+        cases = (
+            ("logical_port", "   "),
+            ("logical_port", "port 1"),
+            ("chassis", "   "),
+            ("chassis", "compute/023"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                source = deepcopy(self.source_fixture)
+                source["runtime"] = deepcopy(self.ovn_target_fixture["runtime"])
+                target = deepcopy(self.ovn_target_fixture)
+                target["runtime"]["nodes"][0]["facts"][field] = value
+
+                result = compare_source_target(source, target)
+
+                self.assertIn(
+                    "target OVN binding evidence malformed for port port-1",
+                    result.blockers,
+                )
+
+    def test_matching_malformed_ovn_node_and_logical_port_fail_closed(self):
+        source = deepcopy(self.source_fixture)
+        source["runtime"] = deepcopy(self.ovn_target_fixture["runtime"])
+        target = deepcopy(self.ovn_target_fixture)
+        target["runtime"]["nodes"][0]["id"] = "port 1"
+        target["runtime"]["nodes"][0]["facts"]["logical_port"] = "port 1"
+        target["runtime"]["edges"][0]["source"] = "ovn_binding:port 1"
+
+        result = compare_source_target(source, target)
+
+        self.assertIn(
+            "target OVN binding evidence malformed for port port-1",
+            result.blockers,
+        )
 
     def test_unsupported_backend_is_explicit_unknown(self):
         result = compare_source_target(
