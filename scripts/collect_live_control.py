@@ -360,10 +360,13 @@ def _execute_probe_config(
             "rbd": f"{resource.get('pool')}/{resource.get('image')}",
             "lvm": f"{resource.get('vg')}/{resource.get('lv')}",
         }.get(item["kind"], str(resource.get("backend_id", "unsupported")))
-        evidence_id = f"storage:{volume_id}:{item['scope']}:{item['kind']}:{item['backend_id']}"
+        probe_kind = "nfs" if item["kind"] == "file" else item["kind"]
+        evidence_id = f"storage:{volume_id}:{item['scope']}:{probe_kind}:{item['backend_id']}"
+        resource_fingerprint = hashlib.sha256(f"{probe_kind}:{scoped_resource}".encode("utf-8")).hexdigest()
         storage_results.append({
-            "volume_id": volume_id, "scope": item["scope"], "kind": item["kind"],
+            "volume_id": volume_id, "scope": item["scope"], "kind": probe_kind,
             "backend_identity": item["backend_id"], "resource_identity": scoped_resource,
+            "resource_fingerprint": resource_fingerprint,
             "expected_size": resource.get("expected_size"), "observed_size": observed[0],
             "evidence_id": evidence_id, "status": check.status, "reason": check.reason,
         })
@@ -446,6 +449,7 @@ class _CombinedClient:
         self._api_result = deepcopy(api_result)
         self._api = {}
         self.cache_misses = []
+        self.db_cache_misses = []
         for item in api_result.get("openstack", []):
             if not isinstance(item, dict) or set(item) != {"command", "payload", "evidence"} or not isinstance(item["command"], list):
                 raise ValueError("cached OpenStack response is invalid")
@@ -487,6 +491,18 @@ class _CombinedClient:
                 ) for column in filters)
             ]
         if len(matches) != 1:
+            schemas = sorted({
+                identity.split(".", 1)[0]
+                for identity in _TABLE_ROOT_FILTERS
+                if identity.split(".", 1)[1] == table
+            })
+            miss = {
+                "schema": schemas[0] if len(schemas) == 1 else "unknown",
+                "table": str(table),
+                "filters": deepcopy(filters) if isinstance(filters, dict) else {},
+            }
+            if _canonical(miss) not in {_canonical(item) for item in self.db_cache_misses}:
+                self.db_cache_misses.append(miss)
             return [], {"evidence_id": f"{self.side}-db:unknown.{table}"}
         match = matches[0]
         evidence_matches = [
@@ -603,7 +619,7 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
         ]
         scopes = set()
         for item in matches:
-            expected_keys = {"volume_id", "scope", "kind", "backend_identity", "resource_identity", "expected_size", "observed_size", "evidence_id", "status", "reason"}
+            expected_keys = {"volume_id", "scope", "kind", "backend_identity", "resource_identity", "resource_fingerprint", "expected_size", "observed_size", "evidence_id", "status", "reason"}
             if set(item) != expected_keys:
                 continue
             scope = item["scope"]
@@ -622,7 +638,8 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
             cinder_backend_id = volume_nodes[0].facts.get("storage_backend_id", volume_nodes[0].facts.get("backend_id")) if len(volume_nodes) == 1 else None
             cinder_backend_kind = volume_nodes[0].facts.get("backend_kind") if len(volume_nodes) == 1 else None
             cinder_resource_identity = volume_nodes[0].facts.get("resource_identity") if len(volume_nodes) == 1 else None
-            connection_evidence_id = volume_nodes[0].facts.get("connection_evidence_id") if len(volume_nodes) == 1 else None
+            cinder_resource_fingerprint = volume_nodes[0].facts.get("resource_fingerprint") if len(volume_nodes) == 1 else None
+            connection_evidence_ids = volume_nodes[0].facts.get("connection_evidence_ids", []) if len(volume_nodes) == 1 else []
             bound = (
                 isinstance(identity, str) and identity
                 and isinstance(resource_identity, str) and resource_identity
@@ -630,6 +647,9 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
                 and cinder_backend_id == identity
                 and cinder_backend_kind == kind
                 and cinder_resource_identity == resource_identity
+                and item["resource_fingerprint"] == cinder_resource_fingerprint
+                and item["resource_fingerprint"] == hashlib.sha256(f"{kind}:{resource_identity}".encode("utf-8")).hexdigest()
+                and isinstance(connection_evidence_ids, list) and connection_evidence_ids
                 and isinstance(item["expected_size"], int)
                 and expected_bytes is not None
                 and item["expected_size"] == expected_bytes
@@ -654,7 +674,7 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
             identity_hash = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
             result.checks.append(CheckResult(
                 f"cinder.storage.{volume_id}.{scope}.{kind}.{identity_hash}", status, reason,
-                [f"volume:{volume_id}"], [value for value in (evidence_id, connection_evidence_id) if isinstance(value, str)],
+                [f"volume:{volume_id}"], [evidence_id, *connection_evidence_ids],
             ))
             if status == "BLOCKED" and reason not in result.blockers:
                 result.blockers.append(reason)
@@ -672,6 +692,75 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
                 "UNKNOWN", "required storage probe evidence is missing",
                 [f"volume:{volume_id}"],
             ))
+
+
+def _bind_cinder_connection_summaries(cinder, connection_summaries):
+    if not isinstance(connection_summaries, list):
+        raise ValueError("Cinder connection summaries are invalid")
+    volume_nodes = {node.id: node for node in cinder.nodes if node.kind == "volume"}
+    attachment_nodes = {node.id: node for node in cinder.nodes if node.kind == "volume_attachment"}
+    backend_nodes = {node.id: node for node in cinder.nodes if node.kind == "storage_backend"}
+    required_attachment_edges = {
+        (edge.source, edge.target) for edge in cinder.edges
+        if edge.required and edge.relation == "has_attachment"
+    }
+    required_backend_edges = {
+        (edge.source, edge.target) for edge in cinder.edges
+        if edge.required and edge.relation == "has_backing_backend"
+    }
+    summaries_by_volume = {}
+    bound_pairs = set()
+    for summary in connection_summaries:
+        if not isinstance(summary, dict):
+            raise ValueError("Cinder connection summary is invalid")
+        volume_id = summary.get("volume_id")
+        attachment_id = summary.get("attachment_id")
+        volume_node = volume_nodes.get(volume_id)
+        attachment_node = attachment_nodes.get(attachment_id)
+        backend_id = summary.get("backend_id")
+        backend_kind = summary.get("backend_kind")
+        connection_summary = attachment_node.facts.get("connection_summary") if attachment_node is not None else None
+        graph_driver = connection_summary.get("driver_type") if isinstance(connection_summary, dict) else None
+        if graph_driver == "file":
+            graph_driver = "nfs"
+        valid = (
+            volume_node is not None and attachment_node is not None
+            and attachment_node.facts.get("volume_id") == volume_id
+            and (f"volume:{volume_id}", f"volume_attachment:{attachment_id}") in required_attachment_edges
+            and volume_node.facts.get("storage_backend_id") == backend_id
+            and backend_id in backend_nodes
+            and (f"volume:{volume_id}", f"storage_backend:{backend_id}") in required_backend_edges
+            and graph_driver == backend_kind
+            and (volume_id, attachment_id) not in bound_pairs
+        )
+        if not valid:
+            cinder.blockers.append(f"Cinder protected attachment evidence mismatch: {attachment_id}")
+            continue
+        summaries_by_volume.setdefault(volume_id, []).append(summary)
+        bound_pairs.add((volume_id, attachment_id))
+        attachment_node.evidence_ids.append(summary["evidence_id"])
+        volume_node.evidence_ids.append(summary["evidence_id"])
+    for volume_id, summaries in summaries_by_volume.items():
+        identities = {(item["backend_kind"], item["backend_id"], item["resource_identity"], item["resource_fingerprint"]) for item in summaries}
+        if len(identities) != 1:
+            cinder.blockers.append(f"Cinder multiattach backing identity conflicts: {volume_id}")
+            continue
+        backend_kind, backend_id, resource_identity, resource_fingerprint = next(iter(identities))
+        volume_nodes[volume_id].facts.update({
+            "backend_kind": backend_kind, "resource_identity": resource_identity,
+            "resource_fingerprint": resource_fingerprint,
+            "connection_evidence_ids": sorted(item["evidence_id"] for item in summaries),
+            "attachment_ids": sorted(item["attachment_id"] for item in summaries),
+        })
+    for attachment_id, attachment_node in attachment_nodes.items():
+        volume_id = attachment_node.facts.get("volume_id")
+        if (
+            isinstance(volume_id, str)
+            and (f"volume:{volume_id}", f"volume_attachment:{attachment_id}") in required_attachment_edges
+            and (volume_id, attachment_id) not in bound_pairs
+        ):
+            cinder.blockers.append(f"Cinder protected attachment evidence missing: {attachment_id}")
+    return cinder
 
 
 def _compose_collectors(side, api_result, records, evidence, snapshot):
@@ -705,18 +794,9 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
         ))
     results.append(NeutronCollector(client, side, snapshot).collect(port_ids))
     cinder = CinderCollector(client, side, snapshot).collect(volume_ids)
-    connection_summaries = api_result.get("cinder_connection_summaries", {})
-    if not isinstance(connection_summaries, dict):
-        raise ValueError("Cinder connection summaries are invalid")
-    for node in cinder.nodes:
-        summary = connection_summaries.get(node.id) if node.kind == "volume" else None
-        if isinstance(summary, dict):
-            node.facts.update({
-                "backend_kind": summary["backend_kind"],
-                "resource_identity": summary["resource_identity"],
-                "connection_evidence_id": summary["evidence_id"],
-            })
-            node.evidence_ids.append(summary["evidence_id"])
+    _bind_cinder_connection_summaries(
+        cinder, api_result.get("cinder_connection_summaries", [])
+    )
     _integrate_storage_readiness(cinder, volume_ids, api_result)
     results.append(cinder)
     requirements = {
@@ -730,7 +810,11 @@ def _compose_collectors(side, api_result, records, evidence, snapshot):
         for image_id in image_ids
     }
     results.append(GlanceCollector(client, side).collect(requirements))
-    return [result.to_dict() for result in results], [list(command) for command in client.cache_misses]
+    return (
+        [result.to_dict() for result in results],
+        [list(command) for command in client.cache_misses],
+        deepcopy(client.db_cache_misses),
+    )
 
 
 def _build_evidence_index(side, collectors, api_result, db_evidence):
@@ -771,15 +855,16 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             raise ValueError("capability evidence is invalid")
         add(deepcopy(entry))
 
-    for volume_id, summary in api_result.get("cinder_connection_summaries", {}).items():
-        expected = {"evidence_id", "attachment_id", "backend_kind", "backend_id", "resource_identity"}
-        if not isinstance(summary, dict) or set(summary) != expected or _canonical_uuid(volume_id) is None:
+    for summary in api_result.get("cinder_connection_summaries", []):
+        expected = {"volume_id", "evidence_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"}
+        if not isinstance(summary, dict) or set(summary) != expected or _canonical_uuid(summary.get("volume_id")) is None:
             raise ValueError("Cinder connection summary is invalid")
         add({
             "evidence_id": summary["evidence_id"], "kind": "cinder-connection",
-            "side": side, "service": "cinder", "volume_id": volume_id,
+            "side": side, "service": "cinder", "volume_id": summary["volume_id"],
             "attachment_id": summary["attachment_id"], "backend_kind": summary["backend_kind"],
             "backend_id": summary["backend_id"], "resource_identity": summary["resource_identity"],
+            "resource_fingerprint": summary["resource_fingerprint"],
         })
 
     cached = {}
@@ -820,7 +905,7 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             item = storage[identity]
             add({"evidence_id":identity,"kind":"storage-probe","side":side,"service":service,
                  "resource_id":item["volume_id"],"backend_kind":item["kind"],"backend_identity":item["backend_identity"],"resource_identity":item["resource_identity"],
-                 "scope":item["scope"],"expected_size":item["expected_size"],"observed_size":item["observed_size"],"status":item["status"]})
+                 "resource_fingerprint":item["resource_fingerprint"],"scope":item["scope"],"expected_size":item["expected_size"],"observed_size":item["observed_size"],"status":item["status"]})
         elif identity in glance:
             item = glance[identity]
             add({"evidence_id":identity,"kind":"glance-range","side":side,"service":service,
@@ -865,8 +950,9 @@ def _load_cinder_sensitive_evidence(path, side):
         or len(payload["entries"]) > 4096
     ):
         raise ValueError("Cinder sensitive evidence envelope is invalid")
-    summaries = {}
+    summaries = []
     sensitive = {}
+    seen_pairs = set()
     expected = {"evidence_id", "volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "connector", "connection_info"}
     for entry in payload["entries"]:
         if not isinstance(entry, dict) or set(entry) != expected:
@@ -876,41 +962,66 @@ def _load_cinder_sensitive_evidence(path, side):
         evidence_id = entry["evidence_id"]
         backend_kind = entry["backend_kind"].lower() if isinstance(entry["backend_kind"], str) else ""
         backend_id = entry["backend_id"]
-        resource_identity = entry["resource_identity"]
+        declared_identity = entry["resource_identity"]
         if backend_kind == "file":
             backend_kind = "nfs"
-        valid_resource = False
-        if isinstance(resource_identity, str) and 0 < len(resource_identity) <= 1024 and "\x00" not in resource_identity:
-            if backend_kind == "nfs":
-                parsed = PurePosixPath(resource_identity)
-                valid_resource = resource_identity.startswith("/") and str(parsed) == resource_identity and ".." not in parsed.parts
-            elif backend_kind in {"rbd", "lvm"}:
-                parts = resource_identity.split("/")
-                valid_resource = len(parts) == 2 and all(_SAFE_ROOT.fullmatch(part) for part in parts)
-            else:
-                valid_resource = _SAFE_ROOT.fullmatch(resource_identity) is not None
         connection_info = entry["connection_info"]
         connector = entry["connector"]
         driver_type = connection_info.get("driver_volume_type") if isinstance(connection_info, dict) else None
+        data = connection_info.get("data") if isinstance(connection_info, dict) else None
+        derived_identity = None
+        if isinstance(data, dict):
+            if backend_kind == "rbd":
+                pool, image = data.get("pool"), data.get("image")
+                name = data.get("name")
+                if (not isinstance(pool, str) or not isinstance(image, str)) and isinstance(name, str) and name.count("/") == 1:
+                    pool, image = name.split("/", 1)
+                if isinstance(pool, str) and isinstance(image, str) and _SAFE_ROOT.fullmatch(pool) and _SAFE_ROOT.fullmatch(image):
+                    derived_identity = f"{pool}/{image}"
+            elif backend_kind == "nfs":
+                candidate = data.get("device_path") or data.get("path")
+                if isinstance(candidate, str):
+                    parsed = PurePosixPath(candidate)
+                    if candidate.startswith("/") and str(parsed) == candidate and ".." not in parsed.parts:
+                        derived_identity = candidate
+            elif backend_kind == "lvm":
+                vg, lv = data.get("volume_group"), data.get("logical_volume")
+                device = data.get("device_path")
+                if (not isinstance(vg, str) or not isinstance(lv, str)) and isinstance(device, str) and device.startswith("/dev/"):
+                    parts = PurePosixPath(device).parts
+                    if len(parts) == 4:
+                        vg, lv = parts[2], parts[3]
+                if isinstance(vg, str) and isinstance(lv, str) and _SAFE_ROOT.fullmatch(vg) and _SAFE_ROOT.fullmatch(lv):
+                    derived_identity = f"{vg}/{lv}"
+            else:
+                candidate = data.get("resource_id")
+                if isinstance(candidate, str) and _SAFE_ROOT.fullmatch(candidate):
+                    derived_identity = candidate
+        pair = (volume_id, attachment_id)
         if (
             volume_id is None or attachment_id is None
             or not isinstance(evidence_id, str) or _SAFE_ROOT.fullmatch(evidence_id) is None
             or not backend_kind or _SAFE_ROOT.fullmatch(backend_kind) is None
             or not isinstance(backend_id, str) or _SAFE_ROOT.fullmatch(backend_id) is None
-            or not valid_resource
+            or derived_identity is None or declared_identity != derived_identity
             or not isinstance(connector, dict) or not connector
             or not isinstance(connection_info, dict) or not connection_info
             or driver_type not in {backend_kind, "file" if backend_kind == "nfs" else backend_kind}
-            or volume_id in summaries or evidence_id in sensitive
+            or connector.get("attachment_id") != attachment_id
+            or connector.get("volume_id") != volume_id
+            or pair in seen_pairs or evidence_id in sensitive
         ):
             raise ValueError("Cinder sensitive evidence identity is invalid")
-        summaries[volume_id] = {
+        seen_pairs.add(pair)
+        summaries.append({
+            "volume_id": volume_id,
             "evidence_id": evidence_id, "attachment_id": attachment_id,
             "backend_kind": backend_kind, "backend_id": backend_id,
-            "resource_identity": resource_identity,
-        }
+            "resource_identity": derived_identity,
+            "resource_fingerprint": hashlib.sha256(f"{backend_kind}:{derived_identity}".encode("utf-8")).hexdigest(),
+        })
         sensitive[evidence_id] = deepcopy(entry)
-    return summaries, sensitive
+    return sorted(summaries, key=lambda item: (item["volume_id"], item["attachment_id"])), sensitive
 
 
 def _safe_out(path):
@@ -1194,6 +1305,7 @@ def _expand_live_api_roots(roots, acquire, side, *, need_glance_catalog=False):
                 extend("attachments", _deep_payload_ids(payload, "attachment_id", "attachments"))
                 extend("groups", _deep_payload_ids(payload, "group_id", "consistencygroup_id"))
                 extend("group_snapshots", _deep_payload_ids(payload, "group_snapshot_id"))
+                extend("barbican_secrets", _payload_ids(payload, "encryption_key_id", "encryption_key_uuid", "secret_id", "key_id"))
             elif category == "attachments":
                 payload = acquire(["volume", "attachment", "show", identity, "-f", "json"], f"cinder-{side}-attachment-show-{identity}")
                 extend("volumes", _deep_payload_ids(payload, "volume_id"))
@@ -1398,6 +1510,21 @@ def _read_jsonl(path, query):
     return records
 
 
+def _closure_checks(side, api_cache_misses, db_cache_misses):
+    checks = []
+    if api_cache_misses:
+        checks.append(CheckResult(
+            f"control.{side}.api-closure", "UNKNOWN",
+            "required API dependency was discovered only after DB acquisition",
+        ).to_dict())
+    if db_cache_misses:
+        checks.append(CheckResult(
+            f"control.{side}.db-closure", "UNKNOWN",
+            "required scoped DB dependency is absent from reviewed cache",
+        ).to_dict())
+    return checks
+
+
 def _combine_phase(args):
     api = _read_json(args.api_result)
     filters_document = _read_json(Path(args.api_result).with_name("uuid-filters.json"))
@@ -1509,7 +1636,7 @@ def _combine_phase(args):
     schema_policy = _read_json(args.schema_policy)
     if not isinstance(schema_policy, dict):
         raise ValueError("schema policy is invalid")
-    collectors, cache_misses = _compose_collectors(
+    collectors, cache_misses, db_cache_misses = _compose_collectors(
         args.side, api["api_result"], records, evidence, snapshot
     )
     evidence_index = _build_evidence_index(args.side, collectors, api["api_result"], evidence)
@@ -1542,11 +1669,7 @@ def _combine_phase(args):
     combined = {
         "schema_version": BUNDLE_VERSION,
         "collectors": collectors,
-        "checks": ([CheckResult(
-            f"control.{args.side}.api-closure", "UNKNOWN",
-            "required API dependency was discovered only after DB acquisition",
-            evidence_ids=[],
-        ).to_dict()] if cache_misses else []),
+        "checks": _closure_checks(args.side, cache_misses, db_cache_misses),
         "schema_capabilities": capabilities,
         "uuid_filters": side_filters,
         "evidence_index": evidence_index,

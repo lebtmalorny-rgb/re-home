@@ -2,6 +2,7 @@ import json
 import hashlib
 import inspect
 import os
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import sys
@@ -15,7 +16,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery" / "full-run"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import collect_live_control as control
-from live_discovery.contract import CheckResult, CollectorResult, ResourceNode
+from live_discovery.contract import CheckResult, CollectorResult, DependencyEdge, ResourceNode
 from collect_live_control import _CombinedClient, _TABLE_ROOT_FILTERS, _api_phase, _collector_table_catalog, _execute_probe_config, _expected_plan_tables, _integrate_storage_readiness, _phase_binding, _read_protected_json, _root_filter_values
 from live_discovery.cinder import CORE_TABLES as CINDER_CORE, OPTIONAL_TABLES as CINDER_OPTIONAL
 from live_discovery.neutron import CORE_TABLES as NEUTRON_CORE, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL
@@ -49,11 +50,11 @@ class LiveDiscoveryCliTests(unittest.TestCase):
 
     def test_storage_pass_cannot_cross_backend_kind_or_resource(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
-        result = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/volume-2"})])
-        api = {"storage_probe_results":[{"volume_id":volume_id,"scope":"source-compute","kind":"nfs","backend_identity":"rbd-backend","resource_identity":"/srv/nfs/volume-2","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage-cross-kind","status":"PASS","reason":"ok"}]}
+        result = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/volume-2","resource_fingerprint":hashlib.sha256(b"rbd:volumes/volume-2").hexdigest(),"connection_evidence_ids":["connection-1"]})])
+        api = {"storage_probe_results":[{"volume_id":volume_id,"scope":"source-compute","kind":"nfs","backend_identity":"rbd-backend","resource_identity":"/srv/nfs/volume-2","resource_fingerprint":hashlib.sha256(b"nfs:/srv/nfs/volume-2").hexdigest(),"expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage-cross-kind","status":"PASS","reason":"ok"}]}
         _integrate_storage_readiness(result,[volume_id],api)
         self.assertEqual("BLOCKED", result.checks[0].status)
-        result2=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/expected"})])
+        result2=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/expected","resource_fingerprint":hashlib.sha256(b"rbd:volumes/expected").hexdigest(),"connection_evidence_ids":["connection-1"]})])
         api2={"storage_probe_results":[{**api["storage_probe_results"][0],"kind":"rbd","resource_identity":"volumes/attacker"}]}
         _integrate_storage_readiness(result2,[volume_id],api2)
         self.assertEqual("BLOCKED",result2.checks[0].status)
@@ -104,18 +105,77 @@ class LiveDiscoveryCliTests(unittest.TestCase):
     def test_cinder_connection_evidence_is_mode_checked_and_raw_only_in_sensitive_output(self):
         volume_id="22222222-2222-2222-2222-222222222222"
         attachment_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        payload={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":[{"evidence_id":"cinder-sensitive-attachment","volume_id":volume_id,"attachment_id":attachment_id,"backend_kind":"rbd","backend_id":"rbd-backend","resource_identity":"volumes/volume-2","connector":{"host":"compute-023","auth_password":"connector-secret"},"connection_info":{"driver_volume_type":"rbd","secret_uuid":"connection-secret"}}]}
+        payload={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":[{"evidence_id":"cinder-sensitive-attachment","volume_id":volume_id,"attachment_id":attachment_id,"backend_kind":"rbd","backend_id":"rbd-backend","resource_identity":"volumes/volume-2","connector":{"attachment_id":attachment_id,"volume_id":volume_id,"host":"compute-023","auth_password":"connector-secret"},"connection_info":{"driver_volume_type":"rbd","data":{"pool":"volumes","image":"volume-2","secret_uuid":"connection-secret"}}}]}
         with tempfile.TemporaryDirectory() as temporary:
             path=Path(temporary)/"cinder-sensitive.json"
             path.write_text(json.dumps(payload),encoding="utf-8")
             path.chmod(0o600)
             summaries,sensitive=control._load_cinder_sensitive_evidence(path,"source")
-            self.assertEqual("rbd",summaries[volume_id]["backend_kind"])
+            self.assertEqual("rbd",summaries[0]["backend_kind"])
             self.assertNotIn("connector-secret",json.dumps(summaries))
             self.assertIn("connector-secret",json.dumps(sensitive))
             path.chmod(0o644)
             with self.assertRaises(ValueError):
                 control._load_cinder_sensitive_evidence(path,"source")
+
+    def test_cinder_resource_identity_is_derived_and_multiattach_is_independent(self):
+        volume_id="22222222-2222-2222-2222-222222222222"
+        attachments=["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]
+        entries=[]
+        for index,attachment_id in enumerate(attachments):
+            entries.append({"evidence_id":f"cinder-sensitive-{index}","volume_id":volume_id,"attachment_id":attachment_id,"backend_kind":"rbd","backend_id":"rbd-backend","resource_identity":"volumes/volume-2","connector":{"attachment_id":attachment_id,"volume_id":volume_id,"host":f"compute-{index}"},"connection_info":{"driver_volume_type":"rbd","data":{"pool":"volumes","image":"volume-2"}}})
+        payload={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":entries}
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"multiattach.json"
+            path.write_text(json.dumps(payload),encoding="utf-8"); path.chmod(0o600)
+            summaries,_=control._load_cinder_sensitive_evidence(path,"source")
+            self.assertEqual(2,len(summaries))
+            self.assertEqual(set(attachments),{item["attachment_id"] for item in summaries})
+            self.assertTrue(all(item["resource_identity"]=="volumes/volume-2" and len(item["resource_fingerprint"])==64 for item in summaries))
+            forged=json.loads(json.dumps(payload)); forged["entries"][0]["resource_identity"]="attacker/forged"
+            path.write_text(json.dumps(forged),encoding="utf-8"); path.chmod(0o600)
+            with self.assertRaises(ValueError): control._load_cinder_sensitive_evidence(path,"source")
+            wrong=json.loads(json.dumps(payload)); wrong["entries"][0]["connector"]["attachment_id"]=attachments[1]
+            path.write_text(json.dumps(wrong),encoding="utf-8"); path.chmod(0o600)
+            with self.assertRaises(ValueError): control._load_cinder_sensitive_evidence(path,"source")
+
+    def test_nfs_and_lvm_resource_identity_are_derived_from_connection_data(self):
+        volume_id="22222222-2222-2222-2222-222222222222"
+        cases=[("nfs","/var/lib/nova/mnt/export/volume-2",{"driver_volume_type":"nfs","data":{"device_path":"/var/lib/nova/mnt/export/volume-2"}}),("lvm","cinder-volumes/volume-2",{"driver_volume_type":"lvm","data":{"volume_group":"cinder-volumes","logical_volume":"volume-2"}})]
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"derived.json"
+            for index,(kind,identity,connection) in enumerate(cases):
+                attachment=f"{index+1:08d}-aaaa-4aaa-8aaa-{index+1:012d}"
+                payload={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":[{"evidence_id":f"derived-{kind}","volume_id":volume_id,"attachment_id":attachment,"backend_kind":kind,"backend_id":f"{kind}-backend","resource_identity":identity,"connector":{"attachment_id":attachment,"volume_id":volume_id},"connection_info":connection}]}
+                path.write_text(json.dumps(payload),encoding="utf-8"); path.chmod(0o600)
+                summaries,_=control._load_cinder_sensitive_evidence(path,"source")
+                self.assertEqual(identity,summaries[0]["resource_identity"])
+
+    def test_multiattach_summaries_bind_each_attachment_node_independently(self):
+        volume="22222222-2222-2222-2222-222222222222"; backend="rbd-backend"
+        attachments=["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]
+        result=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume,"source",{"size":1,"storage_backend_id":backend}),ResourceNode("storage_backend",backend,"source"),*[ResourceNode("volume_attachment",item,"source",{"volume_id":volume,"connection_summary":{"driver_type":"rbd"}}) for item in attachments]],edges=[*[DependencyEdge(f"volume:{volume}",f"volume_attachment:{item}","has_attachment",True) for item in attachments],DependencyEdge(f"volume:{volume}",f"storage_backend:{backend}","has_backing_backend",True)])
+        fingerprint=hashlib.sha256(b"rbd:volumes/volume-2").hexdigest()
+        summaries=[{"volume_id":volume,"attachment_id":item,"evidence_id":f"evidence-{index}","backend_kind":"rbd","backend_id":backend,"resource_identity":"volumes/volume-2","resource_fingerprint":fingerprint} for index,item in enumerate(attachments)]
+        control._bind_cinder_connection_summaries(result,summaries)
+        attachment_nodes={node.id:node for node in result.nodes if node.kind=="volume_attachment"}
+        self.assertEqual(["evidence-0"],attachment_nodes[attachments[0]].evidence_ids)
+        self.assertEqual(["evidence-1"],attachment_nodes[attachments[1]].evidence_ids)
+        volume_node=next(node for node in result.nodes if node.kind=="volume")
+        self.assertEqual(["evidence-0","evidence-1"],volume_node.facts["connection_evidence_ids"])
+        self.assertEqual([],result.blockers)
+        incomplete=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume,"source",{"size":1,"storage_backend_id":backend}),ResourceNode("storage_backend",backend,"source"),*[ResourceNode("volume_attachment",item,"source",{"volume_id":volume,"connection_summary":{"driver_type":"rbd"}}) for item in attachments]],edges=[*[DependencyEdge(f"volume:{volume}",f"volume_attachment:{item}","has_attachment",True) for item in attachments],DependencyEdge(f"volume:{volume}",f"storage_backend:{backend}","has_backing_backend",True)])
+        control._bind_cinder_connection_summaries(incomplete,summaries[:1])
+        self.assertIn(f"Cinder protected attachment evidence missing: {attachments[1]}",incomplete.blockers)
+
+    def test_cinder_summary_backend_must_match_volume_graph(self):
+        volume="22222222-2222-2222-2222-222222222222"; attachment="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        expected_backend="rbd-backend"; unrelated_backend="other-backend"
+        result=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume,"source",{"size":1,"storage_backend_id":expected_backend}),ResourceNode("storage_backend",expected_backend,"source"),ResourceNode("storage_backend",unrelated_backend,"source"),ResourceNode("volume_attachment",attachment,"source",{"volume_id":volume,"connection_summary":{"driver_type":"rbd"}})],edges=[DependencyEdge(f"volume:{volume}",f"volume_attachment:{attachment}","has_attachment",True),DependencyEdge(f"volume:{volume}",f"storage_backend:{expected_backend}","has_backing_backend",True)])
+        fingerprint=hashlib.sha256(b"rbd:volumes/volume-2").hexdigest()
+        summary={"volume_id":volume,"attachment_id":attachment,"evidence_id":"evidence-0","backend_kind":"rbd","backend_id":unrelated_backend,"resource_identity":"volumes/volume-2","resource_fingerprint":fingerprint}
+        control._bind_cinder_connection_summaries(result,[summary])
+        self.assertIn(f"Cinder protected attachment evidence mismatch: {attachment}",result.blockers)
 
     def test_root_manifest_is_merged_before_recursive_api_closure(self):
         ids = {name: f"{index:08d}-1111-4111-8111-{index:012d}" for index, name in enumerate((
@@ -125,7 +185,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             "instances":[ids["instance"]],"ports":[ids["port"]],"networks":[ids["network"]],"subnets":[ids["subnet"]],
             "security_groups":[ids["security_group"]],"qos_policies":[ids["qos"]],"trunks":[ids["trunk"]],"floating_ips":[ids["floating"]],
             "routers":[ids["router"]],"address_groups":[ids["address_group"]],"volumes":[ids["volume"]],"volume_types":[ids["type"]],
-            "attachments":[ids["attachment"]],"snapshots":[ids["snapshot"]],"barbican_secrets":[ids["secret"]],"images":[ids["image"]],"flavors":[ids["flavor"]],
+            "attachments":[ids["attachment"]],"snapshots":[ids["snapshot"]],"images":[ids["image"]],"flavors":[ids["flavor"]],
         }
         calls = []
         class Client:
@@ -139,7 +199,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 elif command[:2] == ["server","show"]:
                     payload = {"id":ids["instance"],"flavor":{"id":ids["flavor"]},"image":{"id":ids["image"]}}
                 elif command[:2] == ["volume","show"]:
-                    payload = {"id":ids["volume"],"volume_type_id":ids["type"],"snapshot_id":ids["snapshot"],"attachments":[{"id":ids["attachment"]}]}
+                    payload = {"id":ids["volume"],"volume_type_id":ids["type"],"snapshot_id":ids["snapshot"],"encryption_key_id":ids["secret"],"attachments":[{"id":ids["attachment"]}]}
                 elif command[:3] == ["network","trunk","show"]:
                     payload = {"id":ids["trunk"],"sub_ports":[{"port_id":ids["child_port"]}]}
                 else:
@@ -193,6 +253,18 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         self.assertEqual({"id":[one]}, proof["filters"])
         missing, _ = client.db_records("ports", {"id":["33333333-3333-3333-3333-333333333333"]})
         self.assertEqual([], missing)
+
+    def test_db_cache_miss_is_typed_and_recorded(self):
+        port_id="33333333-3333-3333-3333-333333333333"
+        client=_CombinedClient("source",{"openstack":[],"roots":{"ports":[port_id]}},[],[])
+        rows,_=client.db_records("ports",{"id":[port_id]})
+        self.assertEqual([],rows)
+        self.assertEqual([{"schema":"neutron","table":"ports","filters":{"id":[port_id]}}],client.db_cache_misses)
+
+    def test_api_and_db_closure_misses_emit_distinct_unknown_checks(self):
+        checks=control._closure_checks("source",[["port","show","missing"]],[{"schema":"neutron","table":"ports","filters":{"id":["33333333-3333-3333-3333-333333333333"]}}])
+        self.assertEqual(["control.source.api-closure","control.source.db-closure"],[item["check_id"] for item in checks])
+        self.assertTrue(all(item["status"]=="UNKNOWN" for item in checks))
 
     def test_root_manifest_categories_are_canonical(self):
         valid = {"roots":{"hosts":["compute-023.example"],"ports":["11111111-1111-1111-1111-111111111111"]}}
@@ -277,13 +349,51 @@ class LiveDiscoveryCliTests(unittest.TestCase):
     def test_target_live_like_all_collectors_have_zero_cache_misses_and_real_evidence(self):
         manage=json.loads((ROOT/"tests/fixtures/live_discovery/openstack-command-results.json").read_text())["manage_outputs"]
         api={"openstack":[],"roots":{"ports":[],"volumes":[],"images":[],"projects":[]},"target_manage_outputs":manage,"target_image_inspects":{},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}]}
-        collectors,misses=control._compose_collectors("target",api,[],[],SchemaSnapshot(tables={}))
+        collectors,misses,db_misses=control._compose_collectors("target",api,[],[],SchemaSnapshot(tables={}))
         self.assertEqual([],misses)
+        self.assertEqual([],db_misses)
         self.assertEqual({"target-profile","runtime-capabilities","neutron","cinder","glance"},{item["service"] for item in collectors})
         index=control._build_evidence_index("target",collectors,api,[])
         identities={item["evidence_id"] for item in index}
         self.assertIn("runtime-target-virsh-version",identities)
         self.assertIn("nova-online-data-migrations",identities)
+
+    def test_nonempty_source_and_target_service_fixtures_execute_without_cache_misses(self):
+        from tests import test_live_discovery_nova as nova_test
+        from tests import test_live_discovery_neutron as neutron_test
+        from tests import test_live_discovery_cinder as cinder_test
+        from tests import test_live_discovery_glance as glance_test
+        from live_discovery.neutron import NeutronCollector
+        from live_discovery.cinder import CinderCollector
+        from live_discovery.glance import GlanceCollector
+        nova_fixture=json.loads((ROOT/"tests/fixtures/live_discovery/nova-source.json").read_text())
+        nova_result=nova_test.collect_from_fixture(nova_fixture,"compute-023","source")
+        self.assertTrue(any(node.kind=="instance" for node in nova_result.nodes)); self.assertEqual([],nova_result.blockers)
+        neutron_base=neutron_test.canonical_uuid_fixture(json.loads((ROOT/"tests/fixtures/live_discovery/neutron-ovs-source.json").read_text()))
+        cinder_base=cinder_test.canonical_fixture(json.loads((ROOT/"tests/fixtures/live_discovery/cinder-source.json").read_text()))
+        aliases={"image-1":"44444444-4444-4444-8444-444444444444","project-1":"77777777-7777-4777-8777-777777777777","project-2":"88888888-8888-4888-8888-888888888888"}
+        def replace(value):
+            if isinstance(value,str):
+                for old,new in aliases.items(): value=value.replace(old,new)
+                return value
+            if isinstance(value,list): return [replace(item) for item in value]
+            if isinstance(value,dict): return {key:replace(item) for key,item in value.items()}
+            return value
+        glance_base=replace(json.loads((ROOT/"tests/fixtures/live_discovery/glance-source.json").read_text()))
+        for side in ("source","target"):
+            neutron_fixture=deepcopy(neutron_base); neutron_fixture["side"]=side
+            neutron_client=neutron_test.FixtureClient(neutron_fixture)
+            neutron_result=NeutronCollector(neutron_client,side,neutron_test.schema_from_fixture(neutron_fixture)).collect([neutron_test.UUID_ALIASES["port-1"]])
+            self.assertEqual([],neutron_result.blockers); self.assertTrue(neutron_client.commands and neutron_client.queries and neutron_result.nodes and neutron_result.edges)
+            cinder_fixture=deepcopy(cinder_base); cinder_fixture["side"]=side
+            cinder_client=cinder_test.FixtureClient(cinder_fixture)
+            cinder_result=CinderCollector(cinder_client,side,cinder_test.schema_from_fixture(cinder_fixture)).collect([cinder_test.CANONICAL_IDS["volume-1"]])
+            self.assertEqual([],cinder_result.blockers); self.assertTrue(cinder_client.commands and cinder_client.queries and cinder_result.nodes and cinder_result.edges)
+            glance_fixture=deepcopy(glance_base); glance_fixture["side"]=side
+            glance_client=glance_test.FixtureClient(glance_fixture)
+            image_id=aliases["image-1"]
+            glance_result=GlanceCollector(glance_client,side).collect({image_id:{"required":True,"reason":"local_root","bdm_proves_no_local_root":False,"runtime_proves_no_local_root":False,"consumer_project_ids":[aliases["project-1"]]}})
+            self.assertEqual([],glance_result.blockers); self.assertTrue(glance_client.commands and glance_client.probes and glance_result.nodes and glance_result.edges)
     def test_task7_and_task8_probe_results_are_typed_and_handed_to_collectors(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
         image_id = "44444444-4444-4444-4444-444444444444"
@@ -300,12 +410,14 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 {"volume_id": volume_id, "scope": "target-storage", "kind": "vendor-san", "backend_identity":"rbd-backend","resource_identity":"vendor","expected_size":1073741824,"observed_size":None,"evidence_id":"storage:vendor", "status": "UNKNOWN", "reason": "storage driver is unsupported"},
             ],
         }
+        for item in api_result["storage_probe_results"]:
+            item["resource_fingerprint"] = hashlib.sha256(f"{item['kind']}:{item['resource_identity']}".encode()).hexdigest()
         client = _CombinedClient("source", api_result, [], [])
         capabilities, evidence = client.glance_store_capabilities("glance-source-store-capabilities")
         self.assertEqual("rbd", capabilities[0]["backend_type"])
         self.assertEqual("glance-source-store-capabilities", evidence["evidence_id"])
         self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
-        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source", {"size":1,"storage_backend_id":"rbd-backend","backend_kind":"nfs","resource_identity":"/srv/volume"})])
+        cinder = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume", volume_id, "source", {"size":1,"storage_backend_id":"rbd-backend","backend_kind":"nfs","resource_identity":"/srv/volume","resource_fingerprint":hashlib.sha256(b"nfs:/srv/volume").hexdigest(),"connection_evidence_ids":["connection-1"]})])
         _integrate_storage_readiness(cinder, [volume_id], api_result)
         self.assertTrue(all(any(f".{kind}." in check.check_id for check in cinder.checks) for kind in {"nfs", "rbd", "lvm", "vendor-san"}))
         self.assertIn("backing object probe is not bound to Cinder size and backend", cinder.blockers)
