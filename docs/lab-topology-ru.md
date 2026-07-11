@@ -15,7 +15,7 @@ Ansible, какие hosts указаны в inventory, какой host пере�
 | `target_reference_compute` | `os2-compute-01` | `192.168.10.78` | Эталонный compute CP-B, источник target Kolla configs |
 | `rehome_compute` | `os1-compute-02` | `192.168.10.74` | Compute host, который переносится между control planes |
 | VM | `os1-vm-100` | `192.168.10.100` | ВМ, которая должна оставаться running и доступной по сети |
-| NFS/Cinder | NFS server | `192.168.10.80` | Backend Cinder volume для ВМ |
+| NFS/Cinder | NFS server | `192.168.10.80` | Только профиль текущего lab: backend Cinder volume для ВМ |
 
 ## Состояние до re-home
 
@@ -113,6 +113,29 @@ Neutron metadata. Для OVS нужно сохранить/нормализов�
 levels, MAC и fixed IP, иначе target Neutron может видеть port через API, но
 dataplane агент получит "port is not bound".
 
+## Live discovery на этой топологии
+
+Перед DB import/cutover Ansible runner выполняет
+`playbooks/02b-discover-live-resource-graph.yml` через семь plays:
+
+- source API/schema/UUID-scoped DB — на `source_control`;
+- target API/schema/DB — на `target_control`;
+- domain/OVS runtime — на `rehome_compute`;
+- target libvirt/QEMU capability — на `target_reference_compute`;
+- source Cinder probe — на `os1-compute-02`;
+- target Cinder probe — на `os2-ctrl-01` для конкретного lab profile;
+- HMAC verification, assembly и artifacts — на Ansible runner.
+
+Подробная схема: [Поток live discovery](live-discovery-data-flow-ru.md).
+Финальный набор: [Артефакты live discovery](live-discovery-artifacts-ru.md).
+
+NFS — только профиль текущего lab, а не ограничение решения. Typed backend map
+поддерживает read-only probes для NFS/file, RBD и LVM. iSCSI, Fibre Channel и
+vendor backend остаются явными `UNKNOWN` без отдельного reviewed read-only
+probe. При переносе в другую инфраструктуру нужно заменить не только path, но
+и `kind`, оба delegate, scopes и probe template в
+`live_discovery_storage_backends`.
+
 ## Что менять при переносе в другую инфраструктуру
 
 В `inventory/lab-os1-to-os2.yml` заменить:
@@ -124,7 +147,9 @@ dataplane агент получит "port is not bound".
 - target image tags и base distro;
 - `runtime_guard_probe_targets`;
 - source-only services, которых нет в target cluster;
-- Cinder/NFS metadata normalizations, если storage backend отличается.
+- Cinder metadata normalizations и весь `live_discovery_storage_backends`, если
+  storage backend отличается; не сохранять NFS assumption для RBD/LVM/SAN.
 
-Перед адаптацией inventory обязательно пройти `operator-inputs-ru.md`: там
-перечислены входные секреты, clouds/configs, DB prerequisites и guardrails.
+Перед адаптацией inventory обязательно пройти
+[входные данные оператора](../operator-inputs-ru.md): там перечислены входные
+секреты, clouds/configs, DB prerequisites и guardrails.

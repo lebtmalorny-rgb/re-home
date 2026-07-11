@@ -115,49 +115,59 @@ OVS dataplane и storage helpers.
 
 ### `02b-discover-live-resource-graph.yml`
 
-- **Где выполняется:** `localhost`, ровно по одному узлу из
-  `source_control`, `target_control`, `rehome_compute` и
-  `target_reference_compute`; storage/Glance probes делегируются только на
-  явно заданные source/target probe hosts.
-- **Назначение:** собрать read-only resource graph и readiness verdict по
-  данным живых source/target кластеров перед переносом узла. SQL dump не
-  является источником данных; Masakari/DRS не собираются.
-- **Что читает:** OpenStack API, UUID-scoped `SELECT` из Nova/Neutron/Cinder,
-  `information_schema`, согласованные release labels/tags и container image
-  digests, libvirt/QEMU,
-  OVS/OVN, Cinder backing storage и один байт Glance image data.
-- **Порядок:** первые controller plays формируют API/schema/DB evidence;
-  compute plays собирают runtime и реальные target capabilities; шестой play
-  выполняет protected storage/Glance probes, обновляет HMAC-связанные phase
-  artifacts и только затем запускает source/target combine; седьмой play
-  вызывает локальный assembler.
-- **Что меняет:** только run-local каталоги и artifacts. Все probe/version/
-  inspect/DB команды имеют `changed_when: false`; SQL валидируется как
-  SELECT-only. Credentials, HMAC key, Glance token, probe/capability configs,
-  raw Cinder evidence и опциональное timestamped evidence уже выполненных
-  Nova/Cinder online migrations имеют режим `0600`. Migration envelope также
-  фиксирует live revisions Nova API/cell, Neutron heads, Cinder и Glance;
-  профиль Epoxy подтверждается только при точном совпадении revisions и
-  `completed=true` для свежего evidence. Входные байты один раз
-  фиксируются под sibling owner-lock `.control/owners/<run-id>`; caller paths
-  после этого повторно не читаются. Owner-lock проверяется по случайному token;
-  failure и unreachable на любом последующем play удаляют только собственный
-  незавершённый lock, а success сохраняет `completed` marker без secret bytes.
-  Сам playbook online migrations не запускает.
-- **Artifacts:**
-  `{{ local_artifact_dir }}/live-discovery/<run-id>/readiness-report.json` и
-  companion JSON/YAML/Markdown evidence artifacts.
-- **Guard:** inventory roles должны быть singleton; run ID и protected inputs
-  проверяются до построения путей; generic storage backend остаётся пустым и
-  даёт `UNKNOWN`, пока не задан read-only профиль. NFS не является обязательным:
-  read-only size probes реализованы для NFS/file, RBD и LVM; iSCSI, Fibre
-  Channel и иные Cinder/vendor drivers сохраняются в типизированном evidence,
-  но без явно реализованного безопасного probe template дают `UNKNOWN`. Exit
-  code assembler, отличный от
-  `0` (`UNKNOWN`/`BLOCKED`), завершает playbook ошибкой.
-  Runtime collector rc `2` является семантическим verdict: artifact сначала
-  проверяется тем же контрактом, что использует assembler, затем итоговый
-  `BLOCKED/UNKNOWN` формируется локальным assembler. Иные rc аварийны.
+- **Где выполняется:** семь plays в строгом порядке: `localhost`,
+  `source_control`, `target_control`, `rehome_compute`,
+  `target_reference_compute`, снова `localhost` для probe/combine и
+  `localhost` для assembly. Каждая inventory role — singleton. Storage/Glance
+  probes делегируются только на host из `live_discovery_storage_backends`; при
+  пустой карте стороны используют controller и storage readiness остаётся
+  `UNKNOWN`.
+- **Назначение:** обязательный read-only gate перед любым DB import/cutover.
+  Он строит graph по живому source `keystack-2025.1` и canonical target
+  `vanilla-openstack-2025.1-epoxy`. SQL dump не является источником данных и
+  может быть только fixture. Masakari/DRS исключены.
+- **Порядок фаз:** первая подписанная `--phase api` определяет roots и UUID
+  filters. Публичная `--phase verify` сверяет HMAC, API/filter/plan envelopes,
+  live `information_schema`, exact query coverage, SQL и plan digest до записи
+  SQL: это verify-before-SQL. Только `verified-plan.json` позволяет выполнить
+  UUID-scoped SELECT/JSONL. После runtime/capability и storage/Glance probes
+  HMAC-bound phase triplets возвращаются контроллерам; `--phase combine`
+  вызывает реальные Nova/Neutron/Cinder/Glance collectors. Последний play
+  запускает local assembler.
+- **Что читает:** OpenStack API; `information_schema`; scoped SELECT Nova,
+  Neutron, Cinder; libvirt/QEMU и OVS/OVN; target image refs/digests/revisions;
+  Cinder backing object; Glance `Range: bytes=0-0`. Source roots выводятся из
+  live API, операторский/dump-backed root manifest отсутствует.
+- **Что меняет:** только owned remote/local staging и artifacts. OpenStack/SQL
+  state, services и data не меняются. Все probe-команды имеют
+  `changed_when: false`; исключение — создание/завершение собственного
+  owner-lock. `online_data_migrations` не запускаются. Опциональный свежий
+  migration evidence только доказывает ранее выполненную оператором проверку и
+  exact Nova/Neutron/Cinder/Glance revisions.
+- **Защита:** HMAC key, clouds/passwords, probe configs, source/target Glance
+  tokens, optional Cinder/migration evidence — caller-owned regular files mode
+  `0600`. Source и target tokens различны. Они один раз открываются без symlink,
+  замораживаются в owned boundary `0700`; raw values не попадают в normal
+  artifacts. На success frozen secrets удаляются и completed owner остаётся;
+  rescue/unreachable cleanup удаляет только собственный incomplete owner.
+  Concurrent run с тем же `run-id` отклоняется.
+- **Artifacts:** assembler атомарно публикует ровно
+  `resource-graph.json`, `resource-graph.yml`, `readiness-report.json`,
+  `readiness-report.md`, `schema-capabilities.json`, `schema-mapping.json`,
+  `uuid-filters.json`, `evidence-index.json`; опционально
+  `sensitive/evidence.json` (`0700`/`0600`). Промежуточные
+  `source-control.json`, `target-control.json`, `runtime.json` и phase files не
+  входят в финальный normal set.
+- **Verdict:** `READY=0`, `READY_WITH_WARNINGS=0`, `UNKNOWN=2`, `BLOCKED=3`.
+  Top-level play принимает только rc `0`. Runtime collector rc `2` допускается
+  как промежуточный semantic verdict только после contract validation; local
+  assembler сохраняет его как итоговый fail-closed `UNKNOWN/BLOCKED`.
+- **Storage:** NFS не обязателен. NFS/file, RBD и LVM имеют безопасные
+  read-only size probes; iSCSI, Fibre Channel и vendor drivers остаются
+  типизированными, но дают `UNKNOWN` без reviewed probe template.
+- **Документация:** [data flow](docs/live-discovery-data-flow-ru.md),
+  [artifacts](docs/live-discovery-artifacts-ru.md),
+  [operator inputs](operator-inputs-ru.md).
 
 ### `03-backup-databases.yml`
 

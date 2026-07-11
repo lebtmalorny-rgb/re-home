@@ -107,9 +107,114 @@ runtime ВМ. Это не только Masakari: на других класте�
 Если сервис не классифицирован, playbook не должен сам решать, что с ним делать.
 Оператор должен явно добавить его в одну из групп.
 
-## Первый реализованный шаг
+## Обязательный live discovery gate
 
-Сначала собрать host-scoped manifest по re-home host и ВМ. Это выполняется
+До старого manifest/schema/import пути нужно выполнить новый live gate:
+
+```bash
+cd /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible
+ansible-playbook -i inventory/lab-os1-to-os2.yml playbooks/02b-discover-live-resource-graph.yml
+```
+
+Для другого окружения заменить inventory, но не порядок. Живые source/target
+API, БД, compute runtime, target capability, Cinder backing и Glance store
+являются источником истины. Uploaded SQL/schema dump — только пример/fixture,
+не способ наполнить discovery. Source profile — `keystack-2025.1`; target
+принимается только при live proof `vanilla-openstack-2025.1-epoxy`.
+
+Playbook выполняет семь plays: local freeze/owner, source control, target
+control, re-home runtime, target reference capability, source/target probes и
+local assembly. API roots подписываются HMAC; `--phase verify` проверяет план и
+live schema до SQL (verify-before-SQL); затем выполняются только UUID-scoped
+SELECT и `--phase combine`. Masakari/DRS не входят в этот graph/verdict.
+
+### Preflight оператора
+
+Перед командой проверить:
+
+- в каждой из `source_control`, `target_control`, `rehome_compute`,
+  `target_reference_compute` ровно один host;
+- `rehome_host`, local/remote dirs, target profile, schema policy, storage map
+  и fail-closed flags совпадают на source/target controller;
+- clouds files, Kolla passwords, HMAC key, probe configs и два разных Glance
+  tokens принадлежат uid оператора, mode `0600`, не symlink;
+- HMAC key содержит 16..4096 bytes;
+- `live_discovery_source_glance_token_file_local` и
+  `live_discovery_target_glance_token_file_local` имеют разные checksums;
+- storage map отражает реальный backend, а не lab assumption;
+- все overrideable argv заданы YAML lists и не содержат shell
+  operators/mutations; playbook сам передаёт frozen config в
+  `argv_policy.py --config-json` до remote execution;
+- доступен writable `live_discovery_local_dir`, но каталога конкретного
+  `<run-id>` ещё нет;
+- опциональное online-migration evidence свежее (не старше 24 часов) и содержит
+  exact current revisions. Сам playbook `online_data_migrations` не запускает.
+
+Для NFS текущего lab используется map из inventory. Это не NFS-only решение:
+NFS/file, RBD и LVM имеют read-only size probes. iSCSI, Fibre Channel или
+vendor backend должны быть объявлены фактическим kind с
+`probe_template: unsupported` и дадут `UNKNOWN`, пока нет reviewed безопасного
+probe. Пустая `live_discovery_storage_backends: {}` также даёт `UNKNOWN`.
+
+### Где искать результат
+
+```text
+{{ local_artifact_dir }}/live-discovery/<run-id>/
+```
+
+Проверить `readiness-report.json`, `readiness-report.md`,
+`resource-graph.json`, `schema-mapping.json`, `uuid-filters.json` и
+`evidence-index.json`. Полный normal set содержит восемь файлов, перечисленных
+в [документе об артефактах](docs/live-discovery-artifacts-ru.md).
+
+```text
+READY=0
+READY_WITH_WARNINGS=0
+UNKNOWN=2
+BLOCKED=3
+```
+
+Продолжать к import/cutover можно только после rc `0` и инженерного review
+всех warnings. `UNKNOWN` запрещает продолжение: отсутствие probe/evidence не
+означает готовность.
+
+### Troubleshooting
+
+| Симптом | Проверка | Действие |
+| --- | --- | --- |
+| preflight до remote commands | singleton groups, controller variable equality, `0600`, file owner/size | исправить inventory/input; не обходить assert |
+| `another owner`/collision | `.control/owners/<run-id>` и completion marker | для rerun выбрать новый `run-id`; не удалять concurrent owner |
+| verify не создал SQL | HMAC, API/filter/plan binding, live `information_schema`, schema policy | повторить acquisition новым run ID после исправления; не запускать SQL вручную |
+| Cinder `UNKNOWN` | backend kind/delegate, protected attachment summary, backing identity/size | добавить reviewed NFS/file/RBD/LVM probe либо отдельный безопасный template для другого backend |
+| Glance `BLOCKED/UNKNOWN` | отдельный side token, catalog origin, store ID, size, Range response | исправить endpoint/access/store evidence; не отключать required image probe |
+| Neutron `BLOCKED` | required edge closure, segment tuple, ML2 binding/levels, OVS/OVN evidence | исправить metadata/runtime readiness до запуска target agent |
+| target profile `UNKNOWN` | official Kolla image repo/tag/digest/label, DB revisions, migration evidence | получить актуальное read-only evidence; не подменять profile inventory string |
+| unreachable/failure | owner marker и protected dirs | дать штатному rescue cleanup завершиться; проверить, что удалён только incomplete owner этого run |
+
+### Cleanup, rerun и concurrency
+
+Успех удаляет frozen HMAC/clouds/tokens/configs и сохраняет completed owner
+marker. Failure/unreachable запускает ownership-checked cleanup. Не выполнять
+ручной `rm -rf` для общего `live-discovery` или `.control/owners`: это может
+затронуть concurrent run. Если процесс был аварийно прерван, сначала сверить
+`run-id`, owner token/completion marker и отсутствие активного процесса; затем
+оформить отдельный cleanup по процедуре change management.
+
+Для повторного запуска использовать новый auto-generated ID (оставить
+`live_discovery_run_id: ""`) или новый явный ID. Нельзя «дополнить» старый
+partial run: final set записывается атомарно. Protected
+`sensitive/evidence.json` (`0700`/`0600`) хранить отдельно и удалить после
+минимально необходимого review/rollback window; обычные artifacts сохранять с
+inventory revision и change record.
+
+На текущем этапе репозиторий прошёл fixture/unit tests и Ansible
+`syntax-check`. Это не утверждение о выполненном live deployment: операторский
+запуск на конкретном кластере и review его evidence остаются обязательными.
+
+## Legacy manifest и последующие фазы
+
+Следующий старый шаг собирает host-scoped manifest по re-home host и ВМ. Он не
+заменяет `02b` и запускается только в согласованном общем порядке. Выполняется
 playbook-ом, helper-скрипты внутри него являются implementation detail:
 
 ```bash

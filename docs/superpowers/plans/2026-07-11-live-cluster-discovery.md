@@ -1319,7 +1319,12 @@ live_discovery_glance_range_probe_enabled: true
 live_discovery_fail_on_not_ready: true
 ```
 
-Lab inventory must set Kolla commands, `network_backend: ovs`, NFS backend kind and actual storage probe delegate. Generic inventory leaves backend kind empty so unsupported storage yields `UNKNOWN`.
+Lab inventory must set Kolla commands, `network_backend: ovs` and the actual
+typed storage backend map with source/target probe delegates. NFS is only the
+current lab example: NFS/file, RBD and LVM have read-only probes; iSCSI, Fibre
+Channel and vendor backends remain explicit `UNKNOWN` without a reviewed
+backend-specific probe. Generic inventory leaves the backend map empty, which
+also yields `UNKNOWN` for required storage evidence.
 
 - [ ] **Step 4: Implement four-play orchestration**
 

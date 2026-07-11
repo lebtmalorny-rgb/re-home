@@ -19,6 +19,196 @@ Playbook-и не должны угадывать параметры класте
 Если параметр неизвестен, re-home нужно остановить до выяснения. Нельзя
 подменять неизвестный параметр значением из lab-примера.
 
+Live discovery использует только факты живых кластеров. Приложенная schema/DB
+dump не является входом playbook-а: её можно использовать только как
+санитизированную fixture для unit tests. Approved source profile —
+`keystack-2025.1`; target должен быть доказан live evidence как
+`vanilla-openstack-2025.1-epoxy`.
+
+## Обязательные входы live discovery
+
+Точный entrypoint выполняется до любого DB import или cutover:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
+```
+
+Inventory должен содержать ровно по одному host в группах:
+
+```yaml
+source_control:
+target_control:
+rehome_compute:
+target_reference_compute:
+```
+
+Playbook не выбирает «первый» host из неоднозначной группы. Значения на
+`source_control` и `target_control` замораживаются и обязаны совпасть для
+`rehome_host`, local/remote dirs, profile, HMAC path, storage map, Range flag и
+fail-closed policy. Переменные `localhost` не заменяют controller authority.
+
+### Базовые переменные
+
+```yaml
+live_discovery_enabled: true
+live_discovery_run_id: ""
+live_discovery_target_profile: vanilla-openstack-2025.1-epoxy
+live_discovery_remote_dir: /var/tmp/openstack-rehome/live-discovery
+live_discovery_local_dir: /path/to/artifacts/compute-023/live-discovery
+live_discovery_schema_policy_file: /path/to/inventory/live-discovery-schema-policy.json
+live_discovery_glance_range_probe_enabled: true
+live_discovery_fail_on_not_ready: true
+```
+
+Пустой `live_discovery_run_id` создаёт ID из UTC microseconds и случайного
+suffix. Явный ID должен соответствовать
+`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` и быть новым. Concurrent или повторный
+запуск с тем же `run-id` останавливается owner-lock до remote reset. Для rerun
+использовать новый ID; не удалять чужой/completed owner вручную.
+
+### Clouds, БД и точные argv
+
+```yaml
+source_clouds_file_local: /secure/source/clouds.yaml
+target_clouds_file_local: /secure/target/clouds.yaml
+source_cloud_name: kolla-admin
+target_cloud_name: kolla-admin
+openstack_cli_container: kolla_toolbox
+
+live_discovery_kolla_passwords_file_local: /secure/kolla/passwords.yml
+live_discovery_schema_mysql_user: root
+live_discovery_schema_mysql_password_key: database_password
+live_discovery_db_service_credentials:
+  nova_api: {user: nova_api, password_key: nova_api_database_password}
+  nova: {user: nova, password_key: nova_database_password}
+  neutron: {user: neutron, password_key: neutron_database_password}
+  cinder: {user: cinder, password_key: cinder_database_password}
+```
+
+Для Kolla нужно задать argv как YAML lists, без shell-строк:
+
+```yaml
+live_discovery_mysql_json_argv:
+  - docker
+  - exec
+  - -e
+  - MYSQL_PWD={{ live_discovery_mysql_password }}
+  - -i
+  - mariadb
+  - mysql
+  - -u{{ live_discovery_mysql_user }}
+  - -h
+  - "{{ schema_compat_mysql_host }}"
+  - --batch
+  - --raw
+  - --skip-column-names
+live_discovery_mysql_environment: {}
+live_discovery_mysql_no_log: true
+live_discovery_nova_api_db_version_argv: [docker, exec, nova_api, nova-manage, api_db, version]
+live_discovery_nova_cell_db_version_argv: [docker, exec, nova_conductor, nova-manage, db, version]
+live_discovery_neutron_db_version_argv: [docker, exec, neutron_server, neutron-db-manage, current, --verbose]
+live_discovery_cinder_db_version_argv: [docker, exec, cinder_api, cinder-manage, db, version]
+live_discovery_container_inspect_argv_prefix: [docker, inspect]
+live_discovery_source_virsh_argv: [docker, exec, nova_libvirt, virsh]
+live_discovery_target_virsh_argv: [docker, exec, nova_libvirt, virsh]
+live_discovery_target_qemu_argv: [docker, exec, nova_libvirt, /usr/bin/qemu-system-x86_64]
+```
+
+`argv_policy.py` проверяет executable, container и разрешённый suffix до
+выполнения. Нельзя добавлять shell operators, mutation arguments или менять
+ожидаемый container. SQL строится самим collector, проходит `--phase verify`,
+привязывается к digest плана и выполняется только как UUID-scoped SELECT.
+
+В `group_vars/all.yml` пока также присутствуют строковые compatibility defaults
+`live_discovery_mysql_json_command`, `live_discovery_target_virsh_command` и
+`live_discovery_target_qemu_command`. Семиплейный orchestration использует
+только безопасные list variables `live_discovery_mysql_json_argv`,
+`live_discovery_target_virsh_argv` и `live_discovery_target_qemu_argv`; менять
+строковый default вместо соответствующего `*_argv` недостаточно.
+
+### Защищённые входы
+
+Все непустые caller files должны быть regular files владельца запускающего
+uid, без symlink, с mode `0600` и допустимым размером:
+
+```yaml
+live_discovery_phase_hmac_key_file_local: /secure/live-discovery/phase-hmac.key
+live_discovery_source_probe_config_file_local: /secure/live-discovery/source-probe.json
+live_discovery_target_probe_config_file_local: /secure/live-discovery/target-probe.json
+live_discovery_source_glance_token_file_local: /secure/live-discovery/source-glance.token
+live_discovery_target_glance_token_file_local: /secure/live-discovery/target-glance.token
+live_discovery_source_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_online_migration_evidence_file_local: ""
+```
+
+HMAC key — 16..4096 bytes. Probe JSON — не более 1 MiB; clouds/passwords и
+migration evidence — не более 1 MiB; Cinder sensitive evidence — не более
+8 MiB. Source и target Glance tokens должны быть отдельными файлами с разными
+checksums. Token value задаётся только через `token_file`/`token_env`, не
+встраивается в JSON. Root manifest не является операторским input: его выводит
+первая live source API phase.
+
+Inputs открываются один раз через `O_NOFOLLOW`, копируются в owned каталог
+`0700` как files `0600`, а caller paths больше не читаются. После успешного
+запуска frozen secret bytes удаляются; при failure/unreachable выполняется
+ownership-checked cleanup только текущего незавершённого run.
+
+Опциональный online-migration envelope имеет contract
+`openstack-rehome-online-migration-evidence/v1alpha1`, timestamp не старше 24
+часов, точные live revisions Nova API/cell, Neutron, Cinder, Glance и записи
+Nova/Cinder с `returncode: 0`, `completed: true`. Playbook никогда не запускает
+`nova-manage db online_data_migrations` или
+`cinder-manage db online_data_migrations`; он только проверяет заранее
+полученное operator evidence. Отсутствие/устаревание/несовпадение оставляет
+target capability в `UNKNOWN`/`BLOCKED`.
+
+### Карта backend-ов Cinder
+
+NFS не является обязательным. Единственный authority — plural map
+`live_discovery_storage_backends`. Для каждого entry нужны ровно `kind`, оба
+delegate, оба scope и template:
+
+```yaml
+live_discovery_storage_backends:
+  primary-rbd:
+    kind: rbd
+    source_delegate: compute-023
+    target_delegate: target-storage-01
+    allowed_scopes: [source-compute, target-storage]
+    probe_template: rbd
+```
+
+Поддержаны NFS/file (`probe_template: nfs`), RBD (`rbd`) и LVM (`lvm`). Для
+iSCSI, Fibre Channel и vendor backend указывать фактический `kind` и
+`probe_template: unsupported`: они остаются типизированным evidence, но дают
+`UNKNOWN`, пока не реализован и не reviewed отдельный read-only probe. Empty
+map `{}` разрешён generic inventory, но не доказывает storage readiness и
+поэтому также даёт `UNKNOWN`. В одной side phase все backend entries должны
+использовать одного explicit delegate.
+
+Probe configs имеют contract `openstack-rehome-probe-config/v1alpha1` и
+содержат `storage` плюс `glance`. Storage item обязан согласоваться с inventory
+по backend ID, kind и scope (`source-compute`/`target-storage`). Discovery не
+mount-ит NFS, не map-ит RBD, не активирует LV и не устанавливает iSCSI/FC
+session.
+
+### Итоговые verdict
+
+```text
+READY=0
+READY_WITH_WARNINGS=0
+UNKNOWN=2
+BLOCKED=3
+```
+
+`UNKNOWN` — fail-closed и запрещает дальнейший import/cutover. Точные файлы и
+retention описаны в
+[`docs/live-discovery-artifacts-ru.md`](docs/live-discovery-artifacts-ru.md),
+а Cinder/Glance детали — в
+[`cinder-rehome-readiness-ru.md`](cinder-rehome-readiness-ru.md) и
+[`glance-rehome-readiness-ru.md`](glance-rehome-readiness-ru.md).
+
 ## Inventory
 
 Минимальные группы Ansible:
@@ -33,6 +223,11 @@ target_control:
   hosts:
     target-ctrl-01:
       ansible_host: 10.1.0.11
+
+target_reference_compute:
+  hosts:
+    target-compute-01:
+      ansible_host: 10.1.1.21
 
 rehome_compute:
   hosts:
@@ -515,13 +710,23 @@ cutover.
 
 ## Минимальный checklist перед запуском
 
-- Inventory содержит `source_control`, `target_control`, `rehome_compute`.
+- Inventory содержит singleton `source_control`, `target_control`,
+  `rehome_compute`, `target_reference_compute`.
 - SSH/become работает на всех нужных hosts.
 - `rehome_host` совпадает с Nova host.
 - На re-home host есть running libvirt domains.
 - Runtime guard видит ВМ и может пинговать probe IP.
 - DB names проверены по service configs.
 - DB credentials дают доступ к `information_schema`.
+- Все обязательные live discovery protected inputs имеют owner uid, mode
+  `0600`, не являются symlink; source/target Glance tokens различаются.
+- `live_discovery_storage_backends` отражает реальные backend kinds и probe
+  delegates; пустая карта осознанно означает `UNKNOWN`.
+- `02b-discover-live-resource-graph.yml` завершился с `READY` или
+  `READY_WITH_WARNINGS`; восемь normal artifacts и evidence index проверены.
+- Cinder, Glance, Neutron и target Epoxy capability не содержат
+  `UNKNOWN`/`BLOCKED`; Masakari/DRS не ожидаются в графе.
+- Только после live discovery можно переходить к следующим пунктам.
 - `03a-check-db-schema-compat.yml` проходит.
 - `03b-normalize-schema-diff.yml` проходит или diff вручную классифицирован.
 - `04a-plan-target-api-prep.yml` сформировал target API prep report.

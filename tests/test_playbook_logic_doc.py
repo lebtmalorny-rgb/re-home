@@ -16,6 +16,16 @@ class PlaybookLogicDocTests(unittest.TestCase):
             with self.subTest(playbook=playbook):
                 self.assertIn(f"### `{playbook}`", text)
 
+    def test_live_discovery_section_matches_actual_orchestration(self):
+        text = DOC.read_text(encoding="utf-8")
+        section = text.split("### `02b-discover-live-resource-graph.yml`", 1)[1].split("\n### `", 1)[0]
+        for needle in (
+            "семь plays", "--phase api", "--phase verify", "--phase combine",
+            "verify-before-SQL", "source-control.json", "target-control.json",
+            "runtime.json", "READY_WITH_WARNINGS=0", "UNKNOWN=2", "BLOCKED=3",
+        ):
+            self.assertIn(needle, section)
+
 
 if __name__ == "__main__":
     unittest.main()
