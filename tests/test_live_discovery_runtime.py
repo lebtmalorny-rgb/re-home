@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery"
 
-from live_discovery.contract import CollectorResult, ResourceNode
+from live_discovery.contract import CollectorResult, DependencyEdge, ResourceNode
 from live_discovery.runtime import (
     FixtureRuntimeRunner,
     collect_runtime,
@@ -76,6 +76,41 @@ class RuntimeCollectorTests(unittest.TestCase):
         self.assertIn(f"volume:{volume_uuid}", targets)
         self.assertNotIn(f"volume:volume-{volume_uuid}", targets)
 
+    def test_non_uuid_volume_text_cannot_suppress_unmapped_disk_blocker(self):
+        fixture = deepcopy(self.fixture)
+        fixture["domains"][0]["disks"][0]["source"] = (
+            "cinder-volumes/volume-not-a-canonical-uuid"
+        )
+        fixture["domains"][0]["disks"][0].pop("serial", None)
+        runner = FixtureRuntimeRunner(fixture)
+        runner.allow_fixture_aliases = False
+
+        result = collect_runtime(runner, ["virsh"], "ovs")
+
+        self.assertIn(
+            "unmapped runtime disk: instance-0000002a/vda",
+            result.blockers,
+        )
+        self.assertNotIn(
+            "volume:volume-not-a-canonical-uuid",
+            {edge.target for edge in result.edges},
+        )
+
+    def test_noncanonical_uppercase_volume_uuid_is_not_accepted(self):
+        fixture = deepcopy(self.fixture)
+        volume_uuid = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+        fixture["domains"][0]["disks"][0]["source"] = f"volume-{volume_uuid}"
+        fixture["domains"][0]["disks"][0].pop("serial", None)
+        runner = FixtureRuntimeRunner(fixture)
+        runner.allow_fixture_aliases = False
+
+        result = collect_runtime(runner, ["virsh"], "ovs")
+
+        self.assertIn(
+            "unmapped runtime disk: instance-0000002a/vda",
+            result.blockers,
+        )
+
     def test_truncated_tap_name_does_not_invent_port_id(self):
         fixture = deepcopy(self.fixture)
         fixture["domains"][0]["interfaces"][0]["target"] = "tap33333333-33"
@@ -107,6 +142,30 @@ class RuntimeCollectorTests(unittest.TestCase):
         self.assertNotIn("secret-uuid", serialized)
         self.assertIn("[REDACTED]", serialized)
 
+    def test_dumpxml_graphics_password_and_auth_values_are_redacted(self):
+        class CredentialXmlRunner(FixtureRuntimeRunner):
+            def _domain_xml(self, domain):
+                xml = super()._domain_xml(domain)
+                return xml.replace(
+                    "</devices>",
+                    '<graphics type="vnc" passwd="graphics-password" token="vnc-token"/>'
+                    '<auth username="chap-user"><secret type="ceph" uuid="auth-secret"/>'
+                    "chap-password</auth></devices>",
+                )
+
+        result = collect_runtime(CredentialXmlRunner(self.fixture), ["virsh"], "ovs")
+
+        serialized = json.dumps(result.to_dict())
+        for sensitive in (
+            "graphics-password",
+            "vnc-token",
+            "chap-user",
+            "auth-secret",
+            "chap-password",
+        ):
+            self.assertNotIn(sensitive, serialized)
+        self.assertIn("[REDACTED]", serialized)
+
     def test_runtime_issues_only_prescribed_read_only_commands(self):
         runner = FixtureRuntimeRunner(self.fixture)
 
@@ -135,10 +194,100 @@ class RuntimeCollectorTests(unittest.TestCase):
                 "source",
             )
         )
+        nova.edges.extend(
+            [
+                DependencyEdge(
+                    "instance:11111111-1111-1111-1111-111111111111",
+                    "volume:volume-1",
+                    "uses_volume",
+                    True,
+                ),
+                DependencyEdge(
+                    "instance:11111111-1111-1111-1111-111111111111",
+                    "port:port-1",
+                    "uses_port",
+                    True,
+                ),
+            ]
+        )
 
         checks = compare_runtime_to_nova(runtime, nova)
 
-        self.assertEqual(["PASS"], [item.status for item in checks])
+        self.assertEqual(3, len(checks))
+        self.assertTrue(all(item.status == "PASS" for item in checks))
+
+    def test_runtime_nova_roots_block_missing_and_extra_ports_and_volumes(self):
+        instance_uuid = "11111111-1111-1111-1111-111111111111"
+        domain = ResourceNode(
+            "libvirt_domain",
+            "instance-0000002a",
+            "source",
+            {"instance_uuid": instance_uuid},
+        )
+        runtime = CollectorResult(service="runtime", side="source", nodes=[domain])
+        runtime.edges.extend(
+            [
+                DependencyEdge(domain.key, "runtime_disk:disk-1", "has_runtime_disk", True),
+                DependencyEdge("runtime_disk:disk-1", "volume:volume-extra", "maps_to_volume", True),
+                DependencyEdge(domain.key, "runtime_interface:tap-1", "has_runtime_interface", True),
+                DependencyEdge("runtime_interface:tap-1", "port:port-extra", "maps_to_port", True),
+            ]
+        )
+        nova = CollectorResult(
+            service="nova",
+            side="source",
+            nodes=[ResourceNode("instance", instance_uuid, "source")],
+            edges=[
+                DependencyEdge(f"instance:{instance_uuid}", "volume:volume-missing", "uses_volume", True),
+                DependencyEdge(f"instance:{instance_uuid}", "port:port-missing", "uses_port", True),
+            ],
+        )
+
+        checks = compare_runtime_to_nova(runtime, nova)
+        root_checks = {item.check_id: item for item in checks if "roots" in item.check_id}
+
+        self.assertEqual("BLOCKED", root_checks[f"runtime.nova-roots.{instance_uuid}.volume"].status)
+        self.assertIn("missing runtime=['volume:volume-missing']", root_checks[f"runtime.nova-roots.{instance_uuid}.volume"].reason)
+        self.assertIn("extra runtime=['volume:volume-extra']", root_checks[f"runtime.nova-roots.{instance_uuid}.volume"].reason)
+        self.assertEqual("BLOCKED", root_checks[f"runtime.nova-roots.{instance_uuid}.port"].status)
+        self.assertIn("missing runtime=['port:port-missing']", root_checks[f"runtime.nova-roots.{instance_uuid}.port"].reason)
+        self.assertIn("extra runtime=['port:port-extra']", root_checks[f"runtime.nova-roots.{instance_uuid}.port"].reason)
+
+    def test_domain_uses_volume_does_not_replace_runtime_disk_mapping(self):
+        instance_uuid = "11111111-1111-1111-1111-111111111111"
+        domain = ResourceNode(
+            "libvirt_domain",
+            "instance-0000002a",
+            "source",
+            {"instance_uuid": instance_uuid},
+        )
+        runtime = CollectorResult(
+            service="runtime",
+            side="source",
+            nodes=[domain],
+            edges=[
+                DependencyEdge(domain.key, "volume:volume-1", "uses_volume", True),
+            ],
+        )
+        nova = CollectorResult(
+            service="nova",
+            side="source",
+            nodes=[ResourceNode("instance", instance_uuid, "source")],
+            edges=[
+                DependencyEdge(
+                    f"instance:{instance_uuid}",
+                    "volume:volume-1",
+                    "uses_volume",
+                    True,
+                ),
+            ],
+        )
+
+        checks = compare_runtime_to_nova(runtime, nova)
+        volume_check = next(item for item in checks if item.check_id.endswith(".volume"))
+
+        self.assertEqual("BLOCKED", volume_check.status)
+        self.assertIn("missing runtime=['volume:volume-1']", volume_check.reason)
 
     def test_runtime_domain_missing_from_nova_is_blocked(self):
         runtime = collect_from_fixture(self.fixture)
@@ -264,6 +413,22 @@ class RuntimeCollectorTests(unittest.TestCase):
         )
         self.assertIn("pc-i440fx-rhel7.6.0", result.checks[0].resource_ids)
         self.assertIn("virtio", result.checks[1].resource_ids)
+
+    def test_target_capabilities_include_non_pc_qemu_machine_types(self):
+        fixture = deepcopy(self.fixture)
+        fixture["side"] = "target"
+        fixture["virsh_version"] = "Compiled against library: libvirt 11.0.0\n"
+        fixture["target_machine_types"] = ["microvm", "virt"]
+        fixture["target_disk_buses"] = ["virtio"]
+
+        result = collect_target_capabilities(
+            FixtureRuntimeRunner(fixture),
+            ["virsh"],
+            ["qemu-system-x86_64"],
+        )
+
+        self.assertIn("microvm", result.checks[0].resource_ids)
+        self.assertIn("virt", result.checks[0].resource_ids)
 
     def test_source_disk_bus_missing_on_target_is_blocker(self):
         checks = compare_disk_buses(["virtio", "scsi"], ["virtio"])

@@ -11,6 +11,20 @@ from .runner import CommandEvidence, ProbeFailed
 
 _VOLUME_ID = re.compile(r"(?:^|[/_.:-])(volume-[A-Za-z0-9-]+)(?:$|[/_.:-])")
 _PORT_PREFIXES = ("tap", "qvo", "qvb", "qr-", "qg-", "vhu")
+_SENSITIVE_XML_NAMES = {
+    "auth", "authentication", "chap", "connection", "connection_data",
+    "connection_info", "key", "passwd", "password", "secret", "token",
+}
+
+
+def _sensitive_xml_name(name: str) -> bool:
+    normalized = name.rsplit("}", 1)[-1].lower().replace("-", "_")
+    if normalized in _SENSITIVE_XML_NAMES:
+        return True
+    return any(
+        marker in normalized
+        for marker in ("password", "passwd", "secret", "token", "chap", "connection")
+    ) or normalized.startswith("key_") or normalized.endswith("_key")
 
 
 def _ovs_atom(value: object) -> object:
@@ -56,12 +70,16 @@ def _redact_xml_secrets(xml_text: str) -> str:
     except ET.ParseError:
         return "[REDACTED INVALID DOMAIN XML]"
     for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "secret":
+        if _sensitive_xml_name(element.tag):
+            element.attrib.clear()
+            element.text = "[REDACTED]"
+            element.tail = None
+            for child in list(element):
+                element.remove(child)
             continue
-        element.attrib.clear()
-        element.text = "[REDACTED]"
-        for child in list(element):
-            element.remove(child)
+        for attribute in list(element.attrib):
+            if _sensitive_xml_name(attribute):
+                element.attrib[attribute] = "[REDACTED]"
     return ET.tostring(root, encoding="unicode")
 
 
@@ -76,7 +94,12 @@ def _evidence_dict(
     return payload
 
 
-def _volume_id(source: object, serial: object = None) -> Optional[str]:
+def _volume_id(
+    source: object,
+    serial: object = None,
+    *,
+    allow_fixture_aliases: bool = False,
+) -> Optional[str]:
     for candidate in (serial, source):
         if not isinstance(candidate, str):
             continue
@@ -86,7 +109,11 @@ def _volume_id(source: object, serial: object = None) -> Optional[str]:
         match = _VOLUME_ID.search(f"/{candidate}/")
         if match:
             backend_name = match.group(1)
-            return _canonical_uuid(backend_name.removeprefix("volume-")) or backend_name
+            canonical = _canonical_uuid(backend_name.removeprefix("volume-"))
+            if canonical:
+                return canonical
+            if allow_fixture_aliases and re.fullmatch(r"volume-[0-9]+", backend_name):
+                return backend_name
     return None
 
 
@@ -94,9 +121,10 @@ def _canonical_uuid(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
     try:
-        return str(uuid.UUID(value))
+        canonical = str(uuid.UUID(value))
     except ValueError:
         return None
+    return canonical if value == canonical else None
 
 
 def _port_reference(value: object) -> Optional[str]:
@@ -383,7 +411,13 @@ def collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult:
                 continue
             xml_disk = xml_disks.get(target, {}) if isinstance(xml_disks, Mapping) else {}
             source = disk.get("source") or xml_disk.get("source")
-            volume_id = _volume_id(source, xml_disk.get("serial"))
+            volume_id = _volume_id(
+                source,
+                xml_disk.get("serial"),
+                allow_fixture_aliases=bool(
+                    getattr(runner, "allow_fixture_aliases", False)
+                ),
+            )
             disk_node = ResourceNode(
                 "runtime_disk",
                 f"{domain_name}/{target}",
@@ -536,6 +570,52 @@ def compare_runtime_to_nova(
                 + ([f"instance:{instance_uuid}"] if present else []),
             )
         )
+        if not present:
+            continue
+
+        instance_key = f"instance:{instance_uuid}"
+        runtime_children = {
+            edge.target
+            for edge in runtime_result.edges
+            if edge.source == domain.key
+            and edge.relation in {"has_runtime_disk", "has_runtime_interface"}
+        }
+        for dependency_kind in ("volume", "port"):
+            nova_relation = f"uses_{dependency_kind}"
+            runtime_relation = f"maps_to_{dependency_kind}"
+            prefix = f"{dependency_kind}:"
+            nova_targets = {
+                edge.target
+                for edge in nova_result.edges
+                if edge.source == instance_key
+                and edge.relation == nova_relation
+                and edge.target.startswith(prefix)
+            }
+            runtime_targets = {
+                edge.target
+                for edge in runtime_result.edges
+                if edge.source in runtime_children
+                and edge.relation == runtime_relation
+                and edge.target.startswith(prefix)
+            }
+            missing = sorted(nova_targets - runtime_targets)
+            extra = sorted(runtime_targets - nova_targets)
+            blocked = bool(missing or extra)
+            checks.append(
+                CheckResult(
+                    f"runtime.nova-roots.{instance_uuid}.{dependency_kind}",
+                    "BLOCKED" if blocked else "PASS",
+                    (
+                        f"{dependency_kind} roots differ: "
+                        f"missing runtime={missing}; extra runtime={extra}"
+                        if blocked
+                        else f"{dependency_kind} roots match: {sorted(nova_targets)}"
+                    ),
+                    resource_ids=sorted(
+                        {domain.key, instance_key, *nova_targets, *runtime_targets}
+                    ),
+                )
+            )
     for instance_uuid in sorted(running_nova_instances - runtime_instance_ids):
         checks.append(
             CheckResult(
@@ -555,7 +635,7 @@ def _machine_types(stdout: str) -> List[str]:
         if not values or values[0].lower() in {"supported", "name"}:
             continue
         candidate = values[0]
-        if candidate.startswith("pc") or candidate.startswith("q35"):
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", candidate):
             machine_types.append(candidate)
     return list(dict.fromkeys(machine_types))
 
@@ -630,6 +710,7 @@ class FixtureRuntimeRunner:
     def __init__(self, fixture: Mapping[str, object]) -> None:
         self.fixture = deepcopy(dict(fixture))
         self.side = str(self.fixture.get("side", "source"))
+        self.allow_fixture_aliases = True
         self.commands: List[List[str]] = []
 
     def run(self, argv, evidence_id, sensitive_stdout=False):
