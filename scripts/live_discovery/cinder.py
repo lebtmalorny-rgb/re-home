@@ -9,8 +9,8 @@ from .contract import CollectorResult, DependencyEdge, ResourceNode
 
 CORE_TABLES = ("volumes", "volume_attachment", "volume_types", "services")
 OPTIONAL_TABLES = (
-    "volume_type_extra_specs", "volume_type_qos_specs",
-    "quality_of_service_specs", "encryption", "snapshots",
+    "volume_type_extra_specs", "volume_type_projects", "volume_type_qos_specs",
+    "qos_specs", "quality_of_service_specs", "encryption", "snapshots",
     "volume_metadata", "volume_glance_metadata", "volume_admin_metadata",
     "groups",
 )
@@ -32,8 +32,10 @@ _TABLE_ID_FIELDS = {
     "volume_attachment": ("id", "volume_id", "instance_uuid"),
     "volume_types": ("id",),
     "volume_type_extra_specs": ("volume_type_id",),
+    "volume_type_projects": ("volume_type_id", "project_id"),
     "volume_type_qos_specs": ("volume_type_id", "qos_specs_id"),
-    "quality_of_service_specs": ("id",),
+    "qos_specs": ("id",),
+    "quality_of_service_specs": ("id", "specs_id"),
     "services": ("uuid",),
     "encryption": ("volume_type_id",),
     "snapshots": ("id", "volume_id", "group_snapshot_id"),
@@ -259,11 +261,13 @@ class CinderCollector:
         )
         types = self._db_rows("volume_types", {"id": type_ids}, result) if type_ids else []
         extra_specs = self._optional_rows("volume_type_extra_specs", {"volume_type_id": type_ids}, result)
+        type_projects = self._optional_rows("volume_type_projects", {"volume_type_id": type_ids}, result)
         type_qos = self._optional_rows("volume_type_qos_specs", {"volume_type_id": type_ids}, result)
         qos_ids = _dedupe(
             value for row in type_qos if (value := _row_id(row, "qos_specs_id")) is not None
         )
-        qos = self._optional_rows("quality_of_service_specs", {"id": qos_ids}, result)
+        qos_definitions = self._optional_rows("qos_specs", {"id": qos_ids}, result)
+        qos = self._optional_rows("quality_of_service_specs", {"specs_id": qos_ids}, result)
         service_ids = _dedupe(
             value for row in volume_rows
             if (value := _row_id(row, "service_uuid")) is not None
@@ -447,14 +451,37 @@ class CinderCollector:
                     type_facts["extra_specs"] = _safe_key_values([
                         item for item in extra_specs if _row_id(item, "volume_type_id") == type_id
                     ])
+                    type_facts["project_ids"] = sorted({
+                        project_id for item in type_projects
+                        if _row_id(item, "volume_type_id") == type_id
+                        and not _is_deleted(item)
+                        and (project_id := _row_id(item, "project_id")) is not None
+                    })
                     type_qos_ids = {
                         _row_id(item, "qos_specs_id") for item in type_qos
                         if _row_id(item, "volume_type_id") == type_id
                     }
-                    type_facts["qos_specs"] = [
-                        _allowlisted(item, ("id", "name", "consumer"))
-                        for item in qos if _row_id(item, "id") in type_qos_ids
-                    ]
+                    qos_definition_rows = {
+                        _row_id(item, "id"): item
+                        for item in qos_definitions if not _is_deleted(item)
+                    }
+                    type_facts["qos_specs"] = []
+                    for qos_id in sorted(value for value in type_qos_ids if value):
+                        definition = qos_definition_rows.get(qos_id)
+                        if definition is None:
+                            result.blockers.append(
+                                f"required QoS definition missing: {qos_id}"
+                            )
+                            continue
+                        qos_facts = _allowlisted(
+                            definition, ("id", "name", "consumer")
+                        )
+                        qos_facts["specifications"] = _safe_key_values([
+                            item for item in qos
+                            if _row_id(item, "specs_id") == qos_id
+                            and not _is_deleted(item)
+                        ])
+                        type_facts["qos_specs"].append(qos_facts)
                     encryption_rows = [item for item in encryptions if _row_id(item, "volume_type_id") == type_id]
                     type_facts["encryption"] = [
                         _allowlisted(item, ("provider", "control_location", "key_size"))

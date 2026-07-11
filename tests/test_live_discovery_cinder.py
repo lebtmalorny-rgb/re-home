@@ -76,7 +76,10 @@ def collect_from_fixture(fixture, volume_ids=("volume-1",), failures=None):
 CANONICAL_IDS = {
     name: f"10000000-0000-0000-0000-{index:012d}"
     for index, name in enumerate(
-        ("volume-1", "attachment-1", "type-1", "service-1", "key-1", "instance-1", "qos-1", "snapshot-1"),
+        (
+            "volume-1", "attachment-1", "type-1", "service-1", "key-1",
+            "instance-1", "qos-1", "qos-row-1", "project-1", "snapshot-1",
+        ),
         start=1,
     )
 }
@@ -119,6 +122,24 @@ class CinderCollectorTests(unittest.TestCase):
             targets,
         )
         self.assertEqual([], result.blockers)
+
+    def test_volume_type_includes_project_visibility_and_qos_values(self):
+        result, client = collect_from_fixture(self.source_fixture)
+        volume_type = next(node for node in result.nodes if node.kind == "volume_type")
+        self.assertEqual(["project-1"], volume_type.facts["project_ids"])
+        self.assertEqual(
+            [{
+                "id": "qos-1",
+                "name": "gold",
+                "consumer": "both",
+                "specifications": [{"key": "read_iops_sec", "value": "1000"}],
+            }],
+            volume_type.facts["qos_specs"],
+        )
+        self.assertIn(
+            ("quality_of_service_specs", {"specs_id": ["qos-1"]}),
+            client.queries,
+        )
 
     def test_missing_encryption_key_uuid_is_blocker(self):
         fixture = deepcopy(self.source_fixture)
