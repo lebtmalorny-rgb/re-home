@@ -315,6 +315,94 @@ class LiveDiscoveryGraphTests(unittest.TestCase):
             for item in graph["assembly_checks"]
         ))
 
+    def test_unhashable_check_status_is_blocked_in_assembly_and_validation(self):
+        graph = assemble_graph([collector(
+            checks=[CheckResult("bad", [], "bad")]
+        )])
+        self.assertTrue(any(
+            item["reason"] == "check payload is malformed"
+            for item in graph["assembly_checks"]
+        ))
+
+        valid = assemble_graph([collector(
+            checks=[CheckResult("nova.source.ready", "PASS", "ready")]
+        )])
+        valid["checks"][0]["status"] = []
+        checks = validate_graph(valid)
+        self.assertTrue(any(
+            item.status == "BLOCKED" and "stored graph check is malformed" in item.reason
+            for item in checks
+        ))
+
+    def test_secret_bearing_identifiers_are_omitted_in_every_graph_position(self):
+        sentinel = "secret-token"
+        cases = []
+        cases.append(CollectorResult(service=sentinel, side="source"))
+        cases.append(CollectorResult(service="nova", side=sentinel))
+        cases.append(collector(nodes=[ResourceNode(sentinel, "node-1", "source")]))
+        cases.append(collector(nodes=[ResourceNode("instance", sentinel, "source")]))
+        cases.append(collector(
+            nodes=[ResourceNode("instance", "vm-1", "source")],
+            edges=[DependencyEdge(sentinel, "instance:vm-1", "uses", True)],
+        ))
+        cases.append(collector(
+            nodes=[ResourceNode("instance", "vm-1", "source")],
+            edges=[DependencyEdge("instance:vm-1", sentinel, "uses", True)],
+        ))
+        cases.append(collector(
+            nodes=[ResourceNode("instance", "vm-1", "source")],
+            edges=[DependencyEdge("instance:vm-1", "instance:vm-1", sentinel, True)],
+        ))
+        cases.append(collector(checks=[CheckResult(sentinel, "BLOCKED", "blocked")]))
+        cases.append(collector(checks=[CheckResult(
+            "safe", "BLOCKED", "blocked", [sentinel], []
+        )]))
+        cases.append(collector(checks=[CheckResult(
+            "safe", "BLOCKED", "blocked", [], [sentinel]
+        )]))
+
+        for result in cases:
+            with self.subTest(result=result.service):
+                graph = assemble_graph([result])
+                self.assertNotIn(sentinel, json.dumps(graph, sort_keys=True))
+                self.assertTrue(any(
+                    item["status"] == "BLOCKED"
+                    for item in graph["assembly_checks"]
+                ))
+
+    def test_unknown_top_level_and_nested_graph_fields_are_blocked(self):
+        base = assemble_graph([collector(
+            nodes=[ResourceNode("instance", "vm-1", "source")],
+            edges=[DependencyEdge("instance:vm-1", "instance:vm-1", "self", False)],
+            checks=[CheckResult("nova.source.ready", "PASS", "ready")],
+        )])
+        mutations = []
+        top = deepcopy(base)
+        top["unknown"] = "secret-token"
+        mutations.append(top)
+        for section in ("nodes", "edges", "checks", "collectors"):
+            graph = deepcopy(base)
+            graph[section][0]["unknown"] = "secret-token"
+            mutations.append(graph)
+        provenance = deepcopy(base)
+        provenance["nodes"][0]["provenance"]["unknown"] = "secret-token"
+        mutations.append(provenance)
+        assembly_check = deepcopy(base)
+        assembly_check["assembly_checks"] = [{
+            **CheckResult("assembly", "BLOCKED", "blocked").to_dict(),
+            "unknown": "secret-token",
+        }]
+        mutations.append(assembly_check)
+
+        for graph in mutations:
+            with self.subTest():
+                checks = validate_graph(graph)
+                self.assertTrue(any(item.status == "BLOCKED" for item in checks))
+                self.assertNotIn(
+                    "secret-token",
+                    json.dumps([item.to_dict() for item in checks], sort_keys=True),
+                )
+
     def test_direct_graph_with_malformed_check_provenance_is_blocked(self):
         graph = assemble_graph([collector(
             checks=[CheckResult("nova.source.ready", "PASS", "ready")]

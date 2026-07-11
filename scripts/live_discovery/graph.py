@@ -37,13 +37,15 @@ _SIDES = frozenset({"source", "target"})
 _EXCLUDED_SERVICES = frozenset({"masakari", "drs"})
 _SAFE_IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
 _SENSITIVE_KEY = re.compile(
-    r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|chap|credential|"
+    r"password|passwd|(?:^|[_-])pwd(?:$|[_-])|token|secret|chap|credential|"
     r"connector|connection[_-]?(?:info|data)",
     flags=re.IGNORECASE,
 )
 _SENSITIVE_VALUE = re.compile(
-    r"(?:password|passwd|token|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
-    r"(?:authorization\s*:\s*(?:bearer|basic)\s+\S+)|"
+    r"(?:password|passwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
+    r"\bsecret[-_]?token\b|\b(?:password|passwd|credential)\b|"
+    r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
+    r"\bsk-[A-Za-z0-9_-]{8,}\b|"
     r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",
     flags=re.IGNORECASE,
 )
@@ -53,6 +55,25 @@ _MAX_TREE_DEPTH = 16
 _MAX_TREE_NODES = 20_000
 _MAX_STRING = 16_384
 
+_GRAPH_KEYS = frozenset({
+    "schema_version", "collectors", "nodes", "edges", "checks",
+    "assembly_checks", "graph_sha256",
+})
+_NODE_KEYS = frozenset({
+    "side", "kind", "id", "key", "facts", "evidence_ids", "provenance",
+})
+_EDGE_KEYS = frozenset({
+    "side", "source", "target", "relation", "required", "provenance",
+})
+_CHECK_KEYS = frozenset({
+    "check_id", "status", "reason", "resource_ids", "evidence_ids",
+})
+_STORED_CHECK_KEYS = frozenset({*_CHECK_KEYS, "provenance"})
+_COLLECTOR_KEYS = frozenset({
+    "service", "side", "node_count", "edge_count", "check_count",
+    "blocker_count", "unknown_count",
+})
+
 
 class _Malformed(ValueError):
     pass
@@ -61,6 +82,8 @@ class _Malformed(ValueError):
 def _identifier(value: object) -> str:
     if not isinstance(value, str) or _SAFE_IDENTIFIER.fullmatch(value) is None:
         raise _Malformed("identifier")
+    if _SENSITIVE_VALUE.search(value):
+        raise _Malformed("sensitive identifier")
     return value
 
 
@@ -203,7 +226,7 @@ def _check_candidate(
     check_id = _identifier(check.check_id)
     if _SENSITIVE_VALUE.search(check_id):
         raise _Malformed("sensitive check identity")
-    if check.status not in _STATUSES:
+    if not isinstance(check.status, str) or check.status not in _STATUSES:
         raise _Malformed("check status")
     reason = _safe_reason(check.reason, "collector check reason is malformed")
     resource_ids = _string_list(check.resource_ids)
@@ -407,9 +430,11 @@ def assemble_graph(results: Iterable[CollectorResult]) -> Dict[str, Any]:
 
 
 def _dict_check(value: Mapping[str, Any]) -> CheckResult:
+    if frozenset(value) not in {_CHECK_KEYS, _STORED_CHECK_KEYS}:
+        raise _Malformed("check keys")
     check_id = _identifier(value.get("check_id"))
     status = value.get("status")
-    if status not in _STATUSES:
+    if not isinstance(status, str) or status not in _STATUSES:
         raise _Malformed("check status")
     reason = _safe_reason(value.get("reason"), "graph check reason is malformed")
     return CheckResult(
@@ -435,6 +460,7 @@ def _external_reference_resolves(reference: str, relation: str) -> bool:
     reference_type, external_id = identifier.split("/", 1)
     return (
         bool(external_id)
+        and "/" not in external_id
         and reference_type in EXTERNAL_REFERENCE_POLICY
         and relation in EXTERNAL_REFERENCE_POLICY[reference_type]
     )
@@ -448,6 +474,16 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
         return [_validation_issue(
             "schema-malformed", "BLOCKED", "resource graph payload is malformed"
         )]
+
+    try:
+        if set(graph) != _GRAPH_KEYS:
+            issues.append(_validation_issue(
+                "schema-keys", "BLOCKED", "resource graph schema has unknown or missing fields"
+            ))
+    except (TypeError, ValueError):
+        issues.append(_validation_issue(
+            "schema-keys", "BLOCKED", "resource graph schema has unknown or missing fields"
+        ))
 
     try:
         if graph.get("schema_version") != GRAPH_VERSION:
@@ -471,7 +507,7 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
 
     for index, payload in enumerate(assembly_checks):
         try:
-            if not isinstance(payload, Mapping):
+            if not isinstance(payload, Mapping) or set(payload) != _CHECK_KEYS:
                 raise _Malformed("check mapping")
             issues.append(_dict_check(payload))
         except _Malformed:
@@ -481,7 +517,7 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
             ))
     for index, payload in enumerate(checks):
         try:
-            if not isinstance(payload, Mapping):
+            if not isinstance(payload, Mapping) or set(payload) != _STORED_CHECK_KEYS:
                 raise _Malformed("check mapping")
             provenance = payload.get("provenance")
             if not isinstance(provenance, Mapping):
@@ -503,12 +539,17 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
     node_keys = set()
     for index, node in enumerate(nodes):
         try:
-            if not isinstance(node, Mapping):
+            if not isinstance(node, Mapping) or set(node) != _NODE_KEYS:
                 raise _Malformed("node mapping")
             side = _identifier(node.get("side"))
             kind = _identifier(node.get("kind"))
             identifier = _identifier(node.get("id"))
-            if side not in _SIDES or node.get("key") not in {None, f"{kind}:{identifier}"}:
+            key_value = node.get("key")
+            if (
+                side not in _SIDES
+                or not isinstance(key_value, str)
+                or key_value != f"{kind}:{identifier}"
+            ):
                 raise _Malformed("node identity")
             _normalize_tree(node.get("facts", {}))
             _evidence_ids(node.get("evidence_ids", []))
@@ -528,7 +569,11 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
 
     for index, edge in enumerate(edges):
         try:
-            if not isinstance(edge, Mapping) or not isinstance(edge.get("required"), bool):
+            if (
+                not isinstance(edge, Mapping)
+                or set(edge) != _EDGE_KEYS
+                or not isinstance(edge.get("required"), bool)
+            ):
                 raise _Malformed("edge mapping")
             side = _identifier(edge.get("side"))
             source = _identifier(edge.get("source"))
@@ -569,7 +614,7 @@ def validate_graph(graph: Mapping[str, Any]) -> List[CheckResult]:
     empty_collectors = set()
     for index, record in enumerate(collectors):
         try:
-            if not isinstance(record, Mapping):
+            if not isinstance(record, Mapping) or set(record) != _COLLECTOR_KEYS:
                 raise _Malformed("collector record")
             side = _identifier(record.get("side"))
             service = _identifier(record.get("service"))

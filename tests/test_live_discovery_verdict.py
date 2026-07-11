@@ -14,11 +14,26 @@ from live_discovery.verdict import compute_verdict
 
 
 def clean_mapping():
+    column = {
+        "name": "id",
+        "ordinal": 1,
+        "column_type": "varchar(36)",
+        "nullable": False,
+        "default": None,
+        "extra": "",
+    }
     return {
         "schema_version": "openstack-rehome-directional-schema-mapping/v1alpha1",
-        "source_profile": "keystack",
+        "source_profile": "keystack-2025.1",
         "target_profile": "vanilla-openstack-2025.1-epoxy",
-        "tables": {},
+        "tables": {
+            "nova.instances": [{
+                "column": "id",
+                "classification": "COMMON_COMPATIBLE",
+                "source": deepcopy(column),
+                "target": deepcopy(column),
+            }],
+        },
         "blockers": [],
     }
 
@@ -91,16 +106,36 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
         for classification in ("BLOCKED", "SEMANTIC_MISMATCH", "TARGET_VALUE_REQUIRED"):
             with self.subTest(classification=classification):
                 mapping = clean_mapping()
-                mapping["tables"] = {
-                    "nova.instances": [{"column": "field", "classification": classification}]
-                }
+                source = deepcopy(mapping["tables"]["nova.instances"][0]["source"])
+                target = deepcopy(mapping["tables"]["nova.instances"][0]["target"])
+                source["name"] = target["name"] = "field"
+                if classification == "BLOCKED":
+                    target = None
+                elif classification == "SEMANTIC_MISMATCH":
+                    target["column_type"] = "bigint"
+                else:
+                    source = None
+                    target["default"] = None
+                    target["nullable"] = False
+                mapping["tables"] = {"nova.instances": [{
+                    "column": "field", "classification": classification,
+                    "source": source, "target": target,
+                }]}
+                mapping["blockers"] = ["nova.instances.field"]
                 verdict = compute_verdict(complete_graph(), [], mapping)
                 self.assertEqual("BLOCKED", verdict["verdict"])
 
     def test_reviewed_source_only_mapping_is_warning(self):
         mapping = clean_mapping()
+        source = deepcopy(mapping["tables"]["nova.instances"][0]["source"])
+        source["name"] = "vendor_field"
         mapping["tables"] = {
-            "nova.instances": [{"column": "vendor_field", "classification": "SOURCE_ONLY_IGNORED"}]
+            "nova.instances": [{
+                "column": "vendor_field",
+                "classification": "SOURCE_ONLY_IGNORED",
+                "source": source,
+                "target": None,
+            }]
         }
 
         verdict = compute_verdict(complete_graph(), [], mapping)
@@ -109,10 +144,11 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
 
     def test_duplicate_mapping_column_is_blocked(self):
         mapping = clean_mapping()
+        item = deepcopy(mapping["tables"]["nova.instances"][0])
         mapping["tables"] = {
             "nova.instances": [
-                {"column": "host", "classification": "COMMON_COMPATIBLE"},
-                {"column": "host", "classification": "NORMALIZATION_REQUIRED"},
+                item,
+                deepcopy(item),
             ]
         }
 
@@ -133,6 +169,67 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
         verdict = compute_verdict(complete_graph(), [], malformed)
         self.assertEqual("BLOCKED", verdict["verdict"])
         self.assertNotIn("do-not-leak", json.dumps(verdict, sort_keys=True))
+
+    def test_empty_mapping_evidence_is_unknown(self):
+        cases = ({}, {**clean_mapping(), "tables": {}}, {
+            **clean_mapping(), "tables": {"nova.instances": []},
+        })
+        for mapping in cases:
+            with self.subTest(mapping=mapping):
+                self.assertEqual(
+                    "UNKNOWN",
+                    compute_verdict(complete_graph(), [], mapping)["verdict"],
+                )
+
+    def test_wrong_mapping_profiles_are_blocked(self):
+        for field, value in (
+            ("source_profile", "keystack"),
+            ("target_profile", "other-target"),
+        ):
+            with self.subTest(field=field):
+                mapping = clean_mapping()
+                mapping[field] = value
+                self.assertEqual(
+                    "BLOCKED",
+                    compute_verdict(complete_graph(), [], mapping)["verdict"],
+                )
+
+    def test_mapping_rejects_unknown_keys_and_malformed_schema_columns(self):
+        mutations = []
+        top = clean_mapping()
+        top["unknown"] = "secret-token"
+        mutations.append(top)
+        item_unknown = clean_mapping()
+        item_unknown["tables"]["nova.instances"][0]["unknown"] = "secret-token"
+        mutations.append(item_unknown)
+        column_unknown = clean_mapping()
+        column_unknown["tables"]["nova.instances"][0]["source"]["unknown"] = "secret-token"
+        mutations.append(column_unknown)
+        typed = clean_mapping()
+        typed["tables"]["nova.instances"][0]["source"]["nullable"] = []
+        mutations.append(typed)
+        for mapping in mutations:
+            with self.subTest():
+                verdict = compute_verdict(complete_graph(), [], mapping)
+                self.assertEqual("BLOCKED", verdict["verdict"])
+                self.assertNotIn("secret-token", json.dumps(verdict, sort_keys=True))
+
+    def test_mapping_classification_must_match_column_presence_and_compatibility(self):
+        mapping = clean_mapping()
+        mapping["tables"]["nova.instances"][0]["classification"] = "SOURCE_ONLY_IGNORED"
+        verdict = compute_verdict(complete_graph(), [], mapping)
+        self.assertEqual("BLOCKED", verdict["verdict"])
+
+    def test_unhashable_mapping_classification_and_check_status_are_blocked(self):
+        mapping = clean_mapping()
+        mapping["tables"]["nova.instances"][0]["classification"] = []
+        mapping_verdict = compute_verdict(complete_graph(), [], mapping)
+        self.assertEqual("BLOCKED", mapping_verdict["verdict"])
+
+        checks_verdict = compute_verdict(
+            complete_graph(), [CheckResult("bad", [], "bad")], clean_mapping()
+        )
+        self.assertEqual("BLOCKED", checks_verdict["verdict"])
 
     def test_missing_duplicate_and_empty_required_collectors_are_unknown(self):
         for mutation in ("missing", "duplicate", "empty"):
@@ -197,6 +294,33 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
             "UNKNOWN", compute_verdict(assemble_graph(results), [], clean_mapping())["verdict"]
         )
 
+    def test_target_only_or_non_nova_instance_does_not_satisfy_source_root(self):
+        for side, service in (("target", "nova"), ("source", "cinder")):
+            with self.subTest(side=side, service=service):
+                results = []
+                for required_side, required_service in REQUIRED_COLLECTORS:
+                    nodes = [ResourceNode(
+                        f"{required_service}_evidence",
+                        f"{required_side}-{required_service}",
+                        required_side,
+                    )]
+                    checks = []
+                    if (required_side, required_service) == ("source", "nova"):
+                        checks.append(CheckResult("nova.source.ready", "PASS", "ready"))
+                    if (required_side, required_service) == (side, service):
+                        nodes.append(ResourceNode("instance", "instance-1", side))
+                    results.append(CollectorResult(
+                        service=required_service, side=required_side,
+                        nodes=nodes, checks=checks,
+                    ))
+                if (side, service) == ("target", "nova"):
+                    results.append(CollectorResult(
+                        service="nova", side="target",
+                        nodes=[ResourceNode("instance", "instance-1", "target")],
+                    ))
+                verdict = compute_verdict(assemble_graph(results), [], clean_mapping())
+                self.assertEqual("UNKNOWN", verdict["verdict"])
+
     def test_conflicting_duplicate_check_ids_block(self):
         checks = [
             CheckResult("same", "PASS", "one"),
@@ -215,8 +339,19 @@ class LiveDiscoveryVerdictTests(unittest.TestCase):
         ]
         mapping = clean_mapping()
         mapping["tables"] = {
-            "z.table": [{"column": "z", "classification": "NORMALIZATION_REQUIRED"}],
-            "a.table": [{"column": "a", "classification": "COMMON_COMPATIBLE"}],
+            "z.table": [{
+                **deepcopy(clean_mapping()["tables"]["nova.instances"][0]),
+                "column": "z",
+                "source": {**deepcopy(clean_mapping()["tables"]["nova.instances"][0]["source"]), "name": "z"},
+                "target": {**deepcopy(clean_mapping()["tables"]["nova.instances"][0]["target"]), "name": "z"},
+                "classification": "NORMALIZATION_REQUIRED",
+            }],
+            "a.table": [{
+                **deepcopy(clean_mapping()["tables"]["nova.instances"][0]),
+                "column": "a",
+                "source": {**deepcopy(clean_mapping()["tables"]["nova.instances"][0]["source"]), "name": "a"},
+                "target": {**deepcopy(clean_mapping()["tables"]["nova.instances"][0]["target"]), "name": "a"},
+            }],
         }
         reversed_mapping = deepcopy(mapping)
         reversed_mapping["tables"] = dict(reversed(list(mapping["tables"].items())))

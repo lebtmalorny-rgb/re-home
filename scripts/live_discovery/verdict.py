@@ -11,6 +11,7 @@ from .graph import _canonical, _safe_reason, validate_graph
 
 VERDICT_VERSION = "openstack-rehome-readiness-verdict/v1alpha1"
 MAPPING_VERSION = "openstack-rehome-directional-schema-mapping/v1alpha1"
+SOURCE_PROFILE = "keystack-2025.1"
 TARGET_PROFILE = "vanilla-openstack-2025.1-epoxy"
 
 EXIT_CODES = {
@@ -36,8 +37,10 @@ _BLOCKING_MAPPING_CLASSES = frozenset({
 })
 _SAFE_TEXT = re.compile(r"^[^\x00-\x1f\x7f]{1,512}$")
 _SENSITIVE_VALUE = re.compile(
-    r"(?:password|passwd|token|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
-    r"(?:authorization\s*:\s*(?:bearer|basic)\s+\S+)|"
+    r"\bsecret[-_]?token\b|\b(?:password|passwd|credential)\b|"
+    r"(?:password|passwd|token|secret|credential|connection[_-]?(?:info|data))\s*[:=]\s*\S+|"
+    r"(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+)|"
+    r"\bsk-[A-Za-z0-9_-]{8,}\b|"
     r"(?:[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@)",
     flags=re.IGNORECASE,
 )
@@ -45,6 +48,21 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_CHECKS = 100_000
 _MAX_MAPPING_TABLES = 4096
 _MAX_MAPPING_COLUMNS = 100_000
+_MAPPING_KEYS = frozenset({
+    "schema_version", "source_profile", "target_profile", "tables", "blockers",
+})
+_MAPPING_COLUMN_KEYS = frozenset({
+    "column", "classification", "source", "target",
+})
+_SCHEMA_COLUMN_KEYS = frozenset({
+    "name", "ordinal", "column_type", "nullable", "default", "extra",
+})
+_TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+_COLUMN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INTEGER_WITH_DISPLAY_WIDTH = re.compile(
+    r"\b(tinyint|smallint|mediumint|int|integer|bigint)\(\d+\)",
+    flags=re.IGNORECASE,
+)
 
 
 def _id(prefix: str, label: str) -> str:
@@ -78,6 +96,7 @@ def _normalize_check(value: object) -> CheckResult:
         not isinstance(value.check_id, str)
         or _SAFE_TEXT.fullmatch(value.check_id) is None
         or _SENSITIVE_VALUE.search(value.check_id) is not None
+        or not isinstance(value.status, str)
         or value.status not in _STATUSES
     ):
         raise ValueError("invalid check identity")
@@ -90,8 +109,110 @@ def _normalize_check(value: object) -> CheckResult:
     )
 
 
+def _mapping_text(
+    value: object,
+    pattern: re.Pattern = _SAFE_TEXT,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > 512
+        or (value and pattern.fullmatch(value) is None)
+        or any(character in value for character in ("\x00", "\n", "\r"))
+        or _SENSITIVE_VALUE.search(value)
+    ):
+        raise ValueError("invalid mapping text")
+    return value
+
+
+def _schema_column(value: object, column_name: str) -> Dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _SCHEMA_COLUMN_KEYS:
+        raise ValueError("invalid schema column")
+    name = _mapping_text(value.get("name"), _COLUMN_NAME)
+    ordinal = value.get("ordinal")
+    column_type = _mapping_text(value.get("column_type"))
+    nullable = value.get("nullable")
+    default = value.get("default")
+    extra = value.get("extra")
+    if (
+        name != column_name
+        or not isinstance(ordinal, int)
+        or isinstance(ordinal, bool)
+        or not 1 <= ordinal <= _MAX_MAPPING_COLUMNS
+        or not isinstance(nullable, bool)
+        or (default is not None and not isinstance(default, str))
+        or not isinstance(extra, str)
+        or len(extra) > 2048
+    ):
+        raise ValueError("invalid schema column")
+    if default is not None:
+        _mapping_text(default, allow_empty=True)
+    if extra and (_SAFE_TEXT.fullmatch(extra) is None or _SENSITIVE_VALUE.search(extra)):
+        raise ValueError("invalid schema column")
+    return {
+        "name": name,
+        "ordinal": ordinal,
+        "column_type": column_type,
+        "nullable": nullable,
+        "default": default,
+        "extra": extra,
+    }
+
+
+def _normalized_column_type(value: str) -> str:
+    normalized = " ".join(value.lower().split())
+    normalized = _INTEGER_WITH_DISPLAY_WIDTH.sub(
+        lambda match: "int" if match.group(1).lower() == "integer" else match.group(1).lower(),
+        normalized,
+    )
+    return re.sub(r"\binteger\b", "int", normalized)
+
+
+def _columns_compatible(source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    return (
+        _normalized_column_type(source["column_type"])
+        == _normalized_column_type(target["column_type"])
+        and source["nullable"] == target["nullable"]
+        and source["default"] == target["default"]
+        and " ".join(source["extra"].lower().split())
+        == " ".join(target["extra"].lower().split())
+    )
+
+
+def _has_target_default(target: Mapping[str, Any]) -> bool:
+    return (
+        target["nullable"]
+        or target["default"] is not None
+        or "auto_increment" in target["extra"].lower().split()
+    )
+
+
+def _classification_consistent(
+    classification: str,
+    source: object,
+    target: object,
+) -> bool:
+    if classification == "COMMON_COMPATIBLE":
+        return source is not None and target is not None and _columns_compatible(source, target)
+    if classification == "NORMALIZATION_REQUIRED":
+        return source is not None and target is not None
+    if classification == "SOURCE_ONLY_IGNORED":
+        return source is not None and target is None
+    if classification == "TARGET_DEFAULT":
+        return source is None and target is not None and _has_target_default(target)
+    if classification == "TARGET_VALUE_REQUIRED":
+        return source is None and target is not None and not _has_target_default(target)
+    if classification == "SEMANTIC_MISMATCH":
+        return source is not None and target is not None and not _columns_compatible(source, target)
+    if classification == "BLOCKED":
+        return source is None or target is None
+    return False
+
+
 def _mapping_checks(mapping: object) -> List[CheckResult]:
-    if mapping is None:
+    if mapping is None or (isinstance(mapping, Mapping) and not mapping):
         return [_synthetic(
             "mapping-missing", "UNKNOWN", "directional schema mapping is missing"
         )]
@@ -99,24 +220,27 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
         return [_synthetic(
             "mapping-malformed", "BLOCKED", "directional schema mapping is malformed"
         )]
+    if set(mapping) != _MAPPING_KEYS:
+        return [_synthetic(
+            "mapping-fields", "BLOCKED",
+            "directional schema mapping has unknown or missing fields",
+        )]
     if mapping.get("schema_version") != MAPPING_VERSION:
         return [_synthetic(
             "mapping-schema", "BLOCKED", "directional schema mapping version is invalid"
         )]
 
     checks: List[CheckResult] = []
+    if mapping.get("source_profile") != SOURCE_PROFILE:
+        checks.append(_synthetic(
+            "mapping-source-profile", "BLOCKED",
+            "directional schema mapping source profile is not approved Keystack 2025.1",
+        ))
     if mapping.get("target_profile") != TARGET_PROFILE:
         checks.append(_synthetic(
             "mapping-target-profile", "BLOCKED",
             "directional schema mapping target profile is not vanilla OpenStack 2025.1 Epoxy",
         ))
-    source_profile = mapping.get("source_profile")
-    if not isinstance(source_profile, str) or _SAFE_TEXT.fullmatch(source_profile) is None:
-        checks.append(_synthetic(
-            "mapping-source-profile", "UNKNOWN",
-            "directional schema mapping source profile is unavailable",
-        ))
-
     blockers = mapping.get("blockers")
     if not isinstance(blockers, list) or len(blockers) > _MAX_MAPPING_COLUMNS:
         checks.append(_synthetic(
@@ -124,20 +248,26 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
             "directional schema mapping blockers are malformed",
         ))
     else:
-        seen = set()
-        for index, blocker in enumerate(blockers):
-            if not isinstance(blocker, str) or _SAFE_TEXT.fullmatch(blocker) is None:
+        seen_blockers = set()
+        for blocker in blockers:
+            try:
+                safe = _mapping_text(blocker)
+            except ValueError:
                 checks.append(_synthetic(
                     "mapping-blocker-malformed", "BLOCKED",
-                    "directional schema mapping blocker is malformed", str(index),
+                    "directional schema mapping blocker is malformed",
                 ))
                 continue
-            safe = _safe_reason(blocker, "mapping field is malformed")
-            if safe in seen:
-                continue
-            seen.add(safe)
+            if safe in seen_blockers:
+                checks.append(_synthetic(
+                    "mapping-blocker-duplicate", "BLOCKED",
+                    "directional schema mapping blocker is duplicated", safe,
+                ))
+            seen_blockers.add(safe)
+        for safe in sorted(seen_blockers):
             checks.append(_synthetic(
-                "mapping-blocker", "BLOCKED", f"schema mapping blocker: {safe}", safe
+                "mapping-blocker", "BLOCKED",
+                f"schema mapping blocker: {safe}", safe,
             ))
 
     tables = mapping.get("tables")
@@ -147,15 +277,42 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
             "directional schema mapping tables are malformed",
         ))
         return checks
+    if not tables:
+        checks.append(_synthetic(
+            "mapping-evidence-empty", "UNKNOWN",
+            "directional schema mapping table evidence is empty",
+        ))
+        return checks
 
     column_count = 0
-    for table_name in sorted(tables) if all(isinstance(key, str) for key in tables) else []:
+    expected_blockers = set()
+    mapping_structure_valid = True
+    if not all(
+        isinstance(key, str)
+        and _TABLE_NAME.fullmatch(key) is not None
+        and _SENSITIVE_VALUE.search(key) is None
+        for key in tables
+    ):
+        checks.append(_synthetic(
+            "mapping-table-name-malformed", "BLOCKED",
+            "directional schema mapping table name is malformed",
+        ))
+        return checks
+    for table_name in sorted(tables):
         items = tables[table_name]
-        if _SAFE_TEXT.fullmatch(table_name) is None or not isinstance(items, list):
+        if not isinstance(items, list):
             checks.append(_synthetic(
                 "mapping-table-malformed", "BLOCKED",
                 "directional schema mapping table is malformed",
-                table_name if isinstance(table_name, str) else "invalid",
+                table_name,
+            ))
+            mapping_structure_valid = False
+            continue
+        if not items:
+            checks.append(_synthetic(
+                "mapping-table-empty", "UNKNOWN",
+                "directional schema mapping required table evidence is empty",
+                table_name,
             ))
             continue
         column_count += len(items)
@@ -166,26 +323,33 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
             ))
             break
         seen_columns = set()
-        for index, item in enumerate(items):
-            if not isinstance(item, Mapping):
+        source_ordinals = set()
+        target_ordinals = set()
+        previous_order = None
+        for item in items:
+            if not isinstance(item, Mapping) or set(item) != _MAPPING_COLUMN_KEYS:
                 checks.append(_synthetic(
                     "mapping-column-malformed", "BLOCKED",
                     "directional schema mapping column is malformed",
-                    f"{table_name}:{index}",
+                    table_name,
                 ))
+                mapping_structure_valid = False
                 continue
             column = item.get("column")
             classification = item.get("classification")
             if (
                 not isinstance(column, str)
-                or _SAFE_TEXT.fullmatch(column) is None
+                or _COLUMN_NAME.fullmatch(column) is None
+                or _SENSITIVE_VALUE.search(column) is not None
+                or not isinstance(classification, str)
                 or classification not in _MAPPING_CLASSES
             ):
                 checks.append(_synthetic(
                     "mapping-column-malformed", "BLOCKED",
                     "directional schema mapping column is malformed",
-                    f"{table_name}:{index}",
+                    table_name,
                 ))
+                mapping_structure_valid = False
                 continue
             label = f"{table_name}.{column}"
             if column in seen_columns:
@@ -193,9 +357,58 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
                     "mapping-column-duplicate", "BLOCKED",
                     f"schema mapping column is duplicated: {label}", label,
                 ))
+                mapping_structure_valid = False
                 continue
             seen_columns.add(column)
+            try:
+                source = (
+                    None if item.get("source") is None
+                    else _schema_column(item.get("source"), column)
+                )
+                target = (
+                    None if item.get("target") is None
+                    else _schema_column(item.get("target"), column)
+                )
+            except ValueError:
+                checks.append(_synthetic(
+                    "mapping-schema-column-malformed", "BLOCKED",
+                    "directional schema mapping SchemaColumn is malformed", label,
+                ))
+                mapping_structure_valid = False
+                continue
+            for value, ordinals in ((source, source_ordinals), (target, target_ordinals)):
+                if value is not None:
+                    if value["ordinal"] in ordinals:
+                        checks.append(_synthetic(
+                            "mapping-ordinal-duplicate", "BLOCKED",
+                            "directional schema mapping ordinal is duplicated", table_name,
+                        ))
+                        mapping_structure_valid = False
+                    ordinals.add(value["ordinal"])
+            if not _classification_consistent(classification, source, target):
+                checks.append(_synthetic(
+                    "mapping-classification-inconsistent", "BLOCKED",
+                    "directional schema mapping classification is inconsistent", label,
+                ))
+                mapping_structure_valid = False
+                continue
+            canonical_order = (
+                (0, target["ordinal"])
+                if target is not None
+                else (1, source["ordinal"])
+                if source is not None
+                else (2, column)
+            )
+            if previous_order is not None and canonical_order <= previous_order:
+                checks.append(_synthetic(
+                    "mapping-column-order", "BLOCKED",
+                    "directional schema mapping column order is not canonical",
+                    table_name,
+                ))
+                mapping_structure_valid = False
+            previous_order = canonical_order
             if classification in _BLOCKING_MAPPING_CLASSES:
+                expected_blockers.add(label)
                 checks.append(_synthetic(
                     "mapping-classification", "BLOCKED",
                     f"schema mapping classification blocks re-home: {label}", label,
@@ -205,10 +418,10 @@ def _mapping_checks(mapping: object) -> List[CheckResult]:
                     "mapping-source-only", "WARN",
                     f"reviewed source-only schema field is ignored: {label}", label,
                 ))
-    if tables and not all(isinstance(key, str) for key in tables):
+    if mapping_structure_valid and seen_blockers != expected_blockers:
         checks.append(_synthetic(
-            "mapping-table-name-malformed", "BLOCKED",
-            "directional schema mapping table name is malformed",
+            "mapping-blockers-inconsistent", "BLOCKED",
+            "directional schema mapping blockers are inconsistent",
         ))
     return checks
 
@@ -217,7 +430,15 @@ def _graph_has_instance(graph: object) -> bool:
     if not isinstance(graph, Mapping) or not isinstance(graph.get("nodes"), list):
         return False
     for node in graph["nodes"]:
-        if isinstance(node, Mapping) and node.get("kind") == "instance":
+        provenance = node.get("provenance") if isinstance(node, Mapping) else None
+        if (
+            isinstance(node, Mapping)
+            and node.get("side") == "source"
+            and node.get("kind") == "instance"
+            and isinstance(provenance, Mapping)
+            and provenance.get("service") == "nova"
+            and provenance.get("side") == "source"
+        ):
             return True
     return False
 
