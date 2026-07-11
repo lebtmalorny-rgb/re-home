@@ -31,10 +31,23 @@ _SAFE_NETLOC = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
 _ENCRYPTION_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$")
 _CINDER_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ATTACHMENT_STATES = {
-    "attached", "attaching", "detached", "reserved",
+    "attached", "attaching", "detaching", "detached", "reserved",
     "error_attaching", "error_detaching",
 }
 _ATTACHMENT_MODES = {"rw", "ro"}
+_VOLUME_STATES = {
+    "in-use", "available", "error", "maintenance", "creating",
+    "attaching", "detaching", "deleting", "retyping", "extending",
+    "downloading", "uploading", "backing-up", "restoring-backup",
+    "awaiting-transfer", "error_deleting", "error_restoring",
+    "error_extending",
+}
+_VOLUME_TRANSITIONAL_STATES = {
+    "creating", "attaching", "detaching", "deleting", "retyping",
+    "extending", "downloading", "uploading", "backing-up",
+    "restoring-backup", "awaiting-transfer",
+}
+_ATTACHMENT_TRANSITIONAL_STATES = {"attaching", "detaching"}
 _MAX_JSON_BYTES = 65536
 _MAX_JSON_DEPTH = 16
 _MAX_JSON_NODES = 4096
@@ -298,6 +311,10 @@ def _attachment_state(value: object) -> Optional[str]:
 
 def _attachment_mode(value: object) -> Optional[str]:
     return value if isinstance(value, str) and value in _ATTACHMENT_MODES else None
+
+
+def _volume_state(value: object) -> Optional[str]:
+    return value if isinstance(value, str) and value in _VOLUME_STATES else None
 
 
 def _component(value: object) -> Optional[str]:
@@ -767,6 +784,14 @@ class CinderCollector:
                 result.blockers.append(
                     f"attachment state or mode invalid: {attachment_id}"
                 )
+            elif db_status in _ATTACHMENT_TRANSITIONAL_STATES:
+                result.unknowns.append(
+                    f"attachment readiness transitional: {attachment_id}"
+                )
+            elif db_status != "attached":
+                result.blockers.append(
+                    f"required attachment not usable: {attachment_id}"
+                )
             if db_status is not None and api_status is not None:
                 db_facts["attach_status"] = db_status
                 api_facts["status"] = api_status
@@ -794,18 +819,22 @@ class CinderCollector:
             connection_info = _field(row, "connection_info")
             connector = _field(row, "connector")
             summary = _connection_summary(connection_info, connector)
+            parsed_connection = _parse_mapping(connection_info)
+            parsed_connector = _parse_mapping(connector)
             if (
-                db_status in {"attached", "attaching"}
+                db_status in {"attached", *_ATTACHMENT_TRANSITIONAL_STATES}
                 and (
-                    _parse_mapping(connection_info) is None
-                    or _parse_mapping(connector) is None
+                    parsed_connection is None
+                    or len(parsed_connection) == 0
+                    or parsed_connector is None
+                    or len(parsed_connector) == 0
                 )
             ):
                 result.blockers.append(
                     f"active attachment connection metadata invalid: {attachment_id}"
                 )
             if (
-                db_status in {"attached", "attaching"}
+                db_status in {"attached", *_ATTACHMENT_TRANSITIONAL_STATES}
                 and not _active_connection_evidence_valid(
                     connection_info, connector, summary
                 )
@@ -940,10 +969,23 @@ class CinderCollector:
                 or api_size != db_size
             ):
                 result.blockers.append(f"volume API/DB size mismatch: {volume_id}")
-            if _field(api, "status") != _field(row, "status"):
+            db_volume_state = _volume_state(_field(row, "status"))
+            api_volume_state = _volume_state(_field(api, "status"))
+            if db_volume_state is None or api_volume_state is None:
+                result.blockers.append(f"volume state invalid: {volume_id}")
+            elif db_volume_state != api_volume_state:
                 result.blockers.append(
                     f"volume API/DB status mismatch: {volume_id}"
                 )
+            if volume_id in root_ids:
+                if db_volume_state in _VOLUME_TRANSITIONAL_STATES:
+                    result.unknowns.append(
+                        f"volume readiness transitional: {volume_id}"
+                    )
+                elif db_volume_state is not None and db_volume_state != "in-use":
+                    result.blockers.append(
+                        f"volume not usable for re-home: {volume_id}"
+                    )
             api_type_id = _openstack_id(
                 _field(api, "volume_type_id", "type_id", "type"),
                 self._allow_fixture_aliases,
@@ -1012,6 +1054,12 @@ class CinderCollector:
                 )
             facts = _allowlisted(row, _VOLUME_FIELDS)
             api_facts = _allowlisted(api, _API_VOLUME_FIELDS)
+            facts.pop("status", None)
+            api_facts.pop("status", None)
+            if db_volume_state is not None:
+                facts["status"] = db_volume_state
+            if api_volume_state is not None:
+                api_facts["status"] = api_volume_state
             for unsafe_field in ("host", "cluster_name", "storage_backend_id"):
                 facts.pop(unsafe_field, None)
                 api_facts.pop(unsafe_field, None)
@@ -1070,6 +1118,10 @@ class CinderCollector:
                 result.blockers.append(f"required attachment missing: {attachment_id}")
             if api_attachment_ids != db_attachment_ids:
                 result.blockers.append(f"volume attachment API/DB mismatch: {volume_id}")
+            if volume_id in root_ids and not db_attachment_ids:
+                result.blockers.append(
+                    f"required current attachment missing: {volume_id}"
+                )
             for attachment_id in sorted(db_attachment_ids):
                 add_edge(volume.key, f"volume_attachment:{attachment_id}", "has_attachment")
 

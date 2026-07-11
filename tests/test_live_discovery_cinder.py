@@ -435,6 +435,67 @@ class CinderCollectorTests(unittest.TestCase):
                 self.assertIn("attachment state or mode invalid: attachment-1", result.blockers)
                 self.assertNotIn(sentinel, json.dumps(result.to_dict()))
 
+    def test_nova_bdm_volume_state_readiness_matrix(self):
+        cases = (
+            ("in-use", None, None),
+            ("available", "volume not usable for re-home: volume-1", None),
+            ("error", "volume not usable for re-home: volume-1", None),
+            ("maintenance", "volume not usable for re-home: volume-1", None),
+            ("creating", None, "volume readiness transitional: volume-1"),
+            ("attaching", None, "volume readiness transitional: volume-1"),
+            ("detaching", None, "volume readiness transitional: volume-1"),
+        )
+        for state, blocker, unknown in cases:
+            with self.subTest(state=state):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volumes"][0]["status"] = state
+                fixture["openstack"][0]["payload"]["status"] = state
+                if state != "in-use":
+                    fixture["tables"]["volume_attachment"][0]["connection_info"] = "{}"
+                    fixture["tables"]["volume_attachment"][0]["connector"] = "{}"
+                result, _ = collect_from_fixture(fixture)
+                if blocker is not None:
+                    self.assertIn(blocker, result.blockers)
+                else:
+                    self.assertNotIn("volume not usable for re-home: volume-1", result.blockers)
+                if unknown is not None:
+                    self.assertIn(unknown, result.unknowns)
+                else:
+                    self.assertNotIn("volume readiness transitional: volume-1", result.unknowns)
+
+    def test_required_attachment_state_readiness_matrix(self):
+        cases = (
+            ("attached", None, None),
+            ("detached", "required attachment not usable: attachment-1", None),
+            ("reserved", "required attachment not usable: attachment-1", None),
+            ("error_attaching", "required attachment not usable: attachment-1", None),
+            ("error_detaching", "required attachment not usable: attachment-1", None),
+            ("attaching", None, "attachment readiness transitional: attachment-1"),
+            ("detaching", None, "attachment readiness transitional: attachment-1"),
+        )
+        for state, blocker, unknown in cases:
+            with self.subTest(state=state):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volume_attachment"][0]["attach_status"] = state
+                fixture["openstack"][1]["payload"]["status"] = state
+                if state != "attached":
+                    fixture["tables"]["volume_attachment"][0]["connection_info"] = "{}"
+                    fixture["tables"]["volume_attachment"][0]["connector"] = "{}"
+                result, _ = collect_from_fixture(fixture)
+                if blocker is not None:
+                    self.assertIn(blocker, result.blockers)
+                if unknown is not None:
+                    self.assertIn(unknown, result.unknowns)
+                    self.assertIn(
+                        "active attachment connection metadata invalid: attachment-1",
+                        result.blockers,
+                    )
+                else:
+                    self.assertNotIn(
+                        "attachment readiness transitional: attachment-1",
+                        result.unknowns,
+                    )
+
     def test_invalid_host_backend_cluster_never_serialize_raw_values(self):
         cases = (
             ("host", "node@backend-secret-token#pool"),
