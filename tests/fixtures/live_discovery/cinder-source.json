@@ -15,7 +15,8 @@
     "volume_metadata",
     "volume_glance_metadata",
     "volume_admin_metadata",
-    "groups"
+    "groups",
+    "group_snapshots"
   ],
   "openstack": [
     {
@@ -26,6 +27,10 @@
         "status": "in-use",
         "size": 1,
         "type": "type-1",
+        "volume_type_id": "type-1",
+        "service_uuid": "service-1",
+        "host": "cinder@backend#nfs",
+        "cluster_name": "cluster@backend",
         "attachments": [{"id": "attachment-1"}],
         "connection_info": {"auth_password": "api-secret"}
       }
@@ -36,7 +41,8 @@
         "id": "attachment-1",
         "volume_id": "volume-1",
         "server_id": "instance-1",
-        "status": "attached"
+        "status": "attached",
+        "attach_mode": "rw"
       }
     },
     {
@@ -49,6 +55,7 @@
         "id": "service-1",
         "uuid": "service-1",
         "host": "cinder@backend#nfs",
+        "cluster_name": "cluster@backend",
         "binary": "cinder-volume",
         "status": "enabled",
         "state": "up"
@@ -104,6 +111,7 @@
     "volume_metadata": [{"volume_id": "volume-1", "key": "purpose", "value": "database"}],
     "volume_glance_metadata": [{"volume_id": "volume-1", "key": "image_id", "value": "image-1"}],
     "volume_admin_metadata": [{"volume_id": "volume-1", "key": "readonly", "value": "False"}],
-    "groups": []
+    "groups": [],
+    "group_snapshots": []
   }
 }

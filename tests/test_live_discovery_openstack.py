@@ -190,6 +190,26 @@ class OpenStackClientTests(unittest.TestCase):
         self.assertNotIn("must-not-leak", str(raised.exception.__dict__))
         self.assertEqual("[REDACTED]", raised.exception.evidence.stderr)
 
+    def test_missing_endpoint_takes_precedence_over_cooccurring_404(self):
+        failure_evidence = CommandEvidence(
+            "barbican-endpoint-404",
+            ["openstack", "secret", "get", "secret-uuid"],
+            1,
+            "",
+            "404: public endpoint for key-manager service not found token=must-not-leak",
+        )
+
+        class FailingRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                raise ProbeFailed(failure_evidence)
+
+        client = OpenStackClient(FailingRunner(), "cloud", "toolbox", "/clouds.yaml")
+        with self.assertRaises(ProbeFailed) as raised:
+            client.json(["secret", "get", "secret-uuid"], "barbican-endpoint-404")
+        self.assertEqual("endpoint-missing", raised.exception.reason)
+        self.assertFalse(hasattr(raised.exception, "status_code"))
+        self.assertNotIn("must-not-leak", str(raised.exception.__dict__))
+
     def test_client_sanitizes_raw_stdout_and_stderr_from_evidence(self):
         class SecretEvidenceRunner:
             def run(self, argv, evidence_id, sensitive_stdout=False):

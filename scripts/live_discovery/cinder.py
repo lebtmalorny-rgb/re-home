@@ -3,6 +3,7 @@ import json
 import re
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
 from .contract import CollectorResult, DependencyEdge, ResourceNode
 
@@ -12,7 +13,7 @@ OPTIONAL_TABLES = (
     "volume_type_extra_specs", "volume_type_projects", "volume_type_qos_specs",
     "qos_specs", "quality_of_service_specs", "encryption", "snapshots",
     "volume_metadata", "volume_glance_metadata", "volume_admin_metadata",
-    "groups",
+    "groups", "group_snapshots",
 )
 
 _FIXTURE_POLICY_TOKEN = object()
@@ -28,6 +29,7 @@ _TABLE_ID_FIELDS = {
     "volumes": (
         "id", "volume_type_id", "service_uuid", "encryption_key_id",
         "snapshot_id", "source_volid", "group_id", "consistencygroup_id",
+        "group_snapshot_id",
     ),
     "volume_attachment": ("id", "volume_id", "instance_uuid"),
     "volume_types": ("id",),
@@ -42,7 +44,8 @@ _TABLE_ID_FIELDS = {
     "volume_metadata": ("volume_id",),
     "volume_glance_metadata": ("volume_id",),
     "volume_admin_metadata": ("volume_id",),
-    "groups": ("id",),
+    "groups": ("id", "group_type_id"),
+    "group_snapshots": ("id", "group_id"),
 }
 
 _VOLUME_FIELDS = (
@@ -50,10 +53,12 @@ _VOLUME_FIELDS = (
     "bootable", "multiattach", "volume_type_id", "service_uuid", "host",
     "cluster_name", "encryption_key_id", "snapshot_id", "source_volid",
     "group_id", "consistencygroup_id", "storage_backend_id",
+    "group_snapshot_id",
 )
 _API_VOLUME_FIELDS = (
     "id", "name", "status", "size", "availability_zone", "bootable",
-    "multiattach", "volume_type_id", "type_id",
+    "multiattach", "volume_type_id", "type_id", "service_uuid", "host",
+    "cluster_name", "group_id", "consistencygroup_id", "group_snapshot_id",
 )
 _ATTACHMENT_FIELDS = (
     "id", "volume_id", "instance_uuid", "attach_status", "attach_mode",
@@ -68,6 +73,8 @@ _SNAPSHOT_FIELDS = (
     "id", "volume_id", "status", "volume_size", "display_name",
     "group_snapshot_id",
 )
+_GROUP_FIELDS = ("id", "name", "status", "group_type_id")
+_GROUP_SNAPSHOT_FIELDS = ("id", "group_id", "name", "status")
 
 
 class _PolicyMapping(dict):
@@ -113,6 +120,17 @@ def _row_id(row: Mapping[str, Any], *names: str) -> Optional[str]:
     )
 
 
+def _volume_api_field(payload: object, field: str) -> Any:
+    aliases = {
+        "host": ("host", "os-vol-host-attr:host", "os_vol_host_attr_host"),
+        "service_uuid": (
+            "service_uuid", "os-vol-host-attr:service_uuid",
+            "os_vol_host_attr_service_uuid",
+        ),
+    }
+    return _field(payload, *aliases.get(field, (field,)))
+
+
 def _schema_tables(schema: object) -> Set[str]:
     if isinstance(schema, Mapping):
         values = schema.keys()
@@ -136,6 +154,14 @@ def _safe_value(value: object) -> Any:
         return value
     if isinstance(value, str) and _SAFE_TEXT.fullmatch(value):
         return value
+    return None
+
+
+def _typed_bool(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
     return None
 
 
@@ -187,18 +213,83 @@ def _connection_summary(value: object) -> Dict[str, Any]:
     data = _field(payload, "data")
     data = data if isinstance(data, Mapping) else {}
     target_count = 0
-    for name in ("target_portals", "target_iqns", "targets", "target_wwn"):
+    for name in (
+        "target_portals", "target_iqns", "targets", "target_wwn",
+        "target_wwns", "hosts", "mon_hosts",
+    ):
         candidate = _field(data, name)
         if isinstance(candidate, (list, tuple)):
             target_count = max(target_count, len(candidate))
         elif isinstance(candidate, str) and candidate:
             target_count = max(target_count, 1)
+    if target_count == 0 and any(
+        isinstance(_field(data, name), str) and bool(_field(data, name))
+        for name in (
+            "target_portal", "target_iqn", "export", "device_path",
+            "path", "name",
+        )
+    ):
+        target_count = 1
     multipath = _field(data, "multipath")
     return {
         "driver_type": driver_type,
         "target_count": target_count,
         "multipath": multipath if isinstance(multipath, bool) else False,
     }
+
+
+def _active_connection_evidence_valid(
+    connection_info: object, connector: object, summary: Mapping[str, Any]
+) -> bool:
+    connection = _parse_mapping(connection_info)
+    connector_payload = _parse_mapping(connector)
+    if not connection or not connector_payload:
+        return False
+    connector_identity = any(
+        key in connector_payload and connector_payload[key] not in (None, "", [], {})
+        for key in ("host", "initiator", "wwpns", "ip", "platform", "os_type")
+    )
+    if not connector_identity:
+        return False
+    data = _field(connection, "data")
+    if not isinstance(data, Mapping) or not data:
+        return False
+    driver = summary.get("driver_type")
+    target_count = summary.get("target_count")
+    base_valid = (
+        isinstance(driver, str)
+        and bool(driver)
+        and isinstance(target_count, int)
+        and not isinstance(target_count, bool)
+        and target_count > 0
+        and isinstance(summary.get("multipath"), bool)
+    )
+    if not base_valid:
+        return False
+    if driver == "iscsi":
+        portals = _field(data, "target_portals")
+        iqns = _field(data, "target_iqns")
+        if portals is None:
+            portals = [_field(data, "target_portal")]
+        if iqns is None:
+            iqns = [_field(data, "target_iqn")]
+        return (
+            isinstance(portals, (list, tuple))
+            and isinstance(iqns, (list, tuple))
+            and bool(portals)
+            and len(portals) == len(iqns)
+            and all(isinstance(item, str) and item for item in [*portals, *iqns])
+        )
+    if driver in {"fibre_channel", "fc"}:
+        targets = _field(data, "target_wwn", "target_wwns")
+        return isinstance(targets, (list, tuple)) and bool(targets)
+    if driver == "rbd":
+        return bool(_field(data, "name")) and bool(
+            _field(data, "hosts", "mon_hosts")
+        )
+    if driver in {"nfs", "file", "lvm", "local"}:
+        return bool(_field(data, "export", "device_path", "path", "name"))
+    return False
 
 
 class CinderCollector:
@@ -260,12 +351,35 @@ class CinderCollector:
             if (value := _row_id(row, "volume_type_id")) is not None
         )
         types = self._db_rows("volume_types", {"id": type_ids}, result) if type_ids else []
+        private_type_ids = {
+            value for row in types
+            if _typed_bool(_field(row, "is_public")) is False
+            and (value := _row_id(row, "id")) is not None
+        }
+        key_volume_type_ids = {
+            value for row in volume_rows
+            if _row_id(row, "encryption_key_id") is not None
+            and (value := _row_id(row, "volume_type_id")) is not None
+        }
         extra_specs = self._optional_rows("volume_type_extra_specs", {"volume_type_id": type_ids}, result)
+        if private_type_ids and "volume_type_projects" not in self.available_tables:
+            result.unknowns.append(
+                "Cinder active schema family missing: volume_type_projects"
+            )
         type_projects = self._optional_rows("volume_type_projects", {"volume_type_id": type_ids}, result)
+        if type_ids and "volume_type_qos_specs" not in self.available_tables:
+            result.unknowns.append(
+                "Cinder active schema family missing: volume_type_qos_specs"
+            )
         type_qos = self._optional_rows("volume_type_qos_specs", {"volume_type_id": type_ids}, result)
         qos_ids = _dedupe(
             value for row in type_qos if (value := _row_id(row, "qos_specs_id")) is not None
         )
+        for table in ("qos_specs", "quality_of_service_specs"):
+            if qos_ids and table not in self.available_tables:
+                result.unknowns.append(
+                    f"Cinder active schema family missing: {table}"
+                )
         qos_definitions = self._optional_rows("qos_specs", {"id": qos_ids}, result)
         qos = self._optional_rows("quality_of_service_specs", {"specs_id": qos_ids}, result)
         service_ids = _dedupe(
@@ -273,6 +387,10 @@ class CinderCollector:
             if (value := _row_id(row, "service_uuid")) is not None
         )
         services = self._db_rows("services", {"uuid": service_ids}, result) if service_ids else []
+        if key_volume_type_ids and "encryption" not in self.available_tables:
+            result.unknowns.append(
+                "Cinder active schema family missing: encryption"
+            )
         encryptions = self._optional_rows("encryption", {"volume_type_id": type_ids}, result)
         snapshot_ids = _dedupe(
             value for row in volume_rows
@@ -291,7 +409,40 @@ class CinderCollector:
             for name in ("group_id", "consistencygroup_id")
             if (value := _row_id(row, name)) is not None
         )
+        if group_ids and "groups" not in self.available_tables:
+            result.unknowns.append("Cinder active schema family missing: groups")
         groups = self._optional_rows("groups", {"id": group_ids}, result)
+        group_snapshot_ids = _dedupe([
+            *(
+                value for row in volume_rows
+                if (value := _row_id(row, "group_snapshot_id")) is not None
+            ),
+            *(
+                value for row in snapshots
+                if (value := _row_id(row, "group_snapshot_id")) is not None
+            ),
+        ])
+        if group_snapshot_ids and "group_snapshots" not in self.available_tables:
+            result.unknowns.append(
+                "Cinder active schema family missing: group_snapshots"
+            )
+        group_snapshots = self._optional_rows(
+            "group_snapshots", {"id": group_snapshot_ids}, result
+        )
+        group_ids = _dedupe([
+            *group_ids,
+            *(
+                value for row in group_snapshots
+                if (value := _row_id(row, "group_id")) is not None
+            ),
+        ])
+        # A group snapshot can introduce its parent group after the first query.
+        known_group_ids = {
+            value for row in groups if (value := _row_id(row, "id")) is not None
+        }
+        missing_group_ids = [value for value in group_ids if value not in known_group_ids]
+        if missing_group_ids and "groups" in self.available_tables:
+            groups.extend(self._db_rows("groups", {"id": missing_group_ids}, result))
 
         nodes: Dict[str, ResourceNode] = {}
         edge_keys: Set[Tuple[str, str, str, bool]] = set()
@@ -340,10 +491,31 @@ class CinderCollector:
                 result.blockers.append(
                     f"attachment API/DB server mismatch: {attachment_id}"
                 )
-            facts = _allowlisted(row, _ATTACHMENT_FIELDS)
-            facts.update(_allowlisted(api, ("id", "volume_id", "server_id", "instance_uuid", "status", "attach_status", "attach_mode")))
+            db_facts = _allowlisted(row, _ATTACHMENT_FIELDS)
+            api_facts = _allowlisted(
+                api,
+                (
+                    "id", "volume_id", "server_id", "instance_uuid",
+                    "status", "attach_status", "attach_mode",
+                ),
+            )
+            db_status = _field(row, "attach_status")
+            api_status = _field(api, "attach_status", "status")
+            if db_status != api_status:
+                result.blockers.append(
+                    f"attachment API/DB status mismatch: {attachment_id}"
+                )
+            db_mode = _field(row, "attach_mode")
+            api_mode = _field(api, "attach_mode")
+            if db_mode != api_mode:
+                result.blockers.append(
+                    f"attachment API/DB mode mismatch: {attachment_id}"
+                )
+            facts = db_facts
+            facts["api_observed"] = api_facts
             connection_info = _field(row, "connection_info")
             connector = _field(row, "connector")
+            summary = _connection_summary(connection_info)
             if (
                 _field(row, "attach_status") in {"attached", "attaching"}
                 and (
@@ -354,9 +526,18 @@ class CinderCollector:
                 result.blockers.append(
                     f"active attachment connection metadata invalid: {attachment_id}"
                 )
+            if (
+                _field(row, "attach_status") in {"attached", "attaching"}
+                and not _active_connection_evidence_valid(
+                    connection_info, connector, summary
+                )
+            ):
+                result.blockers.append(
+                    f"active attachment driver evidence invalid: {attachment_id}"
+                )
             facts["connection_info"] = "[REDACTED]"
             facts["connector"] = "[REDACTED]"
-            facts["connection_summary"] = _connection_summary(connection_info)
+            facts["connection_summary"] = summary
             add_node("volume_attachment", attachment_id, facts, [evidence_id] if evidence_id else [])
 
         encryption_type_ids = {
@@ -364,9 +545,49 @@ class CinderCollector:
             if (value := _row_id(row, "volume_type_id")) is not None
         }
         type_rows = {_row_id(row, "id"): row for row in types if not _is_deleted(row)}
-        service_rows = {_row_id(row, "uuid"): row for row in services if not _is_deleted(row)}
-        group_row_ids = {_row_id(row, "id") for row in groups if not _is_deleted(row)}
+        service_rows_by_id: Dict[str, List[Mapping[str, Any]]] = {}
+        for service_row in services:
+            service_id = _row_id(service_row, "uuid")
+            if service_id is not None and not _is_deleted(service_row):
+                service_rows_by_id.setdefault(service_id, []).append(service_row)
+        service_rows = {
+            service_id: rows[0]
+            for service_id, rows in service_rows_by_id.items() if len(rows) == 1
+        }
+        for service_id, rows in service_rows_by_id.items():
+            if len(rows) != 1:
+                result.blockers.append(
+                    f"Cinder service DB identity ambiguous: {service_id}"
+                )
+        group_rows = {
+            _row_id(row, "id"): row for row in groups if not _is_deleted(row)
+        }
+        group_row_ids = {value for value in group_rows if value is not None}
+        group_snapshot_rows = {
+            _row_id(row, "id"): row
+            for row in group_snapshots if not _is_deleted(row)
+        }
         snapshot_rows = {_row_id(row, "id"): row for row in snapshots if not _is_deleted(row)}
+
+        for group_id, group_row in group_rows.items():
+            if group_id is not None:
+                add_node(
+                    "volume_group", group_id,
+                    _allowlisted(group_row, _GROUP_FIELDS),
+                )
+        for group_snapshot_id, group_snapshot_row in group_snapshot_rows.items():
+            if group_snapshot_id is None:
+                continue
+            group_snapshot = add_node(
+                "group_snapshot", group_snapshot_id,
+                _allowlisted(group_snapshot_row, _GROUP_SNAPSHOT_FIELDS),
+            )
+            parent_group_id = _row_id(group_snapshot_row, "group_id")
+            if parent_group_id:
+                add_edge(
+                    group_snapshot.key, f"volume_group:{parent_group_id}",
+                    "belongs_to_group",
+                )
 
         for snapshot_id, snapshot_row in snapshot_rows.items():
             if snapshot_id is None:
@@ -380,6 +601,12 @@ class CinderCollector:
                 add_edge(
                     f"volume:{volume_id}", snapshot.key,
                     "retains_snapshot", required=False,
+                )
+            group_snapshot_id = _row_id(snapshot_row, "group_snapshot_id")
+            if snapshot is not None and group_snapshot_id:
+                add_edge(
+                    snapshot.key, f"group_snapshot:{group_snapshot_id}",
+                    "belongs_to_group_snapshot",
                 )
 
         for volume_id in active_ids:
@@ -403,8 +630,45 @@ class CinderCollector:
                 or api_size != db_size
             ):
                 result.blockers.append(f"volume API/DB size mismatch: {volume_id}")
+            if _field(api, "status") != _field(row, "status"):
+                result.blockers.append(
+                    f"volume API/DB status mismatch: {volume_id}"
+                )
+            api_type_id = _openstack_id(
+                _field(api, "volume_type_id", "type_id", "type"),
+                self._allow_fixture_aliases,
+            )
+            db_type_id = _row_id(row, "volume_type_id")
+            if api_type_id != db_type_id:
+                result.blockers.append(
+                    f"volume API/DB type mismatch: {volume_id}"
+                )
+            for field, label in (
+                ("service_uuid", "service"),
+                ("group_id", "group"),
+                ("consistencygroup_id", "consistency group"),
+                ("group_snapshot_id", "group snapshot"),
+            ):
+                api_value = _openstack_id(
+                    _volume_api_field(api, field), self._allow_fixture_aliases
+                )
+                db_value = _row_id(row, field)
+                if api_value != db_value:
+                    result.blockers.append(
+                        f"volume API/DB {label} mismatch: {volume_id}"
+                    )
+            for field in ("host", "cluster_name"):
+                if _volume_api_field(api, field) != _field(row, field):
+                    result.blockers.append(
+                        f"volume API/DB {field} mismatch: {volume_id}"
+                    )
             facts = _allowlisted(row, _VOLUME_FIELDS)
-            facts.update(_allowlisted(api, _API_VOLUME_FIELDS))
+            api_facts = _allowlisted(api, _API_VOLUME_FIELDS)
+            for field in ("host", "service_uuid"):
+                safe = _safe_value(_volume_api_field(api, field))
+                if safe is not None:
+                    api_facts[field] = safe
+            facts["api_observed"] = api_facts
             facts["normalizations"] = {
                 "service_uuid": _row_id(row, "service_uuid"),
                 "volume_type_id": _row_id(row, "volume_type_id"),
@@ -447,7 +711,19 @@ class CinderCollector:
                     if _row_id(type_api, "id") != type_id:
                         result.blockers.append(f"volume type API/DB identity mismatch: {type_id}")
                     type_facts = _allowlisted(type_row, _TYPE_FIELDS)
-                    type_facts.update(_allowlisted(type_api, _TYPE_FIELDS))
+                    type_api_facts = _allowlisted(type_api, _TYPE_FIELDS)
+                    for field, label in (("name", "name"),):
+                        if _field(type_api, field) != _field(type_row, field):
+                            result.blockers.append(
+                                f"volume type API/DB {label} mismatch: {type_id}"
+                            )
+                    api_visibility = _typed_bool(_field(type_api, "is_public"))
+                    db_visibility = _typed_bool(_field(type_row, "is_public"))
+                    if api_visibility is None or db_visibility is None or api_visibility != db_visibility:
+                        result.blockers.append(
+                            f"volume type API/DB visibility mismatch: {type_id}"
+                        )
+                    type_facts["api_observed"] = type_api_facts
                     type_facts["extra_specs"] = _safe_key_values([
                         item for item in extra_specs if _row_id(item, "volume_type_id") == type_id
                     ])
@@ -457,6 +733,13 @@ class CinderCollector:
                         and not _is_deleted(item)
                         and (project_id := _row_id(item, "project_id")) is not None
                     })
+                    if (
+                        db_visibility is False
+                        and not type_facts["project_ids"]
+                    ):
+                        result.blockers.append(
+                            f"private volume type visibility missing: {type_id}"
+                        )
                     type_qos_ids = {
                         _row_id(item, "qos_specs_id") for item in type_qos
                         if _row_id(item, "volume_type_id") == type_id
@@ -481,8 +764,16 @@ class CinderCollector:
                             if _row_id(item, "specs_id") == qos_id
                             and not _is_deleted(item)
                         ])
+                        if not qos_facts["specifications"]:
+                            result.blockers.append(
+                                f"required QoS specifications missing: {qos_id}"
+                            )
                         type_facts["qos_specs"].append(qos_facts)
                     encryption_rows = [item for item in encryptions if _row_id(item, "volume_type_id") == type_id]
+                    if type_id in key_volume_type_ids and not encryption_rows:
+                        result.blockers.append(
+                            f"required encryption definition missing: {type_id}"
+                        )
                     type_facts["encryption"] = [
                         _allowlisted(item, ("provider", "control_location", "key_size"))
                         for item in encryption_rows
@@ -498,6 +789,23 @@ class CinderCollector:
                 if service_row is None:
                     result.blockers.append(f"required Cinder service missing: {service_id}")
                 else:
+                    volume_host = _field(row, "host")
+                    service_host = _field(service_row, "host")
+                    volume_cluster = _field(row, "cluster_name")
+                    service_cluster = _field(service_row, "cluster_name")
+                    if (
+                        service_host != volume_host
+                        or self._backend_from_host(service_host)
+                        != self._backend_from_host(volume_host)
+                        or service_cluster != volume_cluster
+                    ):
+                        result.blockers.append(
+                            f"Cinder service backend mismatch: {service_id}"
+                        )
+                    if _typed_bool(_field(service_row, "disabled")) is not False:
+                        result.blockers.append(
+                            f"Cinder service not ready: {service_id}"
+                        )
                     add_node("cinder_service", service_id, _allowlisted(service_row, _SERVICE_FIELDS))
                 add_edge(volume.key, f"cinder_service:{service_id}", "managed_by")
             else:
@@ -541,12 +849,60 @@ class CinderCollector:
                     if _row_id(snapshot_api, "id") != snapshot_id:
                         result.blockers.append(f"snapshot API/DB identity mismatch: {snapshot_id}")
                     snapshot_facts = _allowlisted(snapshot_row, _SNAPSHOT_FIELDS)
-                    snapshot_facts.update(_allowlisted(snapshot_api, _SNAPSHOT_FIELDS))
+                    snapshot_api_facts = _allowlisted(
+                        snapshot_api, _SNAPSHOT_FIELDS
+                    )
+                    for field, label in (
+                        ("volume_id", "volume"),
+                        ("group_snapshot_id", "group snapshot"),
+                    ):
+                        if _row_id(snapshot_api, field) != _row_id(snapshot_row, field):
+                            result.blockers.append(
+                                f"snapshot API/DB {label} mismatch: {snapshot_id}"
+                            )
+                    for field in ("status", "volume_size"):
+                        if _field(snapshot_api, field) != _field(snapshot_row, field):
+                            result.blockers.append(
+                                f"snapshot API/DB {field} mismatch: {snapshot_id}"
+                            )
+                    snapshot_facts["api_observed"] = snapshot_api_facts
                     add_node("snapshot", snapshot_id, snapshot_facts, [snapshot_evidence] if snapshot_evidence else [])
                 add_edge(volume.key, f"snapshot:{snapshot_id}", "created_from_snapshot")
             for group_id in (_row_id(row, "group_id"), _row_id(row, "consistencygroup_id")):
-                if group_id and group_id not in group_row_ids:
-                    result.blockers.append(f"required volume group missing: {group_id}")
+                if group_id:
+                    if group_id not in group_row_ids:
+                        result.blockers.append(
+                            f"required volume group missing: {group_id}"
+                        )
+                    add_edge(
+                        volume.key, f"volume_group:{group_id}",
+                        "belongs_to_group",
+                    )
+            group_snapshot_id = _row_id(row, "group_snapshot_id")
+            if group_snapshot_id:
+                if group_snapshot_id not in group_snapshot_rows:
+                    result.blockers.append(
+                        f"required group snapshot missing: {group_snapshot_id}"
+                    )
+                add_edge(
+                    volume.key, f"group_snapshot:{group_snapshot_id}",
+                    "belongs_to_group_snapshot",
+                )
+
+        for snapshot_id, snapshot_row in snapshot_rows.items():
+            group_snapshot_id = _row_id(snapshot_row, "group_snapshot_id")
+            if group_snapshot_id and group_snapshot_id not in group_snapshot_rows:
+                result.blockers.append(
+                    f"required group snapshot missing: {group_snapshot_id}"
+                )
+            parent_group_id = (
+                _row_id(group_snapshot_rows[group_snapshot_id], "group_id")
+                if group_snapshot_id in group_snapshot_rows else None
+            )
+            if parent_group_id and parent_group_id not in group_row_ids:
+                result.blockers.append(
+                    f"required volume group missing: {parent_group_id}"
+                )
 
         # Service list is a second independent API view used to confirm UUID/host identity.
         service_api, service_evidence = self._api(
@@ -573,13 +929,48 @@ class CinderCollector:
                         )
                     )
                 ]
-                if len(matches) != 1:
+                if not matches:
                     result.blockers.append(f"Cinder service API identity missing: {service_id}")
+                elif len(matches) > 1:
+                    result.blockers.append(
+                        f"Cinder service API identity ambiguous: {service_id}"
+                    )
                 elif service_id in service_rows:
                     api_host = _field(matches[0], "host")
                     if api_host != db_host:
                         result.blockers.append(f"Cinder service API/DB host mismatch: {service_id}")
-                    add_node("cinder_service", service_id, _allowlisted(matches[0], ("host", "binary", "status", "state")), [service_evidence] if service_evidence else [])
+                    for field in ("binary", "cluster_name"):
+                        if _field(matches[0], field) != _field(db_service, field):
+                            result.blockers.append(
+                                f"Cinder service API/DB {field} mismatch: {service_id}"
+                            )
+                    if (
+                        self._backend_from_host(api_host)
+                        != self._backend_from_host(db_host)
+                    ):
+                        result.blockers.append(
+                            f"Cinder service backend mismatch: {service_id}"
+                        )
+                    status = _field(matches[0], "status")
+                    state = _field(matches[0], "state")
+                    if (
+                        not isinstance(status, str)
+                        or status.lower() != "enabled"
+                        or not isinstance(state, str)
+                        or state.lower() != "up"
+                    ):
+                        result.blockers.append(
+                            f"Cinder service not ready: {service_id}"
+                        )
+                    service_node = nodes.get(f"cinder_service:{service_id}")
+                    if service_node is not None:
+                        service_node.facts["api_observed"] = _allowlisted(
+                            matches[0], ("host", "binary", "status", "state")
+                        )
+                        service_node.evidence_ids[:] = _dedupe([
+                            *service_node.evidence_ids,
+                            *([service_evidence] if service_evidence else []),
+                        ])
         else:
             result.blockers.append("Cinder service list payload invalid")
 
@@ -673,16 +1064,36 @@ class CinderCollector:
         except Exception as error:
             status = getattr(error, "status_code", None)
             reason = getattr(error, "reason", None)
-            if status in {403, 404}:
-                result.blockers.append(f"encryption key {key_id} metadata access returned {status}")
-            elif reason == "endpoint-missing":
+            if reason == "endpoint-missing":
                 result.unknowns.append(f"encryption key service endpoint missing: {key_id}")
+            elif status in {403, 404}:
+                result.blockers.append(f"encryption key {key_id} metadata access returned {status}")
             else:
                 result.unknowns.append(f"encryption key metadata probe failed: {key_id}")
             return _PolicyMapping({}, self._allow_fixture_aliases), None, True
         actual_evidence_id = _field(evidence, "evidence_id", "id")
         if actual_evidence_id != evidence_id or not isinstance(payload, Mapping):
             result.blockers.append(f"encryption key metadata evidence invalid: {key_id}")
+            return _PolicyMapping({}, self._allow_fixture_aliases), None, True
+        identities = []
+        direct_identity = _field(payload, "id", "uuid")
+        if direct_identity not in (None, ""):
+            identities.append(
+                _openstack_id(direct_identity, self._allow_fixture_aliases)
+            )
+        href = _field(payload, "secret_href", "secret_ref", "href")
+        if isinstance(href, str):
+            path_parts = [item for item in urlparse(href).path.split("/") if item]
+            if path_parts:
+                identities.append(
+                    _openstack_id(
+                        path_parts[-1], self._allow_fixture_aliases
+                    )
+                )
+        if not identities or any(identity != key_id for identity in identities):
+            result.blockers.append(
+                f"encryption key metadata identity mismatch: {key_id}"
+            )
             return _PolicyMapping({}, self._allow_fixture_aliases), None, True
         result.evidence.append({
             "evidence_id": evidence_id, "kind": "openstack-json", "command": command,

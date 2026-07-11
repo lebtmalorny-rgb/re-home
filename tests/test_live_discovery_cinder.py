@@ -88,7 +88,10 @@ CANONICAL_IDS = {
 def canonical_fixture(fixture):
     def replace(value):
         if isinstance(value, str):
-            return CANONICAL_IDS.get(value, value)
+            replaced = CANONICAL_IDS.get(value, value)
+            for alias, canonical in CANONICAL_IDS.items():
+                replaced = replaced.replace(alias, canonical)
+            return replaced
         if isinstance(value, list):
             return [replace(item) for item in value]
         if isinstance(value, dict):
@@ -140,6 +143,149 @@ class CinderCollectorTests(unittest.TestCase):
             ("quality_of_service_specs", {"specs_id": ["qos-1"]}),
             client.queries,
         )
+
+    def test_disabled_or_down_service_blocks(self):
+        cases = (("db-disabled", "disabled", True), ("api-down", "state", "down"))
+        for label, field, value in cases:
+            with self.subTest(label=label):
+                fixture = deepcopy(self.source_fixture)
+                if label == "db-disabled":
+                    fixture["tables"]["services"][0][field] = value
+                else:
+                    fixture["openstack"][3]["payload"][0][field] = value
+                result, _ = collect_from_fixture(fixture)
+                self.assertTrue(any("Cinder service not ready: service-1" in item for item in result.blockers))
+
+    def test_service_binary_and_cluster_must_match_database(self):
+        for field, value in (("binary", "cinder-backup"), ("cluster_name", "other@backend")):
+            with self.subTest(field=field):
+                fixture = deepcopy(self.source_fixture)
+                fixture["openstack"][3]["payload"][0][field] = value
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn(f"Cinder service API/DB {field} mismatch: service-1", result.blockers)
+
+    def test_backend_mismatch_and_ambiguity_block(self):
+        mismatch = deepcopy(self.source_fixture)
+        mismatch["tables"]["services"][0]["host"] = "cinder@other#pool"
+        result, _ = collect_from_fixture(mismatch)
+        self.assertIn("Cinder service backend mismatch: service-1", result.blockers)
+
+        ambiguous = deepcopy(self.source_fixture)
+        duplicate = deepcopy(ambiguous["openstack"][3]["payload"][0])
+        duplicate.pop("id")
+        duplicate.pop("uuid")
+        ambiguous["openstack"][3]["payload"].append(duplicate)
+        result, _ = collect_from_fixture(ambiguous)
+        self.assertIn("Cinder service API identity ambiguous: service-1", result.blockers)
+
+    def test_active_semantic_families_require_schema_and_rows(self):
+        cases = (
+            ("volume_type_qos_specs", "Cinder active schema family missing: volume_type_qos_specs"),
+            ("encryption", "Cinder active schema family missing: encryption"),
+            ("volume_type_projects", "Cinder active schema family missing: volume_type_projects"),
+            ("qos_specs", "Cinder active schema family missing: qos_specs"),
+            ("quality_of_service_specs", "Cinder active schema family missing: quality_of_service_specs"),
+        )
+        for table, expected in cases:
+            with self.subTest(table=table):
+                fixture = deepcopy(self.source_fixture)
+                fixture["schema_tables"].remove(table)
+                fixture["tables"].pop(table, None)
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn(expected, [*result.blockers, *result.unknowns])
+
+    def test_active_semantic_families_require_rows(self):
+        cases = (
+            ("encryption", "required encryption definition missing: type-1"),
+            ("volume_type_projects", "private volume type visibility missing: type-1"),
+            ("qos_specs", "required QoS definition missing: qos-1"),
+            ("quality_of_service_specs", "required QoS specifications missing: qos-1"),
+        )
+        for table, expected in cases:
+            with self.subTest(table=table):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"][table] = []
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn(expected, result.blockers)
+
+    def test_group_and_group_snapshot_dependency_closure(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["tables"]["volumes"][0]["group_id"] = "group-1"
+        fixture["openstack"][0]["payload"]["group_id"] = "group-1"
+        fixture["tables"]["groups"] = [{
+            "id": "group-1", "name": "database-group", "status": "available",
+            "group_type_id": "group-type-1", "deleted": False,
+        }]
+        fixture["tables"]["snapshots"] = [{
+            "id": "snapshot-1", "volume_id": "volume-1", "status": "available",
+            "volume_size": 1, "group_snapshot_id": "group-snapshot-1", "deleted": False,
+        }]
+        fixture["tables"]["group_snapshots"] = [{
+            "id": "group-snapshot-1", "group_id": "group-1",
+            "status": "available", "name": "backup", "deleted": False,
+        }]
+        result, client = collect_from_fixture(fixture)
+        keys = {node.key for node in result.nodes}
+        self.assertIn("volume_group:group-1", keys)
+        self.assertIn("group_snapshot:group-snapshot-1", keys)
+        required = {(edge.source, edge.target) for edge in result.edges if edge.required}
+        self.assertIn(("volume:volume-1", "volume_group:group-1"), required)
+        self.assertIn(("snapshot:snapshot-1", "group_snapshot:group-snapshot-1"), required)
+        self.assertIn(("group_snapshot:group-snapshot-1", "volume_group:group-1"), required)
+        self.assertIn(("groups", {"id": ["group-1"]}), client.queries)
+        self.assertIn(("group_snapshots", {"id": ["group-snapshot-1"]}), client.queries)
+        self.assertEqual([], result.blockers)
+
+    def test_missing_group_dependencies_block(self):
+        cases = (("groups", "required volume group missing: group-1"), ("group_snapshots", "required group snapshot missing: group-snapshot-1"))
+        for table, expected in cases:
+            with self.subTest(table=table):
+                fixture = deepcopy(self.source_fixture)
+                fixture["tables"]["volumes"][0]["group_id"] = "group-1"
+                fixture["openstack"][0]["payload"]["group_id"] = "group-1"
+                fixture["tables"]["groups"] = [{"id": "group-1", "name": "g", "deleted": False}]
+                fixture["tables"]["snapshots"] = [{"id": "snapshot-1", "volume_id": "volume-1", "group_snapshot_id": "group-snapshot-1", "status": "available", "volume_size": 1, "deleted": False}]
+                fixture["tables"]["group_snapshots"] = [{"id": "group-snapshot-1", "group_id": "group-1", "status": "available", "deleted": False}]
+                fixture["tables"][table] = []
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn(expected, result.blockers)
+
+    def test_api_db_contradictions_block_without_overwriting_db_facts(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["openstack"][0]["payload"]["status"] = "available"
+        fixture["openstack"][1]["payload"]["status"] = "detached"
+        fixture["openstack"][2]["payload"]["is_public"] = True
+        result, _ = collect_from_fixture(fixture)
+        self.assertIn("volume API/DB status mismatch: volume-1", result.blockers)
+        self.assertIn("attachment API/DB status mismatch: attachment-1", result.blockers)
+        self.assertIn("volume type API/DB visibility mismatch: type-1", result.blockers)
+        volume = next(node for node in result.nodes if node.key == "volume:volume-1")
+        self.assertEqual("in-use", volume.facts["status"])
+        self.assertEqual("available", volume.facts["api_observed"]["status"])
+
+    def test_mismatched_barbican_secret_href_blocks(self):
+        fixture = deepcopy(self.source_fixture)
+        fixture["openstack"][4]["payload"]["Secret href"] = "https://barbican.example/v1/secrets/key-other"
+        result, _ = collect_from_fixture(fixture)
+        self.assertIn("encryption key metadata identity mismatch: key-1", result.blockers)
+
+    def test_active_attachment_requires_nonempty_driver_evidence(self):
+        cases = (
+            ({}, None),
+            ({"driver_volume_type": "iscsi", "data": {}}, None),
+            ({"driver_volume_type": "", "data": {"target_portals": ["x"]}}, None),
+            ({"driver_volume_type": "iscsi", "data": {"target_portals": ["p1", "p2"], "target_iqns": ["i1"]}}, None),
+            (None, {"auth_token": "only-secret"}),
+        )
+        for connection_info, connector in cases:
+            with self.subTest(connection_info=connection_info, connector=connector):
+                fixture = deepcopy(self.source_fixture)
+                if connection_info is not None:
+                    fixture["tables"]["volume_attachment"][0]["connection_info"] = json.dumps(connection_info)
+                if connector is not None:
+                    fixture["tables"]["volume_attachment"][0]["connector"] = json.dumps(connector)
+                result, _ = collect_from_fixture(fixture)
+                self.assertIn("active attachment driver evidence invalid: attachment-1", result.blockers)
 
     def test_missing_encryption_key_uuid_is_blocker(self):
         fixture = deepcopy(self.source_fixture)

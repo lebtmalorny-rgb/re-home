@@ -29,11 +29,29 @@ def _valid_path(value: object) -> Optional[str]:
 
 def _expected_size(resource: Mapping[str, Any]) -> Tuple[Optional[int], bool]:
     if "expected_size" not in resource:
-        return None, True
+        return None, False
     value = resource["expected_size"]
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         return None, False
     return value, True
+
+
+def _allowed_names(value: object) -> Optional[set[str]]:
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    names = {_valid_name(item) for item in value}
+    if None in names or not names:
+        return None
+    return {item for item in names if item is not None}
+
+
+def _allowed_roots(value: object) -> Optional[Sequence[PurePosixPath]]:
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    roots = [_valid_path(item) for item in value]
+    if any(item is None for item in roots):
+        return None
+    return [PurePosixPath(item) for item in roots if item is not None]
 
 
 def _json_size(payload: object) -> Optional[int]:
@@ -71,29 +89,40 @@ def _parse_size(kind: str, stdout: object) -> Optional[int]:
                     return raw
                 if isinstance(raw, str) and raw.isdigit():
                     return int(raw)
+                if isinstance(raw, str) and re.fullmatch(r"\d+\.0+", raw):
+                    return int(raw.split(".", 1)[0])
     return None
 
 
 def _command(kind: str, resource: Mapping[str, Any]) -> Optional[Sequence[str]]:
     if kind == "nfs":
         path = _valid_path(resource.get("path"))
-        return ["stat", "--format", "%s", path] if path else None
+        roots = _allowed_roots(resource.get("allowed_roots"))
+        if path is None or roots is None:
+            return None
+        parsed = PurePosixPath(path)
+        if not any(root in parsed.parents for root in roots):
+            return None
+        return ["stat", "--format", "%s", path]
     if kind == "rbd":
         pool = _valid_name(resource.get("pool"))
         image = _valid_name(resource.get("image"))
-        return ["rbd", "info", "--format", "json", f"{pool}/{image}"] if pool and image else None
+        allowed = _allowed_names(resource.get("allowed_pools"))
+        return ["rbd", "info", "--format", "json", f"{pool}/{image}"] if pool and image and allowed is not None and pool in allowed else None
     if kind == "lvm":
         vg = _valid_name(resource.get("vg"))
         lv = _valid_name(resource.get("lv"))
+        allowed = _allowed_names(resource.get("allowed_vgs"))
         return [
             "lvs", "--reportformat", "json", "--units", "b", "--nosuffix",
             f"{vg}/{lv}",
-        ] if vg and lv else None
+        ] if vg and lv and allowed is not None and vg in allowed else None
     return None
 
 
 def probe_storage(kind: object, resource: object, runner) -> CheckResult:
     normalized_kind = kind.lower() if isinstance(kind, str) else ""
+    normalized_kind = "nfs" if normalized_kind == "file" else normalized_kind
     if normalized_kind not in {"nfs", "rbd", "lvm"}:
         return CheckResult(
             "cinder.storage.unsupported", "UNKNOWN", "storage driver is unsupported"

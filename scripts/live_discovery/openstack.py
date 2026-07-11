@@ -59,7 +59,7 @@ def _sanitized_probe_failure(
         stderr="[REDACTED]",
     )
     failure = ProbeFailed(sanitized)
-    if failure_status is not None:
+    if failure_status is not None and not endpoint_missing:
         failure.status_code = failure_status
     if endpoint_missing:
         failure.reason = "endpoint-missing"
