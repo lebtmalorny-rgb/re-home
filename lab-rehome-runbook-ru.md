@@ -107,9 +107,136 @@ runtime ВМ. Это не только Masakari: на других класте�
 Если сервис не классифицирован, playbook не должен сам решать, что с ним делать.
 Оператор должен явно добавить его в одну из групп.
 
-## Первый реализованный шаг
+## Обязательный live discovery gate
 
-Сначала собрать host-scoped manifest по re-home host и ВМ. Это выполняется
+До старого manifest/schema/import пути нужно выполнить новый live gate:
+
+```bash
+cd /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible
+ansible-playbook -i inventory/lab-os1-to-os2.yml \
+  playbooks/02b-discover-live-resource-graph.yml \
+  --ask-vault-pass \
+  -e @/secure/live-discovery-paths.vault.yml \
+  -e live_discovery_run_id=rehome-20260712-review01
+```
+
+Vault/extra-vars file должен задавать непустые paths HMAC key, обоих probe
+JSON, двух разных Glance tokens, source/target clouds и per-controller Kolla
+passwords. Точные inventory/Vault примеры приведены во
+[входных данных оператора](operator-inputs-ru.md). Cinder sensitive paths
+условно обязательны при active attachments; свежий target migration envelope
+нужен, чтобы target profile не остался `UNKNOWN`.
+
+Для другого окружения заменить inventory, но не порядок. Живые source/target
+API, БД, compute runtime, target capability, Cinder backing и Glance store
+являются источником истины. Uploaded SQL/schema dump — только пример/fixture,
+не способ наполнить discovery. Source profile — `keystack-2025.1`; target
+принимается только при live proof `vanilla-openstack-2025.1-epoxy`.
+
+Playbook выполняет семь plays: local freeze/owner, source control, target
+control, re-home runtime, target reference capability, source/target probes и
+local assembly. API roots подписываются HMAC; `--phase verify` проверяет план и
+live schema до SQL (verify-before-SQL); затем выполняются только UUID-scoped
+SELECT и `--phase combine`. Masakari/DRS не входят в этот graph/verdict.
+
+### Preflight оператора
+
+Перед командой проверить:
+
+- в каждой из `source_control`, `target_control`, `rehome_compute`,
+  `target_reference_compute` ровно один host;
+- `rehome_host`, local/remote dirs, target profile, schema policy, storage map
+  и fail-closed flags совпадают на source/target controller;
+- clouds files, Kolla passwords, HMAC key, probe configs и два разных Glance
+  tokens принадлежат uid оператора, mode `0600`, не symlink;
+- HMAC key содержит 16..4096 bytes;
+- `live_discovery_source_glance_token_file_local` и
+  `live_discovery_target_glance_token_file_local` имеют разные checksums;
+- storage map отражает реальный backend, а не lab assumption;
+- все overrideable argv заданы YAML lists и не содержат shell
+  operators/mutations; playbook сам передаёт frozen config в
+  `argv_policy.py --config-json` до remote execution;
+- доступен writable `live_discovery_local_dir`, но каталога конкретного
+  `<run-id>` ещё нет;
+- опциональное online-migration evidence свежее (не старше 24 часов) и содержит
+  exact current revisions. Сам playbook `online_data_migrations` не запускает.
+
+Для NFS текущего lab используется map из inventory. Решение не ограничено NFS:
+NFS/file, RBD и LVM имеют read-only size probes. iSCSI, Fibre Channel или
+vendor backend должны быть объявлены фактическим kind с
+`probe_template: unsupported` и дадут `UNKNOWN`, пока нет reviewed безопасного
+probe. Пустая `live_discovery_storage_backends: {}` также даёт `UNKNOWN`.
+
+### Где искать результат
+
+```text
+{{ local_artifact_dir }}/live-discovery/<run-id>/
+```
+
+Проверить `readiness-report.json`, `readiness-report.md`,
+`resource-graph.json`, `schema-mapping.json`, `uuid-filters.json` и
+`evidence-index.json`. Полный normal set содержит восемь файлов, перечисленных
+в [документе об артефактах](docs/live-discovery-artifacts-ru.md).
+
+```text
+READY=0
+READY_WITH_WARNINGS=0
+UNKNOWN=2
+BLOCKED=3
+```
+
+Продолжать к import/cutover можно только после rc `0` и инженерного review
+всех warnings. `UNKNOWN` запрещает продолжение: отсутствие probe/evidence не
+означает готовность.
+
+### Troubleshooting
+
+| Симптом | Проверка | Действие |
+| --- | --- | --- |
+| preflight до remote commands | singleton groups, controller variable equality, `0600`, file owner/size | исправить inventory/input; не обходить assert |
+| `another owner`/collision | `.control/owners/<run-id>` и completion marker | для rerun выбрать новый `run-id`; не удалять concurrent owner |
+| verify не создал SQL | HMAC, API/filter/plan binding, live `information_schema`, schema policy | повторить acquisition новым run ID после исправления; не запускать SQL вручную |
+| Cinder `UNKNOWN` | backend kind/delegate, protected attachment summary, backing identity/size | добавить reviewed NFS/file/RBD/LVM probe либо отдельный безопасный template для другого backend |
+| Glance `BLOCKED/UNKNOWN` | отдельный side token, catalog origin, store ID, size, Range response | исправить endpoint/access/store evidence; не отключать required image probe |
+| Neutron `BLOCKED` | required edge closure, segment tuple, ML2 binding/levels, OVS/OVN evidence | исправить metadata/runtime readiness до запуска target agent |
+| target profile `UNKNOWN` | official Kolla image repo/tag/digest/label, DB revisions, migration evidence | получить актуальное read-only evidence; не подменять profile inventory string |
+| unreachable/failure | owner marker и protected dirs | дать штатному rescue cleanup завершиться; проверить, что удалён только incomplete owner этого run |
+
+### Cleanup, rerun и concurrency
+
+Успех удаляет frozen HMAC/clouds/tokens/configs и сохраняет completed owner
+marker. Failure/unreachable запускает ownership-checked cleanup. Не выполнять
+ручной `rm -rf` для общего `live-discovery` или `.control/owners`: это может
+затронуть concurrent run. Если процесс был аварийно прерван, сначала сверить
+`run-id`, owner token/completion marker и отсутствие активного процесса; затем
+оформить отдельный cleanup по процедуре change management.
+
+Для повторного запуска использовать новый auto-generated ID (оставить
+`live_discovery_run_id: ""`) или новый явный ID. Нельзя «дополнить» старый
+partial run: final set записывается атомарно. Protected
+`sensitive/evidence.json` (`0700`/`0600`) хранить отдельно и удалить после
+минимально необходимого review/rollback window; обычные artifacts сохранять с
+inventory revision и change record.
+
+На текущем этапе репозиторий прошёл fixture/unit tests и Ansible
+`syntax-check`. Это не утверждение о выполненном live deployment: операторский
+запуск на конкретном кластере и review его evidence остаются обязательными.
+
+## Короткая последовательность
+
+1. Сначала обязательный
+   `02b-discover-live-resource-graph.yml`: live graph, verdict и authoritative
+   resource-scoped directional mapping в `schema-mapping.json`.
+2. Только после rc `0` при необходимости выполнить необязательный legacy
+   `02a-build-rehome-manifest.yml` для старых helper-фаз.
+3. `03a`/`03b` запускать только как необязательную legacy-диагностику полного
+   schema diff; полное равенство Keystack и Epoxy не требуется.
+4. Затем выполнять reviewed planning/import/cutover фазы ниже.
+
+## Необязательный legacy manifest и последующие фазы
+
+Следующий старый шаг собирает host-scoped manifest по re-home host и ВМ. Он не
+заменяет `02b` и запускается только в согласованном общем порядке. Выполняется
 playbook-ом, helper-скрипты внутри него являются implementation detail:
 
 ```bash
@@ -136,8 +263,12 @@ artifacts/os1-compute-02/rehome_manifest.yml
 artifacts/os1-compute-02/rehome_manifest.json
 ```
 
-Перед любыми импортами metadata и перед cutover нужно выполнить read-only
-проверку совместимости схем БД:
+`03a`/`03b` — только необязательная legacy-диагностика полного schema diff для
+близких/same-schema сред. Authoritative gate уже сформирован `02b` как
+resource-scoped directional mapping в `schema-mapping.json`. Для Keystack →
+Epoxy полное равенство schema не требуется.
+
+Если дополнительная полная диагностика полезна, выполнить:
 
 ```bash
 cd /Users/dmitry/Desktop/test_migration/migration_project/openstack-rehome-ansible
@@ -159,8 +290,9 @@ Playbook собирает:
 artifacts/schema-compat/os1-to-os2/
 ```
 
-Если версии migrations или `information_schema` отличаются, playbook падает и
-re-home нельзя продолжать до ручного разбора diff.
+Если версии migrations или полный `information_schema` отличаются, сам legacy
+playbook падает. Это повод изучить diagnostic diff, но его rc не заменяет и не
+усиливает verdict `02b` для vendor → vanilla направления.
 
 После `03a` можно запустить локальную нормализацию уже собранных artifacts:
 
@@ -176,9 +308,10 @@ artifacts/schema-compat/os1-to-os2/normalized-diffs/
 artifacts/schema-compat/os1-to-os2/normalization-summary.txt
 ```
 
-Нормализация пока консервативная: удаляет пустые строки и известный command
-noise, затем сортирует normalized lines. Если normalized diff остается
-непустым, metadata import и cutover все равно запрещены.
+Нормализация консервативная: удаляет пустые строки и известный command noise,
+затем сортирует normalized lines. Непустой полный diff ожидаем между Keystack и
+Epoxy; обязательным остаётся отсутствие blocker-ов в directional mapping и
+общий rc `0` от `02b`.
 
 После успешной проверки схем нужно построить target API prep report. Этот шаг
 не является cutover и по умолчанию ничего не создает:

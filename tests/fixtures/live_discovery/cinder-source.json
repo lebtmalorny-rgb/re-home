@@ -1,0 +1,117 @@
+{
+  "side": "source",
+  "schema_tables": [
+    "volumes",
+    "volume_attachment",
+    "volume_types",
+    "volume_type_extra_specs",
+    "volume_type_projects",
+    "volume_type_qos_specs",
+    "qos_specs",
+    "quality_of_service_specs",
+    "services",
+    "encryption",
+    "snapshots",
+    "volume_metadata",
+    "volume_glance_metadata",
+    "volume_admin_metadata",
+    "groups",
+    "group_snapshots"
+  ],
+  "openstack": [
+    {
+      "command": ["volume", "show", "volume-1", "-f", "json"],
+      "payload": {
+        "id": "volume-1",
+        "name": "database",
+        "status": "in-use",
+        "size": 1,
+        "type": "type-1",
+        "volume_type_id": "type-1",
+        "service_uuid": "service-1",
+        "host": "cinder@backend#nfs",
+        "cluster_name": "cluster@backend",
+        "attachments": [{"id": "attachment-1"}],
+        "connection_info": {"auth_password": "api-secret"}
+      }
+    },
+    {
+      "command": ["volume", "attachment", "show", "attachment-1", "-f", "json"],
+      "payload": {
+        "id": "attachment-1",
+        "volume_id": "volume-1",
+        "server_id": "instance-1",
+        "status": "attached",
+        "attach_mode": "rw"
+      }
+    },
+    {
+      "command": ["volume", "type", "show", "type-1", "-f", "json"],
+      "payload": {"id": "type-1", "name": "encrypted-nfs", "is_public": false}
+    },
+    {
+      "command": ["volume", "service", "list", "--long", "-f", "json"],
+      "payload": [{
+        "id": "service-1",
+        "uuid": "service-1",
+        "host": "cinder@backend#nfs",
+        "cluster_name": "cluster@backend",
+        "binary": "cinder-volume",
+        "status": "enabled",
+        "state": "up"
+      }]
+    },
+    {
+      "command": ["secret", "get", "key-1", "-f", "json"],
+      "payload": {"Secret href": "https://barbican.example/v1/secrets/key-1", "status": "ACTIVE"}
+    }
+  ],
+  "tables": {
+    "volumes": [{
+      "id": "volume-1",
+      "display_name": "database",
+      "status": "in-use",
+      "size": 1,
+      "volume_type_id": "type-1",
+      "service_uuid": "service-1",
+      "host": "cinder@backend#nfs",
+      "cluster_name": "cluster@backend",
+      "encryption_key_id": "key-1",
+      "storage_backend_id": "nfs-1",
+      "deleted": false
+    }],
+    "volume_attachment": [{
+      "id": "attachment-1",
+      "volume_id": "volume-1",
+      "instance_uuid": "instance-1",
+      "attach_status": "attached",
+      "attach_mode": "rw",
+      "connection_info": "{\"driver_volume_type\":\"iscsi\",\"data\":{\"target_portals\":[\"10.0.0.10:3260\",\"10.0.0.11:3260\"],\"target_iqns\":[\"iqn.1\",\"iqn.2\"],\"auth_password\":\"chap-secret\",\"multipath\":true}}",
+      "connector": "{\"host\":\"compute-1\",\"initiator\":\"iqn.connector\",\"auth_token\":\"token-secret\"}",
+      "deleted": false
+    }],
+    "volume_types": [{"id": "type-1", "name": "encrypted-nfs", "is_public": false, "deleted": false}],
+    "volume_type_extra_specs": [{"volume_type_id": "type-1", "key": "volume_backend_name", "value": "backend"}],
+    "volume_type_projects": [{"volume_type_id": "type-1", "project_id": "project-1", "deleted": false}],
+    "volume_type_qos_specs": [{"volume_type_id": "type-1", "qos_specs_id": "qos-1"}],
+    "qos_specs": [{"id": "qos-1", "name": "gold", "consumer": "both", "deleted": false}],
+    "quality_of_service_specs": [{"id": "qos-row-1", "specs_id": "qos-1", "key": "read_iops_sec", "value": "1000", "deleted": false}],
+    "services": [{
+      "uuid": "service-1",
+      "host": "cinder@backend#nfs",
+      "cluster_name": "cluster@backend",
+      "binary": "cinder-volume",
+      "topic": "cinder-volume",
+      "disabled": false,
+      "backend_name": "backend",
+      "deleted": false
+    }],
+    "encryption": [{"volume_type_id": "type-1", "provider": "luks", "control_location": "front-end", "key_size": 256}],
+    "snapshots": [],
+    "volume_metadata": [{"volume_id": "volume-1", "key": "purpose", "value": "database"}],
+    "volume_glance_metadata": [{"volume_id": "volume-1", "key": "image_id", "value": "image-1"}],
+    "volume_admin_metadata": [{"volume_id": "volume-1", "key": "readonly", "value": "False"}],
+    "groups": [],
+    "group_snapshots": []
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "side": "source",
+  "network_backend": "ovs",
+  "schema_tables": [
+    "ports", "ipallocations", "networks", "subnets", "networksegments",
+    "ml2_port_bindings", "ml2_distributed_port_bindings",
+    "ml2_port_binding_levels", "securitygroups", "securitygrouprules",
+    "securitygroupportbindings", "allowedaddresspairs", "portdnses",
+    "dnsnameservers", "extradhcpopts", "qos_port_policy_bindings",
+    "qos_network_policy_bindings", "qos_fip_policy_bindings", "qos_policies",
+    "trunks", "subports", "routers", "routerports", "routerroutes",
+    "floatingips", "portforwardings", "address_groups",
+    "address_associations", "addressgrouprbacs"
+  ],
+  "openstack": [
+    {
+      "command": ["port", "show", "port-1", "-f", "json"],
+      "payload": {
+        "id": "port-1", "network_id": "network-1",
+        "mac_address": "fa:16:3e:12:34:56", "device_id": "instance-1",
+        "device_owner": "compute:nova", "binding_host_id": "compute-023",
+        "binding_vif_type": "ovs", "security_group_ids": ["sg-1"]
+      }
+    },
+    {
+      "command": ["network", "show", "network-1", "-f", "json"],
+      "payload": {"id": "network-1", "name": "tenant-net", "port_security_enabled": true}
+    }
+  ],
+  "tables": {
+    "ports": [{"id": "port-1", "network_id": "network-1", "mac_address": "fa:16:3e:12:34:56", "device_id": "instance-1", "device_owner": "compute:nova"}],
+    "ipallocations": [{"port_id": "port-1", "network_id": "network-1", "subnet_id": "subnet-1", "ip_address": "192.0.2.10"}],
+    "networks": [{"id": "network-1", "name": "tenant-net"}],
+    "subnets": [{"id": "subnet-1", "network_id": "network-1", "cidr": "192.0.2.0/24"}],
+    "networksegments": [{"id": "segment-1", "network_id": "network-1", "network_type": "vxlan", "physical_network": null, "segmentation_id": 101}],
+    "ml2_port_bindings": [{"port_id": "port-1", "host": "compute-023", "vif_type": "ovs", "vnic_type": "normal"}],
+    "ml2_distributed_port_bindings": [],
+    "ml2_port_binding_levels": [{"port_id": "port-1", "host": "compute-023", "level": 0, "driver": "openvswitch", "segment_id": "segment-1"}],
+    "securitygroups": [{"id": "sg-1", "name": "default"}],
+    "securitygrouprules": [{"id": "rule-1", "security_group_id": "sg-1", "remote_address_group_id": "address-group-1"}],
+    "securitygroupportbindings": [{"port_id": "port-1", "security_group_id": "sg-1"}],
+    "allowedaddresspairs": [{"port_id": "port-1", "mac_address": "fa:16:3e:12:34:56", "ip_address": "192.0.2.11"}],
+    "portdnses": [{"port_id": "port-1", "dns_name": "workload-1"}],
+    "dnsnameservers": [{"subnet_id": "subnet-1", "address": "192.0.2.53"}],
+    "extradhcpopts": [{"port_id": "port-1", "opt_name": "mtu", "opt_value": "1450"}],
+    "qos_port_policy_bindings": [{"port_id": "port-1", "policy_id": "qos-1"}],
+    "qos_network_policy_bindings": [],
+    "qos_fip_policy_bindings": [],
+    "qos_policies": [{"id": "qos-1", "name": "gold"}],
+    "trunks": [{"id": "trunk-1", "port_id": "port-1", "name": "vm-trunk"}],
+    "subports": [],
+    "routers": [{"id": "router-1", "name": "router"}],
+    "routerports": [{"router_id": "router-1", "port_id": "port-1", "port_type": "network:router_interface"}],
+    "routerroutes": [{"router_id": "router-1", "destination": "198.51.100.0/24", "nexthop": "192.0.2.1"}],
+    "floatingips": [{"id": "fip-1", "fixed_port_id": "port-1", "router_id": "router-1", "floating_network_id": "network-external"}],
+    "portforwardings": [{"id": "pf-1", "floatingip_id": "fip-1", "internal_port_id": "port-1"}],
+    "address_groups": [{"id": "address-group-1", "name": "trusted"}],
+    "address_associations": [{"address_group_id": "address-group-1", "address": "203.0.113.0/24"}],
+    "addressgrouprbacs": []
+  },
+  "runtime": {
+    "nodes": [
+      {"kind": "runtime_interface", "id": "tap-port-1", "facts": {"port_id": "port-1", "source": "br-int"}},
+      {"kind": "ovs_port", "id": "tap-port-1", "facts": {"bridge": "br-int"}}
+    ],
+    "edges": [
+      {"source": "runtime_interface:tap-port-1", "target": "port:port-1", "relation": "maps_to_port"},
+      {"source": "ovs_port:tap-port-1", "target": "port:port-1", "relation": "maps_to_port"}
+    ]
+  }
+}

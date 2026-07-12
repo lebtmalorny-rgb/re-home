@@ -1,137 +1,139 @@
-# Поведение Neutron/OVS во время re-home
+# Готовность Neutron и dataplane при re-home
 
-Этот документ фиксирует важный failure mode, обнаруженный в lab `os1 -> os2`.
+Документ объединяет обнаруженный в lab OVS failure mode и требования нового
+read-only live discovery. Одинаковый CIDR, MAC/fixed IP и API status `ACTIVE`
+не доказывают, что target agent безопасно примет уже существующий tap/logical
+port.
 
 ## Главный вывод
 
-Одинаковая сеть в source и target cluster, одинаковый CIDR и сохраненный
-`fixed_ip` ВМ недостаточны для непрерывности сети.
+Для каждого selected Nova port должен быть закрыт полный required dependency
+graph. Target должен иметь exact port/network UUID и единственный совместимый
+segment tuple `(network_type, physical_network, segmentation_id)`, а runtime
+evidence обязано соответствовать выбранному backend OVS или OVN. Любая
+отсутствующая/противоречивая обязательная связь даёт `BLOCKED`/`UNKNOWN`.
 
-Для OVS cutover порт считается готовым не тогда, когда `openstack port show`
-показывает `ACTIVE`, а тогда, когда target Neutron plugin при RPC-запросе от
-target `neutron_openvswitch_agent` возвращает этот port как bound на
-`rehome_host`.
+Перед import/cutover выполняется
+[`02b-discover-live-resource-graph.yml`](playbooks/02b-discover-live-resource-graph.yml).
+Source/target live API и UUID-scoped DB queries — источник истины; dump может
+быть только fixture.
 
-Для running VM нужно, чтобы target Neutron не только показывал через API:
+## Замыкание основных зависимостей порта
 
-- тот же port UUID;
-- тот же MAC;
-- тот же fixed IP;
-- `binding_host_id = rehome_host`;
-- `binding_vif_type = ovs`;
-- `status = ACTIVE`.
+Для каждого port собираются и сопоставляются API и DB facts:
 
-Target Neutron OVS agent при первом sync должен получить от target Neutron
-plugin полноценный bound-port. Если plugin отвечает, что port не bound, agent
-считает локальный tap/OVS port невалидным и может почистить flows в `br-int`,
-`br-ex` и `br-tun`. QEMU domain и tap-интерфейс при этом остаются живыми, но L2
-dataplane ВМ падает.
+- `ports`: UUID, network UUID, project, MAC, status, device owner/id,
+  `binding_host_id`, vif type/details/profile и port security;
+- fixed IP и `ipallocations`, network, subnet, allocation pools, host routes,
+  DNS/DHCP/service types;
+- `networksegments`, network type, physical network и segmentation ID;
+- обязательные `ml2_port_bindings`, distributed bindings и все
+  `ml2_port_binding_levels`;
+- security group bindings/rules/RBAC и `allowed-address-pairs`;
+- port DNS и `extra DHCP options`;
+- active agents, host/segment mappings.
 
-Практическое правило: для OVS target DB должна содержать согласованный набор
-строк `ports`, `ipallocations`, `ml2_port_bindings`,
-`ml2_port_binding_levels`, `networksegments` и security group bindings для
-каждого переносимого port UUID. В нашем lab отсутствие
-`ml2_port_binding_levels` было достаточным условием для обрыва ping после
-старта target OVS agent.
+Наличие binding level не заменяет `ml2_port_bindings`. Каждый binding level
+обязан ссылаться на существующий segment той же network. Missing/malformed
+host, level, tuple или API/DB network mismatch блокирует readiness даже тогда,
+когда одинаково ошибочные source/target значения формально совпадают.
 
-## Наблюдение в lab
+## Полное замыкание дополнительных зависимостей
 
-Во время запуска target `neutron_openvswitch_agent` на re-home host:
+Optional schema family включается только при live schema capability и
+фактической UUID-связи с выбранным root. После активации её required edge уже не
+optional:
 
-1. Source `nova_compute` и source `neutron_openvswitch_agent` были остановлены.
-2. Target `neutron_openvswitch_agent` стартовал с target config и target image.
-3. Target Neutron API показывал port ВМ как `ACTIVE`, с сохраненным
-   `192.168.10.100`, MAC и `binding_host_id`.
-4. Но в логах target OVS agent появилась диагностическая картина:
-   - `Device <port_uuid> is not bound`;
-   - `Device <port_uuid> not defined on plugin or binding failed`;
-   - затем `Cleaning stale br-int flows`, `Cleaning stale br-ex flows`,
-     `Cleaning stale br-tun flows`.
-5. После этого ping до ВМ пропал, хотя libvirt domain и `domiflist` не
-   изменились.
-6. После rollback на source `neutron_openvswitch_agent` связь восстановилась.
+- QoS policy и port/network/FIP/router bindings;
+- trunks и `subports`; parent раскрывает child ports рекурсивно, а выбранный
+  child раскрывает parent и core dependencies;
+- routers, router ports/routes, floating IP, router/FIP `port forwarding`;
+- security rules с remote `address groups`, address group RBAC и address
+  scopes;
+- DNS, DHCP и service-type зависимости.
 
-Практический смысл: target API-visible binding и target agent RPC-visible
-binding - не одно и то же. Для cutover нужен второй вариант.
+Unrelated tenant rows не сканируются и не попадают в graph. DB acquisition
+сразу получает явные UUID filters; отфильтровать полный table dump постфактум
+недопустимо. Bare mappings без Task 2 JSONL provenance отклоняются.
 
-## Что именно нужно проверять
+## Готовность OVS
 
-Перед реальным cutover недостаточно команды уровня API:
+Для OVS target API должен показать exact port, но этого недостаточно. Discovery
+проверяет:
 
 ```bash
 openstack port show <port_uuid>
 ```
 
-Она полезна, но не доказывает, что OVS agent сможет безопасно принять port.
-Нужно дополнительно проверить target ML2/runtime состояние:
+Команда полезна как API-диагностика, но сама по себе не доказывает
+RPC/agent-visible binding и безопасный dataplane sync.
 
-- в target DB есть корректные `ml2_port_bindings` для port UUID и
-  `host = rehome_host`;
-- в target DB есть `ml2_port_binding_levels` для этого port UUID;
-- `segment_id` в binding level указывает на target `networksegments` того же
-  network UUID/provider mapping;
-- target Neutron знает OVS agent на `rehome_host`;
-- при тестовом старте target OVS agent он получает `Port <uuid> updated`, а не
-  `Device <uuid> is not bound`;
-- runtime guard проверяет не только libvirt domain/interface snapshot, но и
-  ping/ARP после первого full sync OVS agent.
+- `ml2_port_bindings.host = rehome_host` и корректный `vif_type`;
+- все `ml2_port_binding_levels` и unique compatible segment;
+- target OVS agent registration/capability;
+- exact пары bridge и port/interface для выбранного Neutron port;
+- source и target runtime evidence независимо; нельзя собрать совпадение из
+  bridge одного node kind и interface другого.
 
-В текущем наборе playbook-ов эту проверку и нормализацию закрывает
-`04j-ensure-neutron-ml2-binding-levels.yml`. Он должен выполняться после
-target DB metadata import/normalization и до запуска `06-cutover-compute.yml`.
-Report-only режим показывает, есть ли binding level, а применение требует
-явного флага `target_neutron_ml2_binding_levels_apply=true`.
+Missing source OVS evidence — `UNKNOWN`; target blocker/unknown propagates в
+итог. Unsupported network backend не превращается в пустой PASS.
 
-Важно: `07-rebind-network-ports.yml` или ручной `openstack port set
---host <rehome_host>` не заменяет `04j`. Rebind меняет API-visible binding, но
-не доказывает, что ML2 binding level уже существует и что OVS agent получит
-port как bound через RPC.
+## Готовность OVN
 
-## Почему это влияет на непрерывность
+Для OVN требуются source и target logical port binding, правильный chassis и
+связь port UUID → logical port → chassis. Наличие chassis где-либо в target не
+компенсирует отсутствующий source binding. Malformed/missing logical port,
+chassis или edge даёт `UNKNOWN/BLOCKED`.
 
-OVS agent при full sync не является пассивным наблюдателем. Он сверяет локальные
-OVS ports с ответами Neutron plugin и перепрограммирует flows/security filters.
-Если target plugin не возвращает active binding для уже существующего tap, agent
-может удалить flows, созданные source agent. В этом состоянии:
+## Наблюдение в lab: `Device <port_uuid> is not bound`
 
-- IP внутри guest остается тем же;
-- Neutron port UUID и MAC могут сохраняться в target API;
-- QEMU продолжает работать;
-- но внешний трафик до ВМ не идет.
+При первом запуске target `neutron_openvswitch_agent`:
 
-Поэтому re-home должен сохранять не только адресацию, но и полноценную
-Neutron/ML2 binding model.
+1. Source Nova/network agents были остановлены.
+2. Target API показывал VM port как `ACTIVE` с прежними UUID, MAC, fixed IP и
+   host binding.
+3. В target DB не хватало согласованного `ml2_port_binding_levels`.
+4. Agent получил `Device <port_uuid> is not bound` / `binding failed`, затем
+   очистил stale flows в `br-int`, `br-ex`, `br-tun`.
+5. QEMU domain/tap остались, но ping пропал; rollback source agent восстановил
+   связь.
 
-## Правило для playbook-ов
+OVS agent при full sync активно сверяет local ports с plugin и
+перепрограммирует flows/security filters. Поэтому API-visible и
+RPC/agent-visible binding — разные доказательства.
 
-`06-cutover-compute.yml` не должен продолжать запуск target `nova_compute`, если
-после target network agent ВМ потеряла ping или logs показывают `not bound`.
-Корректное действие в этом случае:
+## Связь discovery и legacy normalization
 
-1. остановить target network agent;
-2. вернуть source `/etc/kolla/neutron-openvswitch-agent` и source
-   `/etc/kolla/nova-compute`;
-3. запустить source `neutron_openvswitch_agent` и source `nova_compute`;
-4. подтвердить восстановление ping;
-5. исправить target ML2 metadata/binding до следующего cutover.
+Live discovery ничего не исправляет. Он должен завершиться до
+`04j-ensure-neutron-ml2-binding-levels.yml` и показать, какие dependencies
+отсутствуют. Legacy `04j` выполняется после reviewed target DB import и только
+с отдельным apply flag. `07-rebind-network-ports.yml` или ручной
+`openstack port set --host` не заменяет `04j` и не заменяет
+binding-level/segment/runtime proof.
 
-Повторный cutover без исправления target binding приведет к тому же обрыву
-dataplane.
+Перед `06-cutover-compute.yml` нужны одновременно:
 
-## Что нужно доработать в методе
+- target graph без Neutron `UNKNOWN/BLOCKED`;
+- exact API/DB UUID identity и полный required closure;
+- compatible unique segment tuples;
+- корректный OVS/OVN runtime evidence;
+- runtime guard с domain/interface snapshot и reachability;
+- отсутствие `not bound`/binding failure в controlled validation.
 
-Нужен отдельный pre-cutover Neutron binding guard, который работает до остановки
-source agents и проверяет target DB/API consistency по каждому port UUID:
+## Действие при потере dataplane
 
-- `ports`;
-- `ml2_port_bindings`;
-- `ml2_port_binding_levels`;
-- `networksegments`;
-- `ipallocations`;
-- security group bindings/rules;
-- target OVS agent registration for `rehome_host`.
+Cutover не должен продолжать запуск target `nova_compute`, если после target
+network agent пропал ping или появились binding errors:
 
-Для production-процедуры этот guard должен быть обязательным. В lab можно
-продолжать только после того, как target OVS agent перестает писать
-`Device <port_uuid> is not bound` и после старта target network agent ping до ВМ
-остается непрерывным.
+1. остановить target network agent по утверждённой rollback процедуре;
+2. вернуть source Nova/network configs и agents;
+3. подтвердить неизменность domain/interfaces и восстановление ping;
+4. исправить target dependency/segment/runtime readiness;
+5. выполнить новый live discovery с новым `run-id`;
+6. повторять cutover только после rc `0` и review.
+
+Masakari/DRS не участвуют в этой проверке. Итоговые contracts/exit codes
+описаны в [документе об артефактах](docs/live-discovery-artifacts-ru.md), а
+общий поток — в [схеме live discovery](docs/live-discovery-data-flow-ru.md).
+Текущая автоматическая проверка использует fixture/unit tests и Ansible
+`syntax-check`; она не заявляет о выполненном production/live cutover.

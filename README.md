@@ -1,83 +1,106 @@
 # OpenStack compute host re-home
 
 Репозиторий содержит Ansible/runbook для контролируемого re-home compute host
-между двумя OpenStack control planes. Сценарий рассчитан на host, где уже
-работают libvirt/QEMU domains, поэтому главная цель - перевести управление
-host в target control plane без остановки ВМ и без потери ее сетевой
-доступности.
+с уже работающими libvirt/QEMU domains из vendor-modified source control plane
+в target control plane. В текущем профиле source — `keystack-2025.1`, а
+canonical target — живой vanilla OpenStack 2025.1 Epoxy:
+`vanilla-openstack-2025.1-epoxy`.
 
-Это не универсальная кнопка миграции. Перед cutover target control plane должен
-получить согласованную Nova/Neutron/Cinder metadata model для переносимых ВМ,
-ports и volumes.
+Главный обязательный gate — read-only live discovery. Он строит resource graph
+Nova/runtime, Neutron, Cinder и Glance по данным живых кластеров. Загруженная
+schema/DB dump может быть только санитизированной fixture или справочным
+примером и не является production source of truth.
 
 ## Что читать первым
 
-1. `docs/lab-topology-ru.md` - схема lab до и после re-home: Ansible host,
-   source/target control plane, reference compute, re-home host, ВМ и сеть.
-2. `operator-inputs-ru.md` - какие входные данные, secrets, clouds/configs и
-   prerequisites нужно подготовить для другой инфраструктуры.
-3. `playbook-logic-ru.md` - что делает каждый playbook, где он запускается,
-   какие state-changing действия выполняет и какие guardrails применяет.
-4. `lab-rehome-runbook-ru.md` - короткое описание текущего lab и фактического
-   пути os1 -> os2.
-5. `neutron-rehome-behavior-ru.md`,
-   `horizon-rehome-visibility-ru.md`,
-   `nova-ovs-rehome-investigation-ru.md` - отдельные failure modes, которые
-   были найдены в ходе проверки.
+1. [Поток live discovery](docs/live-discovery-data-flow-ru.md) — семь plays,
+   signed API/DB phases, verify-before-SQL и границы доверия.
+2. [Входные данные оператора](operator-inputs-ru.md) — inventory, exact vars,
+   credentials, protected files, storage probes и preflight.
+3. [Артефакты live discovery](docs/live-discovery-artifacts-ru.md) — восемь
+   обычных файлов, contracts, verdict/exit codes и retention.
+4. [Логика playbook-ов](playbook-logic-ru.md) — где выполняется и что меняет
+   каждый playbook.
+5. [Операционный runbook](lab-rehome-runbook-ru.md) — команды, cleanup,
+   troubleshooting и порядок до cutover.
+6. [Lab topology](docs/lab-topology-ru.md) — конкретный стенд os1 → os2;
+   его NFS backend является только примером.
+7. Готовность сервисов: [готовность Cinder](cinder-rehome-readiness-ru.md),
+   [готовность Glance](glance-rehome-readiness-ru.md),
+   [готовность Neutron](neutron-rehome-behavior-ru.md).
 
-## Термины
+## Область и ограничения
 
-- `cp_a` / `source_control` - текущий владелец compute host.
-- `cp_b` / `target_control` - новый владелец compute host.
-- `rehome_compute` - compute host с running domains.
-- `target_reference_compute` - штатный target compute, откуда берутся Kolla
-  config bundles для target runtime containers.
-- `rehome_host` - canonical Nova compute host identity; должен совпадать до и
-  после cutover.
-- `hypervisor_hostname` - значение Nova/libvirt для compute node; обычно равно
-  `rehome_host`.
+Live discovery:
 
-## Главные правила
+- читает source/target OpenStack API, `information_schema`, UUID-scoped SELECT,
+  compute runtime, target capabilities и backing objects;
+- не создаёт и не изменяет OpenStack objects;
+- не импортирует SQL и не копирует Cinder/Glance data;
+- не останавливает/перезапускает services или QEMU domains;
+- не выполняет `nova-manage db online_data_migrations` и
+  `cinder-manage db online_data_migrations`;
+- не переносит Placement allocations; heal остаётся последующей отдельной
+  фазой;
+- полностью исключает Masakari и DRS из collectors, graph и verdict.
 
-1. Никогда не держать source и target `nova-compute` одновременно на одном
-   host.
-2. Не останавливать libvirt/QEMU domains во время cutover.
-3. Сохранять instance UUID, libvirt domain UUID, Neutron port UUID, MAC, fixed
-   IP, Cinder volume ID и attachment ID.
-4. Для OVS/OVN недостаточно сохранить только MAC/IP: tap devices и logical
-   ports завязаны на port UUID и binding metadata.
-5. Первый target `nova_compute` запускать в safe-mode: без running-deleted
-   cleanup, без power-state sync, без lifecycle events, service disabled.
-6. Source DB/configs остаются rollback authority до завершения burn-in.
-7. Для Kolla-Ansible target images нужно скачать до cutover, а активные
-   Nova/network agent containers переключать на target tags именно в cutover,
-   не после принятия ВМ.
+Остальные playbook-и репозитория могут менять состояние и запускаются только
+после review артефактов discovery. Наличие этих playbook-ов не означает, что
+реальный перенос уже выполнен.
 
-## Быстрый запуск в lab
+## Обязательный первый запуск
 
-Команды запускаются с Ansible runner из каталога проекта:
+Сначала адаптировать [generic inventory](inventory/hosts.yml) и
+[`group_vars/all.yml`](group_vars/all.yml), затем выполнить:
 
 ```bash
-cd migration_project/openstack-rehome-ansible
-ansible-playbook -i inventory/lab-os1-to-os2.yml playbooks/<name>.yml
+ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
 ```
 
-Для новой инфраструктуры не запускать lab inventory как есть. Сначала
-адаптировать `inventory/hosts.yml`, `group_vars/all.yml` или отдельный
-inventory по образцу `inventory/lab-os1-to-os2.yml`.
-
-## Recommended execution order
-
-Generic runbook order:
+Для lab используется отдельный пример:
 
 ```bash
+ansible-playbook -i inventory/lab-os1-to-os2.yml playbooks/02b-discover-live-resource-graph.yml
+```
+
+До этой команды должны быть подготовлены singleton groups
+`source_control`, `target_control`, `rehome_compute`,
+`target_reference_compute`, два clouds files, два разных Glance tokens,
+HMAC key, probe configs, Kolla passwords и storage backend map. Generic empty
+`live_discovery_storage_backends: {}` намеренно даёт `UNKNOWN` для требуемого
+storage evidence.
+
+Итоговые коды:
+
+```text
+READY=0
+READY_WITH_WARNINGS=0
+UNKNOWN=2
+BLOCKED=3
+```
+
+`UNKNOWN` так же запрещает переход к import/cutover, как и `BLOCKED`.
+Top-level Ansible play принимает только rc `0`.
+
+## Рекомендуемый порядок выполнения
+
+Команда discovery обязана предшествовать любому DB import/cutover. Следующий
+список показывает полный общий порядок; state-changing шаги требуют отдельного
+change review и явных apply flags:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
+
+# Продолжать только при READY/READY_WITH_WARNINGS и инженерном review.
+# Следующие manifest/full-schema инструменты необязательны и являются legacy-диагностикой.
+ansible-playbook -i inventory/hosts.yml playbooks/02a-build-rehome-manifest.yml
+ansible-playbook -i inventory/hosts.yml playbooks/03a-check-db-schema-compat.yml
+ansible-playbook -i inventory/hosts.yml playbooks/03b-normalize-schema-diff.yml
+
 ansible-playbook -i inventory/hosts.yml playbooks/00-preflight.yml
 ansible-playbook -i inventory/hosts.yml playbooks/01-freeze-source.yml
 ansible-playbook -i inventory/hosts.yml playbooks/02-collect-inventory.yml
-ansible-playbook -i inventory/hosts.yml playbooks/02a-build-rehome-manifest.yml
 ansible-playbook -i inventory/hosts.yml playbooks/03-backup-databases.yml
-ansible-playbook -i inventory/hosts.yml playbooks/03a-check-db-schema-compat.yml
-ansible-playbook -i inventory/hosts.yml playbooks/03b-normalize-schema-diff.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04a-plan-target-api-prep.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04b-plan-db-metadata-import.yml
 ansible-playbook -i inventory/hosts.yml playbooks/04c-collect-source-db-rows.yml
@@ -100,90 +123,63 @@ ansible-playbook -i inventory/hosts.yml playbooks/08-heal-and-validate.yml
 ansible-playbook -i inventory/hosts.yml playbooks/09-enable-target-service.yml
 ```
 
-Для Kolla-Ansible нужны дополнительные image-tag фазы вокруг cutover:
+Обязательное решение о совместимости берётся из resource-scoped directional
+mapping в `schema-mapping.json`, созданного `02b`. Для vendor Keystack и vanilla
+Epoxy полное равенство service schema не требуется. `03a`/`03b` сравнивают
+полные schema и поэтому являются только необязательной legacy-диагностикой,
+полезной для близких/same-schema сред, но не hard gate этого направления.
 
-```text
-Фаза 0   Предварительные проверки
-Фаза 1   Заморозка source scheduling
-Фаза 2   Backup и инвентаризация
-Фаза 2a  Сбор host-scoped re-home manifest через Ansible playbook
-Фаза 3   Backup DB и read-only проверка совместимости DB schema
-Фаза 3a  Нормализация schema diff для отделения шумовых отличий от реальных
-Фаза 3b  Target API prep report: что уже есть на CP-B, что можно создать через API, что требует DB import
-Фаза 3c  DB metadata import review-pack: ordered SQL blocks, UUID filters, guardrails
-Фаза 3d  Read-only source DB row collection по UUID filters
-Фаза 3e  Hard-stopped target SQL import draft generation
-Фаза 3f  Target pre-import guard: target rows по UUID должны отсутствовать или быть явно разобраны
-Фаза 3g  Backup target DB immediately before metadata import
-Фаза 3h  Apply reviewed target SQL import
-Фаза 3i  Нормализация target-specific metadata: cell_id, service_uuid, volume_type_id и похожие UUID/FK
-Фаза 3j  Нормализация Neutron ML2 binding levels для переносимых ports
-Фаза 3k  Подготовка Nova compute service row для re-home host
-Фаза 3l  Нормализация project/user visibility для target Horizon
-Фаза 3m  Подготовка schema и metadata на CP-B
-Фаза 4   Предварительная загрузка target images на re-home host
-Фаза 5   Подготовка target Kolla configs на re-home host
-Фаза 5a  Отключение явно подтвержденных source-only non-runtime сервисов
-Фаза 6   Cutover:
-         остановить source Nova/network containers
-         запустить target-tag network containers
-         запустить target-tag nova_compute в safe-mode
-Фаза 7   Перепривязка Neutron ports
-Фаза 8   Placement heal и проверка Nova
-Фаза 9   Включение target compute service
-Фаза 10  Burn-in / стабилизация
-Фаза 11  Очистка старых source images и containers
-```
-
-Rollback before target-side VM operations:
+Rollback до необратимых target-side операций:
 
 ```bash
 ansible-playbook -i inventory/hosts.yml playbooks/90-rollback-to-source.yml
 ```
 
-## Files
+## Инварианты re-home
 
-- `docs/lab-topology-ru.md`: схема lab до и после re-home.
-- `inventory/hosts.yml`: generic inventory example.
-- `inventory/lab-os1-to-os2.yml`: рабочий lab inventory для Rocky `os1` -> Ubuntu `os2`; содержит lab-local paths и должен адаптироваться перед переносом.
-- `group_vars/all.yml`: переменные, которые нужно адаптировать для своего окружения.
-- `lab-rehome-runbook-ru.md`: краткий русский runbook и исходное состояние текущего lab.
-- `operator-inputs-ru.md`: входные данные, секреты, конфиги и prerequisites для запуска в другой инфраструктуре.
-- `playbook-logic-ru.md`: русское описание логики каждого playbook-а, где он выполняется и что меняет.
-- `neutron-rehome-behavior-ru.md`: русское описание поведения Neutron/OVS во время re-home и failure mode `Device <port_uuid> is not bound`.
-- `horizon-rehome-visibility-ru.md`: русское описание видимости ВМ в Horizon после re-home, включая source stale UI и target project scope.
-- `playbooks/*.yml`: runbook playbooks.
-- `playbooks/02a-build-rehome-manifest.yml`: read-only source/target/compute manifest collection.
-- `playbooks/03a-check-db-schema-compat.yml`: read-only Nova/Neutron/Cinder/Placement schema compatibility report.
-- `playbooks/03b-normalize-schema-diff.yml`: local normalization pass for collected schema compatibility artifacts.
-- `playbooks/04a-plan-target-api-prep.yml`: report-first target API preparation from `rehome_manifest.json`.
-- `playbooks/04b-plan-db-metadata-import.yml`: local DB metadata import review-pack generator.
-- `playbooks/04c-collect-source-db-rows.yml`: read-only source DB row collection for metadata review.
-- `playbooks/04d-generate-target-sql-draft.yml`: hard-stopped target SQL import draft generator.
-- `playbooks/04e-target-preimport-guard.yml`: read-only target DB conflict guard before SQL import.
-- `playbooks/04f-backup-target-db.yml`: Kolla-aware target DB backup before metadata import; defaults to the MariaDB socket inside the container.
-- `playbooks/04g-apply-target-sql.yml`: explicit reviewed SQL import through the target MariaDB container socket.
-- `playbooks/04h-normalize-target-metadata.yml`: explicit post-import normalization for target-specific metadata values such as Cinder volume type IDs.
-- `playbooks/04j-ensure-neutron-ml2-binding-levels.yml`: explicit target Neutron ML2 binding-level normalization for re-home OVS ports.
-- `playbooks/04k-ensure-nova-compute-service.yml`: explicit target Nova service-row normalization for the re-home compute host.
-- `playbooks/04l-normalize-target-project-visibility.yml`: explicit target project/user normalization so imported instances can appear in target Horizon project scope.
-- `playbooks/04i-prepull-target-images.yml`: pre-pulls target-tag Kolla runtime images on the re-home host and records image digests before cutover.
-- `playbooks/05b-stage-target-kolla-config.yml`: copies full target Kolla runtime config bundle from a target reference compute, rewrites host-specific values for the re-home host, and stages it without restarting containers.
-- `playbooks/05a-disable-source-only-services.yml`: guarded pre-cutover stop for explicitly approved source-only services.
-- `templates/*.j2`: safe-mode compute config overlays.
-- `scripts/*.sh`: source inventory and DB helper scripts.
-- `sql-skeleton/README.md`: reference skeleton for the expected target SQL set; do not run it directly.
-- `kolla-image-tags.md`: Kolla-specific описание image tags и переключения containers.
+1. Source и target `nova-compute` не должны одновременно управлять одним host.
+2. QEMU domains, libvirt runtime, dataplane и активные storage sessions не
+   останавливаются во время cutover.
+3. Сохраняются instance/domain UUID, port UUID/MAC/fixed IP, volume и
+   attachment UUID.
+4. Для Neutron нужны полные binding/segment/runtime facts, а не только API
+   status `ACTIVE`.
+5. Для Cinder нужно доказать каждое attachment и backing object. Поддержаны
+   read-only size probes NFS/file, RBD и LVM; iSCSI, Fibre Channel и vendor
+   backend остаются `UNKNOWN` без reviewed безопасного probe.
+6. Для Glance нужны project/member/store provenance, hashes и one-byte Range
+   probe, когда image обязателен.
+7. Source DB/config остаются rollback authority до окончания burn-in.
+8. Каждый DB SELECT и каждый delegate probe обязан иметь acquisition-bound
+   timestamp/rc/failure digest/raw reference; недостающие поля не дополняются
+   значениями по умолчанию, а ненулевой DB rc формирует `BLOCKED`.
+
+## Файлы проекта
+
+- [Generic variables](group_vars/all.yml) и [inventory example](inventory/hosts.yml).
+- [Lab inventory](inventory/lab-os1-to-os2.yml) — конкретные адреса/пути,
+  не переносить без адаптации.
+- [`playbooks/02b-discover-live-resource-graph.yml`](playbooks/02b-discover-live-resource-graph.yml)
+  — новый live read-only gate.
+- [`inventory/live-discovery-schema-policy.json`](inventory/live-discovery-schema-policy.json)
+  — reviewed directional schema policy.
+- [Kolla image tags](kolla-image-tags.md),
+  [Horizon visibility](horizon-rehome-visibility-ru.md),
+  [Nova/OVS investigation](nova-ovs-rehome-investigation-ru.md).
+- [SQL skeleton](sql-skeleton/README.md) — только последующий reviewed import,
+  никогда не источник live discovery.
+
+## Проверка реализации
+
+В репозитории выполнены unit/fixture tests и Ansible `syntax-check`. Они
+проверяют contracts, fail-closed ветки и структуру playbook-а, но не доказывают,
+что discovery или re-home выполнялись на production/live кластере. Перед
+change window оператор должен запустить playbook на своём inventory и проверить
+`readiness-report.json`, `readiness-report.md` и `evidence-index.json`.
 
 ## Что не коммитить
 
-В git не должны попадать runtime/generated данные:
-
-- `artifacts/`;
-- `.ansible/`;
-- `__pycache__/`, `*.pyc`;
-- реальные `passwords.yml`, `clouds.yaml`, `openrc`, DB dumps и SQL apply
-  artifacts с production data.
-
-Для review полезны docs, playbooks, scripts, templates, tests,
-`sql-skeleton/` и inventory examples без секретов.
+Не коммитировать `artifacts/`, `.ansible/`, `__pycache__/`, `*.pyc`, реальные
+`passwords.yml`, `clouds.yaml`, openrc, HMAC key, Glance tokens, Cinder
+connection evidence, DB dumps и SQL apply artifacts. Правила normal/protected
+retention описаны в [документе об артефактах](docs/live-discovery-artifacts-ru.md).

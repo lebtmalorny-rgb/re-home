@@ -1,0 +1,25 @@
+---
+- name: Live discovery owner | require enabled host and propagated run identity
+  ansible.builtin.assert:
+    that:
+      - live_discovery_enabled | bool
+      - live_discovery_frozen_run_id == hostvars['localhost'].live_discovery_frozen_run_id
+      - live_discovery_run_owner_token == hostvars['localhost'].live_discovery_run_owner_token
+  no_log: true
+
+- name: Live discovery owner | verify persistent sibling ownership
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py"
+      - verify
+      - --owner
+      - "{{ hostvars['localhost'].live_discovery_run_owner_dir }}"
+      - --run-id
+      - "{{ hostvars['localhost'].live_discovery_frozen_run_id }}"
+      - --token
+      - "{{ hostvars['localhost'].live_discovery_run_owner_token }}"
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  no_log: true

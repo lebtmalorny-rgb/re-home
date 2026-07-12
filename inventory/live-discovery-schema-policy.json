@@ -1,0 +1,18 @@
+{
+  "schema_version": "openstack-rehome-schema-policy/v1alpha1",
+  "source_profile": "keystack-2025.1",
+  "target_profile": "vanilla-openstack-2025.1-epoxy",
+  "source_only_allowlist": [
+    "nova.services.admin_state",
+    "nova.services.error_details"
+  ],
+  "normalization_columns": [
+    "nova_api.host_mappings.cell_id",
+    "nova_api.instance_mappings.cell_id",
+    "nova.instances.compute_id",
+    "cinder.volumes.service_uuid",
+    "cinder.volumes.volume_type_id",
+    "cinder.volumes.host",
+    "cinder.volumes.cluster_name"
+  ]
+}

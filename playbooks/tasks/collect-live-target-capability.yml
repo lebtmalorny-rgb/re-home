@@ -1,0 +1,135 @@
+- name: Target capability | collect live virsh version
+  ansible.builtin.command:
+    argv: "{{ live_discovery_target_virsh_argv + ['version'] }}"
+  register: live_discovery_target_virsh_version
+  changed_when: false
+  failed_when: false
+
+- name: Target capability | collect live domain capabilities
+  ansible.builtin.command:
+    argv: "{{ live_discovery_target_virsh_argv + ['domcapabilities'] }}"
+  register: live_discovery_target_domcapabilities
+  changed_when: false
+  failed_when: false
+
+- name: Target capability | collect live QEMU machine list
+  ansible.builtin.command:
+    argv: "{{ live_discovery_target_qemu_argv + ['-machine', 'help'] }}"
+  register: live_discovery_target_qemu_machine_help
+  changed_when: false
+  failed_when: false
+
+- name: Target capability | bind rc-bearing live command records
+  ansible.builtin.set_fact:
+    live_discovery_target_capability_records:
+      management:
+        nova_api_db_version:
+          evidence_id: manage-nova-api-db-version
+          command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].cmd }}"
+          returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].rc }}"
+          stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].stdout }}"
+          stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[0].stderr }}"
+        nova_cell_db_version:
+          evidence_id: manage-nova-cell-db-version
+          command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].cmd }}"
+          returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].rc }}"
+          stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].stdout }}"
+          stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[1].stderr }}"
+        neutron_heads:
+          evidence_id: manage-neutron-heads
+          command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].cmd }}"
+          returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].rc }}"
+          stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].stdout }}"
+          stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[2].stderr }}"
+        cinder_db_version:
+          evidence_id: manage-cinder-db-version
+          command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].cmd }}"
+          returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].rc }}"
+          stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].stdout }}"
+          stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_profile_probes.results[3].stderr }}"
+        glance_db_version:
+          evidence_id: manage-glance-db-version
+          command: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.cmd }}"
+          returncode: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.rc }}"
+          stdout: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.stdout }}"
+          stderr: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_glance_alembic.stderr }}"
+      images: {}
+      runtime:
+        runtime-target-virsh-version:
+          evidence_id: runtime-target-virsh-version
+          command: "{{ live_discovery_target_virsh_version.cmd }}"
+          returncode: "{{ live_discovery_target_virsh_version.rc }}"
+          stdout: "{{ live_discovery_target_virsh_version.stdout }}"
+          stderr: "{{ live_discovery_target_virsh_version.stderr }}"
+        runtime-target-domcapabilities:
+          evidence_id: runtime-target-domcapabilities
+          command: "{{ live_discovery_target_domcapabilities.cmd }}"
+          returncode: "{{ live_discovery_target_domcapabilities.rc }}"
+          stdout: "{{ live_discovery_target_domcapabilities.stdout }}"
+          stderr: "{{ live_discovery_target_domcapabilities.stderr }}"
+        runtime-target-qemu-machine-help:
+          evidence_id: runtime-target-qemu-machine-help
+          command: "{{ live_discovery_target_qemu_machine_help.cmd }}"
+          returncode: "{{ live_discovery_target_qemu_machine_help.rc }}"
+          stdout: "{{ live_discovery_target_qemu_machine_help.stdout }}"
+          stderr: "{{ live_discovery_target_qemu_machine_help.stderr }}"
+      target_virsh_argv: "{{ live_discovery_target_virsh_argv }}"
+      target_qemu_argv: "{{ live_discovery_target_qemu_argv }}"
+  delegate_to: localhost
+  delegate_facts: true
+  no_log: true
+
+- name: Target capability | normalize image command record keys
+  ansible.builtin.set_fact:
+    live_discovery_target_capability_records: >-
+      {{ hostvars['localhost'].live_discovery_target_capability_records | combine({
+         'images': hostvars['localhost'].live_discovery_target_capability_records.images | combine({
+           item.item: {
+             'evidence_id': 'image-' ~ item.item,
+             'command': item.cmd,
+             'returncode': item.rc,
+             'stdout': item.stdout,
+             'stderr': item.stderr
+           }
+         })
+      }, recursive=true) }}
+  loop: "{{ hostvars[hostvars['localhost'].live_discovery_target_controller].live_discovery_target_image_inspects_raw.results }}"
+  delegate_to: localhost
+  delegate_facts: true
+  no_log: true
+
+- name: Target capability | derive profile from successful live evidence
+  ansible.builtin.command:
+    argv: >-
+      {{ ['python3', playbook_dir + '/../scripts/live_discovery/capability_input.py',
+          '--records-stdin',
+          '--out', hostvars['localhost'].live_discovery_frozen_protected_dir + '/target-capability-input.json'] +
+         (['--online-migration-evidence', hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local]
+          if hostvars['localhost'].live_discovery_target_online_migration_evidence_file_local | length > 0 else []) }}
+    stdin: "{{ hostvars['localhost'].live_discovery_target_capability_records | to_json }}"
+    stdin_add_newline: false
+  delegate_to: localhost
+  register: live_discovery_target_capability_build
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Target capability | require successful evidence normalization
+  ansible.builtin.assert:
+    that:
+      - live_discovery_target_capability_build.rc == 0
+  no_log: true
+
+- name: Target capability | load normalized protected capability document
+  ansible.builtin.slurp:
+    src: "{{ hostvars['localhost'].live_discovery_frozen_protected_dir }}/target-capability-input.json"
+  register: live_discovery_target_capability_raw
+  delegate_to: localhost
+  no_log: true
+
+- name: Target capability | publish normalized capability document
+  ansible.builtin.set_fact:
+    live_discovery_target_capability_document: "{{ live_discovery_target_capability_raw.content | b64decode | from_json }}"
+  delegate_to: localhost
+  delegate_facts: true
+  no_log: true

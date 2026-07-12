@@ -1,0 +1,39 @@
+{
+  "schema_version": "openstack-rehome-control-api-input/v1alpha1",
+  "side": "source",
+  "api_result": {
+    "rehome_host": "compute-023",
+    "observed_at": "2026-07-12T09:00:00Z",
+    "instances": ["11111111-1111-1111-1111-111111111111"],
+    "openstack": [
+      {"command":["server","list","--all-projects","--host","compute-023","--long","-f","json"],"payload":[],"evidence":{"id":"nova-source-server-list-compute-023","returncode":0,"failure_class":null,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","observed_at":"2026-07-12T09:00:00Z","raw_artifact_ref":"protected://source/openstack/nova-source-server-list-compute-023"}},
+      {"command":["compute","service","list","--host","compute-023","-f","json"],"payload":[],"evidence":{"id":"nova-source-compute-service-list-compute-023","returncode":0,"failure_class":null,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","observed_at":"2026-07-12T09:00:00Z","raw_artifact_ref":"protected://source/openstack/nova-source-compute-service-list-compute-023"}},
+      {"command":["hypervisor","show","compute-023","-f","json"],"payload":{},"evidence":{"id":"nova-source-hypervisor-show-compute-023","returncode":0,"failure_class":null,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","observed_at":"2026-07-12T09:00:00Z","raw_artifact_ref":"protected://source/openstack/nova-source-hypervisor-show-compute-023"}},
+      {"command":["resource","provider","list","--name","compute-023","-f","json"],"payload":[],"evidence":{"id":"nova-source-resource-provider-list-compute-023","returncode":0,"failure_class":null,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","observed_at":"2026-07-12T09:00:00Z","raw_artifact_ref":"protected://source/openstack/nova-source-resource-provider-list-compute-023"}}
+    ],
+    "available_tables": ["nova_api.host_mappings","nova_api.instance_mappings","nova_api.request_specs","nova.instances","nova.block_device_mapping","nova.instance_info_caches","nova.compute_nodes","nova.services"],
+    "roots": {
+      "instances": ["11111111-1111-1111-1111-111111111111"],
+      "cells": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+      "services": ["88888888-8888-8888-8888-888888888888"],
+      "compute_nodes": ["99999999-9999-9999-9999-999999999999"],
+      "ports": [], "volumes": [], "images": [], "projects": []
+    }
+  },
+  "requests": [
+    {
+      "schema": "nova",
+      "table": "instances",
+      "columns": ["uuid", "host", "project_id", "user_id"],
+      "filter_column": "uuid",
+      "filter_values": ["11111111-1111-1111-1111-111111111111"]
+    },
+    {"schema":"nova_api","table":"host_mappings","columns":["id","host","cell_id"],"filter_column":"cell_id","filter_values":["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]},
+    {"schema":"nova_api","table":"instance_mappings","columns":["id","instance_uuid","cell_id"],"filter_column":"instance_uuid","filter_values":["11111111-1111-1111-1111-111111111111"]},
+    {"schema":"nova_api","table":"request_specs","columns":["id","instance_uuid","spec"],"filter_column":"instance_uuid","filter_values":["11111111-1111-1111-1111-111111111111"]},
+    {"schema":"nova","table":"block_device_mapping","columns":["id","instance_uuid","volume_id","deleted"],"filter_column":"instance_uuid","filter_values":["11111111-1111-1111-1111-111111111111"]},
+    {"schema":"nova","table":"instance_info_caches","columns":["id","instance_uuid","network_info","deleted"],"filter_column":"instance_uuid","filter_values":["11111111-1111-1111-1111-111111111111"]},
+    {"schema":"nova","table":"compute_nodes","columns":["id","uuid","host","hypervisor_hostname","service_id"],"filter_column":"uuid","filter_values":["99999999-9999-9999-9999-999999999999"]},
+    {"schema":"nova","table":"services","columns":["id","uuid","host","binary","disabled","deleted"],"filter_column":"uuid","filter_values":["88888888-8888-8888-8888-888888888888"]}
+  ]
+}

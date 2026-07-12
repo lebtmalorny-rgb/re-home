@@ -164,3 +164,69 @@ use_os_cloud: true
 
 # Optional: list of instances and ports after manifest generation.
 manifest_file: "{{ local_artifact_dir }}/rehome_manifest.yml"
+
+# Live read-only discovery. The live cluster is the source of truth; SQL dumps
+# are not accepted by this orchestration. Protected inputs are operator-owned,
+# run-local files and must not be placed below the normal artifact directory.
+live_discovery_enabled: true
+live_discovery_run_id: ""
+live_discovery_target_profile: "vanilla-openstack-2025.1-epoxy"
+live_discovery_remote_dir: "{{ rehome_stage_dir }}/live-discovery"
+live_discovery_local_dir: "{{ local_artifact_dir }}/live-discovery"
+live_discovery_schema_policy_file: "{{ playbook_dir }}/../inventory/live-discovery-schema-policy.json"
+live_discovery_mysql_json_command: "mysql --batch --raw --skip-column-names"
+live_discovery_mysql_json_argv:
+  - mysql
+  - --batch
+  - --raw
+  - --skip-column-names
+live_discovery_mysql_environment: {}
+live_discovery_mysql_no_log: true
+live_discovery_kolla_passwords_file_local: "{{ schema_compat_kolla_passwords_file_local | default('') }}"
+live_discovery_schema_mysql_user: root
+live_discovery_schema_mysql_password_key: database_password
+live_discovery_db_service_credentials:
+  nova_api: {user: nova_api, password_key: nova_api_database_password}
+  nova: {user: nova, password_key: nova_database_password}
+  neutron: {user: neutron, password_key: neutron_database_password}
+  cinder: {user: cinder, password_key: cinder_database_password}
+# Authoritative typed backend map. Empty means storage readiness is UNKNOWN.
+# Every configured entry must declare kind, per-side delegate, allowed scopes
+# and a probe template. NFS/file, RBD and LVM have read-only size probes;
+# iSCSI, Fibre Channel and other vendor kinds remain explicit UNKNOWN until a
+# dedicated non-mutating template is implemented.
+live_discovery_storage_backends: {}
+live_discovery_target_virsh_command: "virsh"
+live_discovery_target_qemu_command: "qemu-system-x86_64"
+live_discovery_source_virsh_argv: [virsh]
+live_discovery_target_virsh_argv: [virsh]
+live_discovery_target_qemu_argv: [qemu-system-x86_64]
+live_discovery_glance_range_probe_enabled: true
+live_discovery_fail_on_not_ready: true
+
+# Externally anchored protected inputs. Paths stay empty in generic inventory
+# so preflight fails before any remote command. The HMAC key must contain at
+# least 16 bytes. Probe configs may reference the ephemeral Glance token only
+# through token_file or token_env; never embed its value.
+live_discovery_phase_hmac_key_file_local: ""
+# Root manifests are derived from the first live source API phase. There is no
+# operator-supplied/dump-backed root manifest input.
+live_discovery_source_probe_config_file_local: ""
+live_discovery_target_probe_config_file_local: ""
+live_discovery_source_cinder_sensitive_evidence_file_local: ""
+live_discovery_target_cinder_sensitive_evidence_file_local: ""
+# Optional 0600 JSON envelope. It records a recent timestamp, exact live
+# database revisions for Nova/Neutron/Cinder/Glance, and completed rc=0
+# Nova/Cinder online-migration evidence. It is evidence only: no migration is
+# executed by this playbook.
+live_discovery_target_online_migration_evidence_file_local: ""
+live_discovery_source_glance_token_file_local: ""
+live_discovery_target_glance_token_file_local: ""
+
+# Kolla/container-aware command argv can be overridden per inventory without
+# using shell interpolation. These are version/current/show/inspect probes only.
+live_discovery_nova_api_db_version_argv: [nova-manage, api_db, version]
+live_discovery_nova_cell_db_version_argv: [nova-manage, db, version]
+live_discovery_neutron_db_version_argv: [neutron-db-manage, current, --verbose]
+live_discovery_cinder_db_version_argv: [cinder-manage, db, version]
+live_discovery_container_inspect_argv_prefix: [docker, inspect]

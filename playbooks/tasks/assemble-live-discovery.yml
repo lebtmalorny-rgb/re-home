@@ -1,0 +1,42 @@
+- name: Live discovery assembly | invoke Task 10 assembler
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/assemble_live_discovery.py"
+      - --source-control
+      - "{{ live_discovery_local_run_dir }}/source-control.json"
+      - --target-control
+      - "{{ live_discovery_local_run_dir }}/target-control.json"
+      - --runtime
+      - "{{ live_discovery_local_run_dir }}/runtime.json"
+      - --schema-policy
+      - "{{ live_discovery_schema_policy_file }}"
+      - --out-dir
+      - "{{ live_discovery_local_run_dir }}"
+  register: live_discovery_assemble
+  changed_when: false
+  failed_when: false
+
+- name: Live discovery assembly | require successful assembly
+  ansible.builtin.assert:
+    that:
+      - live_discovery_assemble.rc in [0]
+
+- name: Live discovery assembly | report readiness artifact
+  ansible.builtin.debug:
+    msg: "{{ live_discovery_local_run_dir }}/readiness-report.json"
+
+- name: Live discovery assembly | seal owner and delete frozen secrets atomically
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py"
+      - complete
+      - --owner
+      - "{{ live_discovery_run_owner_dir }}"
+      - --run-id
+      - "{{ live_discovery_frozen_run_id }}"
+      - --token
+      - "{{ live_discovery_run_owner_token }}"
+  changed_when: true
+  no_log: true

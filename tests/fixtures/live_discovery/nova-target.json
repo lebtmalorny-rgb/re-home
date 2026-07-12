@@ -1,0 +1,38 @@
+{
+  "openstack": [
+    {
+      "command": ["server", "list", "--all-projects", "--host", "compute-023", "--long", "-f", "json"],
+      "payload": []
+    },
+    {
+      "command": ["compute", "service", "list", "--host", "compute-023", "-f", "json"],
+      "payload": [
+        {"ID": 84, "Binary": "nova-compute", "Host": "compute-023", "Status": "enabled", "State": "up"}
+      ]
+    },
+    {
+      "command": ["hypervisor", "show", "compute-023", "-f", "json"],
+      "payload": {"id": 17, "hypervisor_hostname": "compute-023", "status": "enabled", "state": "up"}
+    },
+    {
+      "command": ["resource", "provider", "list", "--name", "compute-023", "-f", "json"],
+      "payload": [
+        {"uuid": "dddddddd-dddd-dddd-dddd-dddddddddddd", "name": "compute-023", "generation": 1}
+      ]
+    }
+  ],
+  "host_mappings": [
+    {"_schema": "nova_api", "_table": "host_mappings", "row": {"id": 15, "host": "compute-023", "cell_id": "cell-target"}}
+  ],
+  "instance_mappings": [],
+  "request_specs": [],
+  "instances": [],
+  "block_device_mapping": [],
+  "instance_info_caches": [],
+  "compute_nodes": [
+    {"_schema": "nova", "_table": "compute_nodes", "row": {"id": 17, "uuid": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "service_id": 84, "hypervisor_hostname": "compute-023", "host": "compute-023", "vcpus": 32, "memory_mb": 65536}}
+  ],
+  "services": [
+    {"_schema": "nova", "_table": "services", "row": {"id": 84, "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff", "host": "compute-023", "binary": "nova-compute", "disabled": 0, "deleted": 0}}
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "side": "source",
+  "virsh_argv": ["virsh"],
+  "network_backend": "ovs",
+  "domains": [
+    {
+      "name": "instance-0000002a",
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "state": "running",
+      "machine_type": "pc-i440fx-rhel7.6.0",
+      "secrets": ["libvirt-secret-value"],
+      "disks": [
+        {
+          "type": "block",
+          "device": "disk",
+          "target": "vda",
+          "bus": "virtio",
+          "source": "/dev/disk/by-id/virtio-volume-1"
+        }
+      ],
+      "interfaces": [
+        {
+          "type": "bridge",
+          "source": "br-int",
+          "model": "virtio",
+          "mac": "fa:16:3e:12:34:56",
+          "target": "tap-port-1"
+        }
+      ]
+    }
+  ],
+  "ovs_interfaces": [
+    {
+      "name": "tap-port-1",
+      "external_ids": {"iface-id": "port-1", "attached-mac": "fa:16:3e:12:34:56"}
+    }
+  ],
+  "ovs_ports": [
+    {
+      "name": "tap-port-1",
+      "interfaces": ["tap-port-1"],
+      "external_ids": {}
+    }
+  ]
+}

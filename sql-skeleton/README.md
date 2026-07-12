@@ -1,16 +1,29 @@
-# SQL import skeleton
+# Каркас импорта SQL
 
-This directory is intentionally populated with empty placeholders.
-For real use, generate a host-scoped, schema-aware import set from CP-A to CP-B.
-Do not run these files directly.
+Каталог намеренно содержит пустые placeholders. Перед любым планированием
+import нужно запустить read-only live discovery:
 
-Rules:
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
+```
 
-1. Never import whole Nova/Neutron/Cinder/Placement databases over a live target cloud.
-2. Do not use `INSERT ... SELECT *` across different patch levels.
-3. Compare `information_schema.COLUMNS`, `KEY_COLUMN_USAGE`, and schema-only dumps first.
-4. Preserve UUIDs: instances, ports, volumes, attachments, request specs, instance mappings.
-5. Rewrite auto-increment integer IDs where needed.
-6. If the target Nova schema has `instances.compute_id`, map it to the target compute_nodes row for `rehome_host`.
-7. Prefer letting target nova-compute create Placement providers, then run `nova-manage placement heal_allocations`.
-8. Back up target DB before every import.
+Источником истины служат live API, `information_schema`, UUID-scoped SELECT и
+runtime/probe evidence. Schema-only dump допустим только как санитизированная
+fixture/справочный пример и не заменяет discovery. Эти файлы нельзя запускать
+непосредственно.
+
+Правила последующего reviewed import:
+
+1. Не импортировать целиком Nova/Neutron/Cinder/Placement DB в живой target.
+2. Не использовать `INSERT ... SELECT *` между разными patch/vendor schema.
+3. Использовать `schema-mapping.json`, `uuid-filters.json` и live
+   `information_schema`; затем отдельно review generated SQL.
+4. Сохранять UUID instances, ports, volumes, attachments, request specs и
+   instance mappings.
+5. Переназначать auto-increment integer IDs только явно и с FK review.
+6. Если target Nova schema содержит `instances.compute_id`, связать его с
+   target `compute_nodes` для `rehome_host`.
+7. Placement не импортировать автоматически: target `nova-compute` создаёт
+   provider, а heal выполняется отдельной последующей фазой.
+8. Перед каждым import делать target DB backup и pre-import conflict guard.
+9. `UNKNOWN`/`BLOCKED` live discovery запрещают import.

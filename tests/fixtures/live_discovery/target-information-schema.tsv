@@ -1,0 +1,18 @@
+SERVICE:nova
+SECTION:COLUMNS
+nova	services	1	uuid	varchar(36)	NO	NULL	\N
+nova	services	2	host	varchar(255)	YES	NULL	\N
+nova	instances	1	progress	int(11) unsigned	NO	0	\N
+nova	instances	2	task_state	varchar(128)	YES	NULL	\N
+nova	instances	3	compute_id	bigint	YES	NULL	\N
+SERVICE:nova_api
+SECTION:COLUMNS
+nova_api	host_mappings	1	cell_id	int unsigned	NO	NULL	\N
+SERVICE:cinder
+SECTION:COLUMNS
+cinder	volumes	1	id	varchar(36)	NO	NULL	\N
+cinder	volumes	2	service_uuid	varchar(36)	YES	NULL	\N
+cinder	volumes	3	target_required	varchar(36)	NO	NULL	\N
+cinder	volumes	4	created_at	timestamp	NO	CURRENT_TIMESTAMP	\N
+SECTION:STATISTICS
+SECTION:FOREIGN_KEYS

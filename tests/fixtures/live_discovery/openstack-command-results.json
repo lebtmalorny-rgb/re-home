@@ -1,0 +1,44 @@
+{
+  "manage_outputs": {
+    "release": "2025.1",
+    "distribution": "vanilla",
+    "nova_api_db_version": "b30f573d3377",
+    "nova_cell_db_version": "b30f573d3377",
+    "neutron_heads": [
+      "2025.1-expand",
+      "2025.1-contract"
+    ],
+    "cinder_db_version": "2025.1",
+    "glance_db_version": "2025.1",
+    "online_migration_evidence": {
+      "nova": {
+        "evidence_id": "nova-online-data-migrations",
+        "command": [
+          "nova-manage",
+          "db",
+          "online_data_migrations"
+        ],
+        "timestamp": "2026-07-11T09:00:00Z",
+        "returncode": 0
+      },
+      "cinder": {
+        "evidence_id": "cinder-online-data-migrations",
+        "command": [
+          "cinder-manage",
+          "db",
+          "online_data_migrations"
+        ],
+        "timestamp": "2026-07-11T09:00:00Z",
+        "returncode": 0
+      }
+    }
+  },
+  "image_inspects": {
+    "nova_api": {
+      "Config": {
+        "Image": "quay.io/openstack.kolla/nova-api:2025.1-ubuntu-noble"
+      },
+      "Image": "sha256:nova-api-image"
+    }
+  }
+}

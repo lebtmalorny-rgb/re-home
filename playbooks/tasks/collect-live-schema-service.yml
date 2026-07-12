@@ -1,0 +1,64 @@
+---
+- name: Live schema | validate service query inputs
+  ansible.builtin.assert:
+    that:
+      - live_discovery_schema_side in ['source', 'target']
+      - live_discovery_schema_service is match('^[a-z][a-z0-9_-]{0,31}$')
+      - live_discovery_schema_db_names | length > 0
+      - live_discovery_mysql_json_argv | length > 0
+
+- name: Live schema | validate rendered MySQL transport argv
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.argv_policy
+      - --mysql-json
+      - "{{ live_discovery_mysql_json_argv | to_json }}"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  changed_when: false
+  no_log: true
+
+- name: Live schema | render strict information_schema query pack
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.schema_query
+      - --databases-json
+      - "{{ live_discovery_schema_db_names | to_json }}"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+  register: live_discovery_schema_query_pack
+  changed_when: false
+  no_log: true
+
+- name: Live schema | validate strict query pack contract
+  ansible.builtin.assert:
+    that:
+      - (live_discovery_schema_query_pack.stdout | from_json).schema_version == 'openstack-rehome-schema-query-pack/v1alpha1'
+      - (live_discovery_schema_query_pack.stdout | from_json).queries | length == 3
+      - ((live_discovery_schema_query_pack.stdout | from_json).queries | map(attribute='section') | list) == ['COLUMNS', 'STATISTICS', 'FOREIGN_KEYS']
+      - (live_discovery_schema_query_pack.stdout | from_json).queries | selectattr('sql', 'defined') | list | length == 3
+
+- name: Live schema | query columns indexes unique constraints and foreign keys
+  ansible.builtin.command:
+    argv: "{{ live_discovery_mysql_json_argv + ['--execute', live_discovery_schema_query_item.sql] }}"
+  loop: "{{ (live_discovery_schema_query_pack.stdout | from_json).queries }}"
+  loop_control:
+    loop_var: live_discovery_schema_query_item
+    label: "{{ live_discovery_schema_query_item.section }}"
+  environment: "{{ live_discovery_mysql_environment }}"
+  register: live_discovery_information_schema_results
+  changed_when: false
+  no_log: "{{ live_discovery_mysql_no_log | bool }}"
+
+- name: Live schema | write run-local information_schema artifact
+  ansible.builtin.copy:
+    dest: "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+    mode: "0640"
+    content: |
+      SERVICE:{{ live_discovery_schema_service }}
+      {% for item in live_discovery_information_schema_results.results %}
+      SECTION:{{ item.live_discovery_schema_query_item.section }}
+      {{ item.stdout }}
+      {% endfor %}

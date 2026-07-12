@@ -38,6 +38,27 @@ class LabTopologyDocTests(unittest.TestCase):
         self.assertIn("Lab-local staging and artifact paths", text)
         self.assertIn("runtime_guard_probe_targets", text)
 
+    def test_topology_marks_nfs_as_lab_only_and_links_live_flow(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertIn("только профиль текущего lab", text)
+        self.assertIn("NFS/file", text)
+        self.assertIn("RBD", text)
+        self.assertIn("LVM", text)
+        self.assertIn("iSCSI", text)
+        self.assertIn("Fibre Channel", text)
+        self.assertIn("[Поток live discovery](live-discovery-data-flow-ru.md)", text)
+
+    def test_play_six_labels_both_delegates_with_cinder_and_glance_probes(self):
+        text = DOC.read_text(encoding="utf-8")
+        self.assertIn(
+            "source Cinder backing + Glance Range probe — на `os1-compute-02`",
+            text,
+        )
+        self.assertIn(
+            "target Cinder backing + Glance Range probe — на `os2-ctrl-01`",
+            text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

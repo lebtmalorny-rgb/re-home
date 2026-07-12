@@ -1,0 +1,29 @@
+{
+  "side": "target",
+  "network_backend": "ovn",
+  "schema_tables": [
+    "ports", "ipallocations", "networks", "subnets", "networksegments",
+    "ml2_port_bindings", "ml2_distributed_port_bindings",
+    "ml2_port_binding_levels", "securitygroups", "securitygrouprules",
+    "securitygroupportbindings"
+  ],
+  "openstack": [
+    {"command": ["port", "show", "port-1", "-f", "json"], "payload": {"id": "port-1", "network_id": "network-1", "binding_host_id": "compute-023", "binding_vif_type": "ovn"}},
+    {"command": ["network", "show", "network-1", "-f", "json"], "payload": {"id": "network-1", "name": "tenant-net"}}
+  ],
+  "tables": {
+    "ports": [{"id": "port-1", "network_id": "network-1"}],
+    "ipallocations": [{"port_id": "port-1", "network_id": "network-1", "subnet_id": "subnet-1", "ip_address": "192.0.2.10"}],
+    "networks": [{"id": "network-1", "name": "tenant-net"}],
+    "subnets": [{"id": "subnet-1", "network_id": "network-1", "cidr": "192.0.2.0/24"}],
+    "networksegments": [{"id": "target-segment-ovn", "network_id": "network-1", "network_type": "vxlan", "physical_network": null, "segmentation_id": 101}],
+    "ml2_port_bindings": [{"port_id": "port-1", "host": "compute-023", "vif_type": "ovn"}],
+    "ml2_distributed_port_bindings": [],
+    "ml2_port_binding_levels": [{"port_id": "port-1", "host": "compute-023", "level": 0, "driver": "ovn", "segment_id": "target-segment-ovn"}],
+    "securitygroups": [], "securitygrouprules": [], "securitygroupportbindings": []
+  },
+  "runtime": {
+    "nodes": [{"kind": "ovn_binding", "id": "port-1", "facts": {"logical_port": "port-1", "chassis": "compute-023"}}],
+    "edges": [{"source": "ovn_binding:port-1", "target": "port:port-1", "relation": "maps_to_port"}]
+  }
+}
