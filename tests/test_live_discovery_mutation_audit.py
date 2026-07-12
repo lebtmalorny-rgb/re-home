@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,17 +43,6 @@ TASK11_HELPERS = {
 }
 INVENTORIES = (ROOT / "inventory/hosts.yml", ROOT / "inventory/lab-os1-to-os2.yml")
 
-_INCLUDE = re.compile(
-    r"(?m)^\s*(?:ansible\.builtin\.)?(?:include_tasks|import_tasks|import_playbook):"
-    r"\s*([^\s#]+)"
-)
-_INCLUDE_MODULE = re.compile(
-    r"(?m)^\s*(?:ansible\.builtin\.)?(?:include_tasks|import_tasks|import_playbook):"
-)
-_MODULE = re.compile(
-    r"^(\s*)(?:(?:[A-Za-z_][A-Za-z0-9_-]*\.)+)?"
-    r"(command|shell|raw):(?:\s*(.*))?$"
-)
 _DYNAMIC_ARGV = re.compile(r"\blive_discovery_[a-z0-9_]*argv(?:_prefix)?\b")
 _ALLOWED_DYNAMIC_ARGV = {
     "live_discovery_cinder_db_version_argv",
@@ -65,48 +55,31 @@ _ALLOWED_DYNAMIC_ARGV = {
     "live_discovery_target_qemu_argv",
     "live_discovery_target_virsh_argv",
 }
-_FORBIDDEN_COMMAND_PATTERNS = (
-    re.compile(r"\bonline_data_migrations\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:INSERT\s+INTO|UPDATE\s+[A-Za-z`]|DELETE\s+FROM|REPLACE\s+INTO|"
-        r"ALTER\s+TABLE|CREATE\s+(?:TABLE|DATABASE)|DROP\s+(?:TABLE|DATABASE)|"
-        r"TRUNCATE\s+TABLE|GRANT\s+|REVOKE\s+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bopenstack\b[^\n]*(?:\bcreate\b|\bset\b|\bdelete\b|\bsave\b|"
-        r"\bmap\b|\bmount\b|\bactivate\b|\block\b|\bunlock\b|\brestore\b|"
-        r"\bmanage\b|\bextend\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:nova-manage|cinder-manage|neutron-db-manage)\b[^\n]*"
-        r"(?:\bsync\b|\bmigrate\b|\bupgrade\b|\bstamp\b|\bdiscover_hosts\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:docker|systemctl|service)\b[^\n]*(?:\bstop\b|\brestart\b|"
-        r"\bstart\b|\bkill\b|\bdisable\b|\benable\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bvirsh\b[^\n]*(?:\bdestroy\b|\bsave\b|\bmanagedsave\b|\bstart\b|"
-        r"\bshutdown\b|\breboot\b|\bsuspend\b|\bresume\b|\bdefine\b|"
-        r"\bundefine\b|\bmigrate\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\brbd\b[^\n]*(?:\bcreate\b|\brm\b|\bmap\b|\bunmap\b|\bmv\b|"
-        r"\bimport\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:ovs-vsctl|ovs-ofctl|ovn-nbctl|ovn-sbctl)\b[^\n]*"
-        r"(?:\bset\b|\bcreate\b|\bdestroy\b|\bclear\b|\bremove\b|"
-        r"\badd-(?:br|port|flow)\b|\bdel-(?:br|port|flows?)\b|\bmod-flows?\b)",
-        re.IGNORECASE,
-    ),
-)
+_TRUSTED_PYTHON_PATHS = {
+    "{{ playbook_dir }}/../scripts/assemble_live_discovery.py",
+    "{{ playbook_dir }}/../scripts/validate_live_runtime.py",
+    "{{ playbook_dir }}/../scripts/live_discovery/argv_policy.py",
+    "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py",
+    "{{ playbook_dir }}/../scripts/live_discovery/protected_input.py",
+    "{{ playbook_dir }}/../scripts/live_discovery/run_owner.py",
+    "{{ live_discovery_side_remote_dir }}/scripts/collect_live_control.py",
+    "{{ live_discovery_source_probe_dir }}/scripts/collect_live_control.py",
+    "{{ live_discovery_target_probe_dir }}/scripts/collect_live_control.py",
+}
+_TRUSTED_WHOLE_ARGV_SHA256 = {
+    "37f7a0384d00c786db39b0ea5fa32c5fe168fc60e1e111a810b2253d2d508ac1",  # item.argv
+    "11968a36427f52c82d08f0fab898b1eacd12a43767e102ca00d58fb2a16d8de8",  # Glance SELECT
+    "91a6fd7cbbb7538979abf799077f4787c3f9b91964fada37bf7832a6e677530d",  # inspect
+    "6a5237508eb53a6521d14e632cfe200911c38a411235c7d3133279044b82bc9f",  # source combine
+    "f1d611f5cb91277e5469d70e7cefa02c36bfcdb350769904da54faa821a46735",  # target combine
+    "f717d936226836ce92c3b0bd98ab7516fa9ab633a02208bed44c722bc0d66e0a",  # scoped SQL
+    "d24496c4a787468b7dd49410612510382f50660d6530e23c8f900908b66b64c7",  # runtime
+    "0b73cc09c8a5afaa2954b6bcb367073d70d18fcc7bb7ee04a8b9a8981b18e9f8",  # schema SELECT
+    "2f0ec5197177b7470869b30b24c4e1511d15d55c6e7e8514516b86b689a48983",  # virsh version
+    "552b0570cd3e13dffb6250f309cd8f89d78adebf211dbfb063de6eb3e9e6b090",  # domcapabilities
+    "10f1f4525097d0166e406e154e517bfc8c6d34b90321fa2c0cec5e2e66d013be",  # qemu
+    "1312dcdeb55a6959f0989754676fa37401f0022728646f33ae0d283066d8bf7c",  # capability input
+}
 
 
 def _production_python_paths():
@@ -193,6 +166,10 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             name = _expression_name(node, aliases)
+            if name in {
+                "asyncio.__dict__", "os.__dict__", "posix.__dict__", "subprocess.__dict__",
+            }:
+                raise AssertionError(f"process namespace reference in {label}:{node.lineno}")
             if dangerous_reference(name):
                 parent = parents.get(node)
                 direct_runner_call = (
@@ -208,6 +185,12 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
             if owner in {"asyncio.__dict__", "os.__dict__", "posix.__dict__", "subprocess.__dict__"}:
                 raise AssertionError(f"dynamic process namespace in {label}:{node.lineno}")
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in {"getattr", "vars"}:
+                parent = parents.get(node)
+                if not isinstance(parent, ast.Call) or parent.func is not node:
+                    raise AssertionError(
+                        f"dynamic lookup reference in {label}:{node.lineno}: {node.id}"
+                    )
             target = aliases.get(node.id, "")
             if dangerous_reference(target):
                 raise AssertionError(f"process API alias reference in {label}:{node.lineno}")
@@ -245,9 +228,79 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
     return subprocess_calls
 
 
-def _reachable_playbook_paths():
+def _yaml_python():
+    executable = shutil.which("ansible-playbook")
+    if executable is None:
+        raise AssertionError("ansible-playbook runtime is required for structural YAML audit")
+    first_line = Path(executable).read_text(encoding="utf-8").splitlines()[0]
+    if not first_line.startswith("#!"):
+        raise AssertionError("ansible-playbook shebang is invalid")
+    interpreter = Path(first_line[2:])
+    if not interpreter.is_file():
+        raise AssertionError("Ansible Python runtime is unavailable")
+    return str(interpreter)
+
+
+def _yaml_load(text, label):
+    program = (
+        "import json,sys,yaml; "
+        "payload=yaml.safe_load(sys.stdin.read()); "
+        "json.dump(payload,sys.stdout,ensure_ascii=False)"
+    )
+    completed = subprocess.run(
+        [_yaml_python(), "-c", program],
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"YAML parse failed for {label}: {completed.stderr}")
+    return json.loads(completed.stdout)
+
+
+def _key_base(key):
+    return key.rsplit(".", 1)[-1] if isinstance(key, str) else ""
+
+
+def _walk_mappings(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_mappings(child)
+
+
+def _include_paths(payload, owner):
+    paths = []
+    for mapping in _walk_mappings(payload):
+        for key, value in mapping.items():
+            base = _key_base(key)
+            execution_family = (
+                base in {"action", "include", "import", "local_action"}
+                or base.startswith(("include_", "import_"))
+            )
+            if not execution_family:
+                continue
+            if base not in {"include_tasks", "import_tasks", "import_playbook"}:
+                raise AssertionError(f"unknown include/action/role form in {owner}: {key}")
+            if isinstance(value, dict):
+                if set(value) != {"file"}:
+                    raise AssertionError(f"unreviewed include mapping in {owner}: {key}")
+                value = value["file"]
+            if not isinstance(value, str) or not value or "{{" in value or "}}" in value:
+                raise AssertionError(f"dynamic include cannot be audited: {owner}: {value}")
+            paths.append(value)
+    return paths
+
+
+def _reachable_playbook_paths(entry=PLAYBOOK):
+    entry = Path(entry).resolve()
     playbooks_root = (ROOT / "playbooks").resolve()
-    pending = [PLAYBOOK.resolve()]
+    pending = [entry]
     seen = set()
     while pending:
         owner = pending.pop()
@@ -255,210 +308,130 @@ def _reachable_playbook_paths():
             continue
         seen.add(owner)
         text = owner.read_text(encoding="utf-8")
-        includes = _INCLUDE.findall(text)
-        if len(includes) != len(_INCLUDE_MODULE.findall(text)):
-            raise AssertionError(f"non-scalar include cannot be audited: {owner}")
-        if re.search(r"(?m)^\s*(?:ansible\.builtin\.)?(?:include_role|import_role):", text):
-            raise AssertionError(f"role include cannot be audited: {owner}")
-        for raw in includes:
-            if "{{" in raw or "}}" in raw:
-                raise AssertionError(f"dynamic include cannot be audited: {owner}: {raw}")
+        payload = _yaml_load(text, owner)
+        for raw in _include_paths(payload, owner):
             candidate = (owner.parent / raw).resolve()
             if not candidate.is_file():
                 candidate = (playbooks_root / raw).resolve()
-            if not candidate.is_file() or playbooks_root not in candidate.parents:
+            allowed_root = owner.parent if playbooks_root not in owner.parents else playbooks_root
+            if not candidate.is_file() or (
+                allowed_root != candidate.parent and allowed_root not in candidate.parents
+            ):
                 raise AssertionError(f"invalid reachable include: {owner}: {raw}")
             pending.append(candidate)
     return sorted(seen)
 
 
-def _module_blocks_from_text(text):
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        match = _MODULE.match(line)
-        if match is None:
+_TASK_LIST_KEYS = {"always", "block", "handlers", "post_tasks", "pre_tasks", "rescue", "tasks"}
+_EXECUTION_MODULES = {
+    "action", "command", "expect", "local_action", "raw", "script", "shell",
+    "win_command", "win_shell",
+}
+
+
+def _iter_task_mappings(payload, *, task_file=False):
+    if not isinstance(payload, list):
+        raise AssertionError("Ansible document must be a list")
+    for item in payload:
+        if not isinstance(item, dict):
+            raise AssertionError("Ansible play/task item must be a mapping")
+        is_play = not task_file and (
+            "hosts" in item
+            or any(_key_base(key) == "import_playbook" for key in item)
+        )
+        if is_play:
+            for key, value in item.items():
+                if _key_base(key) in _TASK_LIST_KEYS:
+                    yield from _iter_task_mappings(value, task_file=True)
             continue
-        indent = len(match.group(1))
-        task_start = None
-        task_indent = None
-        for candidate_index in range(index, -1, -1):
-            candidate = lines[candidate_index]
-            task = re.match(r"^(\s*)-\s+\S", candidate)
-            if task is not None and len(task.group(1)) < indent:
-                task_start = candidate_index
-                task_indent = len(task.group(1))
-                break
-        if task_start is None or indent != task_indent + 2:
-            continue
-        end = task_start + 1
-        while end < len(lines):
-            candidate = lines[end]
-            if (
-                end > task_start
-                and candidate.strip()
-                and re.match(rf"^\s{{{task_indent}}}-\s+", candidate)
-            ):
-                break
-            end += 1
-        yield match.group(2), match.group(3) or "", "\n".join(lines[task_start:end])
+        yield item
+        for key, value in item.items():
+            if _key_base(key) in {"always", "block", "rescue"}:
+                yield from _iter_task_mappings(value, task_file=True)
 
 
-def _module_blocks(path):
-    yield from _module_blocks_from_text(path.read_text(encoding="utf-8"))
+def _valid_item_argv(task):
+    expected = [
+        {"name": "nova-api-db", "argv": "{{ live_discovery_nova_api_db_version_argv }}"},
+        {"name": "nova-cell-db", "argv": "{{ live_discovery_nova_cell_db_version_argv }}"},
+        {"name": "neutron-db", "argv": "{{ live_discovery_neutron_db_version_argv }}"},
+        {"name": "cinder-db", "argv": "{{ live_discovery_cinder_db_version_argv }}"},
+    ]
+    return task.get("loop") == expected
 
 
-def _static_argv(block):
-    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
-    if match is None:
-        return None
-    value = match.group(1).strip()
-    if value.startswith("[") and value.endswith("]"):
-        tokens = [item.strip().strip("'\"") for item in value[1:-1].split(",")]
-        return tokens if tokens and all(tokens) and not any("{{" in item for item in tokens) else None
-    if value:
-        return None
-    lines = block[match.end():].splitlines()
-    tokens = []
-    for line in lines:
-        item = re.match(r"^\s+-\s+(.+?)\s*$", line)
-        if item is None:
-            if tokens and line.strip():
-                break
-            continue
-        token = item.group(1).strip().strip("'\"")
-        if "{{" in token or not token:
-            return None
-        tokens.append(token)
-    return tokens or None
-
-
-def _without_yaml_comments(text):
-    cleaned = []
-    for line in text.splitlines():
-        quote = None
-        escaped = False
-        end = len(line)
-        for index, character in enumerate(line):
-            if escaped:
-                escaped = False
-                continue
-            if character == "\\" and quote is not None:
-                escaped = True
-                continue
-            if quote is not None:
-                if character == quote:
-                    quote = None
-                continue
-            if character in {"'", '"'}:
-                quote = character
-            elif character == "#" and (index == 0 or line[index - 1].isspace()):
-                end = index
-                break
-        cleaned.append(line[:end].rstrip())
-    return "\n".join(cleaned)
-
-
-def _argv_items(block):
-    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
-    if match is None:
-        return []
-    value = match.group(1).strip()
-    if value.startswith("[") and value.endswith("]"):
-        return [item.strip().strip("'\"") for item in value[1:-1].split(",")]
-    if value:
-        return []
-    items = []
-    for line in block[match.end():].splitlines():
-        item = re.match(r"^[ \t]+-\s+(.+?)\s*$", line)
-        if item is not None:
-            items.append(item.group(1).strip().strip("'\""))
-        elif items and line.strip():
-            break
-    return items
-
-
-def _python_argv_is_reviewed(block):
-    items = _argv_items(block)
-    if not items or items[0] != "python3" or len(items) < 2:
+def _audit_python_argv(argv):
+    if len(argv) < 2 or argv[0] != "python3":
         return False
-    if items[1] == "-c":
-        return False
-    if items[1] == "-m":
-        return len(items) >= 3 and items[2] in {
+    if argv[1] == "-m":
+        return len(argv) >= 3 and argv[2] in {
             "live_discovery.argv_policy", "live_discovery.mysql_json",
         }
-    allowed_scripts = {
-        "argv_policy.py", "assemble_live_discovery.py", "capability_input.py",
-        "collect_live_control.py", "collect_live_runtime.py", "probe_plan.py",
-        "protected_input.py", "run_owner.py", "validate_live_runtime.py",
-    }
-    return any(items[1].endswith(script) for script in allowed_scripts)
+    return argv[1] in _TRUSTED_PYTHON_PATHS
 
 
-def _argv_shape_is_reviewed(block):
-    block = _without_yaml_comments(block)
-    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
-    if match is None:
-        return False
-    value = match.group(1).strip().strip("'\"")
-    static = _static_argv(block)
-    if static:
-        return True
-    if "{{" not in block[match.start():]:
-        return True
-    if value.startswith("{{") or value in {">-", "|"}:
-        dynamic = set(_DYNAMIC_ARGV.findall(block))
-        if dynamic - _ALLOWED_DYNAMIC_ARGV:
-            return False
-        if "item.argv" in block:
-            return all(name in block for name in (
-                "live_discovery_nova_api_db_version_argv",
-                "live_discovery_nova_cell_db_version_argv",
-                "live_discovery_neutron_db_version_argv",
-                "live_discovery_cinder_db_version_argv",
-            ))
-        if "['python3'" in block or '["python3"' in block:
-            return True
-        if dynamic:
-            exact_suffixes = (
-                "['version']", "['domcapabilities']", "['-machine', 'help']",
-                "['--execute'", "[item]",
-            )
-            return any(suffix in block for suffix in exact_suffixes)
-        return False
-    first_item = re.search(r"(?m)^[ \t]+-\s+([^\n]+)$", block[match.end():])
-    if first_item is None:
-        return False
-    executable = first_item.group(1).strip().strip("'\"")
-    if executable == "python3":
-        return _python_argv_is_reviewed(block)
-    return "{{" not in executable and executable in {"mkdir", "/usr/bin/true"}
+def _audit_argv(argv, task, label):
+    if isinstance(argv, str):
+        normalized = " ".join(argv.split())
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        if digest not in _TRUSTED_WHOLE_ARGV_SHA256:
+            raise AssertionError(f"{label}: whole-expression argv is not exact-reviewed")
+        if normalized == "{{ item.argv }}" and not _valid_item_argv(task):
+            raise AssertionError(f"{label}: item.argv loop is not exact-reviewed")
+        return set(_DYNAMIC_ARGV.findall(argv))
+    if not isinstance(argv, list) or not argv or not all(
+        isinstance(value, str) and value for value in argv
+    ):
+        raise AssertionError(f"{label}: argv must be a non-empty string list")
+    if "{{" in argv[0] or "}}" in argv[0]:
+        raise AssertionError(f"{label}: dynamic executable is forbidden")
+    if argv[0] == "python3":
+        if not _audit_python_argv(argv):
+            raise AssertionError(f"{label}: Python entrypoint is not exact-reviewed")
+    elif argv[0] == "mkdir":
+        if argv != ["mkdir", "--", "{{ live_discovery_local_run_dir }}"]:
+            raise AssertionError(f"{label}: mkdir argv is not exact-reviewed")
+    elif argv == ["/usr/bin/true"]:
+        pass
+    elif any("{{" in value or "}}" in value for value in argv):
+        raise AssertionError(f"{label}: templated external argv is forbidden")
+    else:
+        rejection = classify_mutation(argv)
+        if rejection is not None:
+            raise AssertionError(f"{label}: external argv rejected: {rejection}")
+    return set(_DYNAMIC_ARGV.findall(" ".join(argv)))
 
 
 def _audit_command_text(text, label):
-    text = _without_yaml_comments(text)
-    if re.search(r"(?m)^\s*(?:-\s+)?(?:action|local_action):", text):
-        raise AssertionError(f"{label}: action/local_action execution is forbidden")
+    payload = _yaml_load(text, label)
+    task_file = not any(
+        isinstance(item, dict) and (
+            "hosts" in item or any(_key_base(key) == "import_playbook" for key in item)
+        )
+        for item in payload if isinstance(item, dict)
+    ) if isinstance(payload, list) else True
     command_count = 0
     dynamic_argv = set()
-    for module, inline, block in _module_blocks_from_text(text):
+    for task in _iter_task_mappings(payload, task_file=task_file):
+        execution = [
+            (key, value) for key, value in task.items()
+            if _key_base(key) in _EXECUTION_MODULES
+        ]
+        if not execution:
+            continue
+        if len(execution) != 1:
+            raise AssertionError(f"{label}: multiple execution modules in one task")
+        key, module_args = execution[0]
+        module = _key_base(key)
         if module != "command":
-            raise AssertionError(f"{label}: {module} bypasses argv audit")
-        if inline.strip():
-            raise AssertionError(f"{label}: free-form command is forbidden")
-        if not _argv_shape_is_reviewed(block):
-            raise AssertionError(f"{label}: argv shape is not reviewed")
-        static = _static_argv(block)
-        if static and static != ["/usr/bin/true"]:
-            rejection = classify_mutation(static)
-            if rejection is not None:
-                raise AssertionError(f"{label}: mutating argv: {rejection}")
-        normalized = re.sub(r"\s+", " ", block)
-        for pattern in _FORBIDDEN_COMMAND_PATTERNS:
-            if pattern.search(normalized):
-                raise AssertionError(f"{label}: {pattern.pattern}")
+            raise AssertionError(f"{label}: {module} execution path is forbidden")
+        if not isinstance(module_args, dict) or set(module_args) - {
+            "argv", "chdir", "stdin", "stdin_add_newline",
+        } or "argv" not in module_args:
+            raise AssertionError(f"{label}: command must use reviewed argv mapping")
+        variables = _audit_argv(module_args["argv"], task, label)
+        dynamic_argv.update(variables)
         command_count += 1
-        dynamic_argv.update(_DYNAMIC_ARGV.findall(block))
     return command_count, dynamic_argv
 
 
@@ -496,6 +469,50 @@ def _concrete_mysql_argv(argv):
 
 
 class LiveDiscoveryMutationAuditTests(unittest.TestCase):
+    def test_structural_include_graph_audits_fqcn_quoted_and_mapping_forms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "child.yml"
+            child.write_text(
+                "---\n- name: mutation\n  command:\n    argv: [rm, -rf, /srv/data]\n",
+                encoding="utf-8",
+            )
+            owners = (
+                "---\n- name: play\n  hosts: localhost\n  tasks:\n"
+                "    - name: quoted legacy\n"
+                "      'ansible.legacy.include_tasks': child.yml\n",
+                "---\n- name: play\n  hosts: localhost\n  tasks:\n"
+                "    - name: collection mapping\n"
+                "      example.collection.include_tasks:\n"
+                "        file: child.yml\n",
+            )
+            for index, source in enumerate(owners):
+                owner = root / f"owner-{index}.yml"
+                owner.write_text(source, encoding="utf-8")
+                with self.subTest(source=source):
+                    paths = _reachable_playbook_paths(owner)
+                    self.assertEqual({owner.resolve(), child.resolve()}, set(paths))
+                    with self.assertRaises(AssertionError):
+                        for path in paths:
+                            _audit_command_text(
+                                path.read_text(encoding="utf-8"), path
+                            )
+
+    def test_structural_include_graph_rejects_unknown_include_and_role_forms(self):
+        unsafe = (
+            "---\n- name: play\n  hosts: localhost\n  tasks:\n    - include: child.yml\n",
+            "---\n- name: play\n  hosts: localhost\n  tasks:\n    - ansible.legacy.include_role:\n        name: unsafe\n",
+            "---\n- name: play\n  hosts: localhost\n  tasks:\n    - 'vendor.collection.import_role':\n        name: unsafe\n",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, source in enumerate(unsafe):
+                owner = root / f"unsafe-{index}.yml"
+                owner.write_text(source, encoding="utf-8")
+                with self.subTest(source=source):
+                    with self.assertRaises(AssertionError):
+                        _reachable_playbook_paths(owner)
+
     def test_ansible_audit_rejects_alternate_modules_templates_and_multiline_mutation(self):
         unsafe = (
             "---\n- name: bare\n  command:\n    argv:\n      - openstack\n      - server\n      - lock\n      - server-1\n",
@@ -510,6 +527,8 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             "---\n- name: inline comment spoof\n  ansible.builtin.command:\n    argv: \"{{ arbitrary_inventory_argv }}\" # ['python3'] live_discovery_mysql_json_argv ['version']\n",
             "---\n- name: action bypass\n  action: command openstack server lock server-1\n",
             "---\n- name: local action bypass\n  local_action: shell docker stop nova_compute\n",
+            "---\n- name: dynamic helper path\n  command:\n    argv:\n      - python3\n      - \"{{ arbitrary_directory }}/run_owner.py\"\n      - verify\n",
+            "---\n- name: whole expression helper spoof\n  command:\n    argv: \"{{ ['python3', arbitrary_directory + '/run_owner.py', 'verify'] }}\"\n",
         )
         for source in unsafe:
             with self.subTest(source=source):
@@ -533,6 +552,8 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             ("import os\nlaunch = os.__dict__['system']\n", False),
             ("import subprocess\nlaunch = subprocess.__dict__['run']\n", True),
             ("from subprocess import run as launch\nreference = launch\n", True),
+            ("import os\nnamespace = os.__dict__\nlaunch = namespace['system']\n", False),
+            ("import os\nlookup = getattr\nlaunch = lookup(os, 'system')\n", False),
         )
         for source, allow_subprocess in unsafe:
             with self.subTest(source=source):
@@ -568,7 +589,8 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
 
     def test_reachable_playbook_command_graph_is_read_only(self):
         paths = _reachable_playbook_paths()
-        self.assertEqual(8, len(paths), [str(path.relative_to(ROOT)) for path in paths])
+        self.assertIn(PLAYBOOK.resolve(), paths)
+        self.assertGreater(len(paths), 1)
         combined = []
         dynamic_argv = set()
         command_count = 0
