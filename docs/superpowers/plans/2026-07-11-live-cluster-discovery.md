@@ -1,14 +1,14 @@
-# Live Cluster Discovery Implementation Plan
+# План реализации live discovery кластера
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Для исполнителей:** ОБЯЗАТЕЛЬНЫЙ НАВЫК: применяйте superpowers:subagent-driven-development (рекомендуется) или superpowers:executing-plans и выполняйте план по задачам. Для отслеживания используются флажки (`- [ ]`).
 
-**Goal:** Построить полностью read-only live discovery pipeline, который собирает resource graph ВМ на re-home compute host, направленно сравнивает vendor Keystack source с vanilla OpenStack 2025.1 Epoxy target и выдаёт fail-closed readiness verdict для Nova, Neutron, Cinder, Glance и runtime.
+**Цель:** Построить полностью read-only live discovery pipeline, который собирает resource graph ВМ на re-home compute host, направленно сравнивает vendor Keystack source с vanilla OpenStack 2025.1 Epoxy target и выдаёт fail-closed readiness verdict для Nova, Neutron, Cinder, Glance и runtime.
 
-**Architecture:** Ansible запускает изолированные collectors на source/target control plane и re-home compute, а локальный assembler объединяет их versioned artifacts. Collectors используют общий stdlib-only контракт, безопасный argv runner и service-specific модули; target `information_schema` является canonical schema, а source-only vendor fields проходят только через явную policy. Никакие API/SQL mutations, data copies, service restarts, online data migrations или Masakari/DRS operations не выполняются.
+**Архитектура:** Ansible запускает изолированные collectors на source/target control plane и re-home compute, а локальный assembler объединяет их versioned artifacts. Collectors используют общий stdlib-only контракт, безопасный argv runner и service-specific модули; target `information_schema` является canonical schema, а source-only vendor fields проходят только через явную policy. Никакие API/SQL mutations, data copies, service restarts, online data migrations или Masakari/DRS operations не выполняются.
 
-**Tech Stack:** Python 3 standard library, `unittest`, Ansible Core 2.18+, OpenStackClient внутри Kolla `kolla_toolbox`, MariaDB read-only queries, libvirt CLI, OVS/OVN read-only CLI, JSON/YAML/Markdown artifacts.
+**Технологии:** Python 3 standard library, `unittest`, Ansible Core 2.18+, OpenStackClient внутри Kolla `kolla_toolbox`, MariaDB read-only queries, libvirt CLI, OVS/OVN read-only CLI, JSON/YAML/Markdown artifacts.
 
-## Global Constraints
+## Общие ограничения
 
 - Target profile: `vanilla-openstack-2025.1-epoxy`; live target schema и runtime являются canonical.
 - Source profile: vendor-modified Keystack; source-only semantics не отбрасываются молча.
@@ -22,7 +22,7 @@
 - Реализация остаётся stdlib-only; новые Python dependencies не добавляются.
 - Каждый task заканчивается отдельным commit после red-green тестового цикла.
 
-## Planned File Structure
+## Планируемая структура файлов
 
 ```text
 scripts/
@@ -63,7 +63,7 @@ cinder-rehome-readiness-ru.md
 glance-rehome-readiness-ru.md
 ```
 
-Existing files modified by the plan:
+Существующие файлы, изменяемые по плану:
 
 - `group_vars/all.yml` — generic live discovery variables.
 - `inventory/hosts.yml` — portable example variables/groups.
@@ -79,9 +79,9 @@ Existing files modified by the plan:
 
 ---
 
-### Task 1: Versioned Contract and Fail-Closed Read-Only Runner
+### Задача 1: Версионированный контракт и fail-closed read-only runner
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/__init__.py`
 - Create: `scripts/live_discovery/contract.py`
@@ -89,7 +89,7 @@ Existing files modified by the plan:
 - Create: `tests/test_live_discovery_contract.py`
 - Create: `tests/test_live_discovery_runner.py`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Produces: `CONTRACT_VERSION = "openstack-rehome-live-discovery/v1alpha1"`.
 - Produces: `CheckResult`, `ResourceNode`, `DependencyEdge`, `CollectorResult`, each with `to_dict()`.
@@ -97,7 +97,7 @@ Existing files modified by the plan:
 - Produces: `MutationRejected`, `ProbeFailed`.
 - All later tasks consume these exact names.
 
-- [ ] **Step 1: Write failing contract tests**
+- [ ] **Шаг 1: Написать failing-тесты для contract tests**
 
 ```python
 from pathlib import Path
@@ -128,13 +128,13 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the contract test and verify RED**
+- [ ] **Шаг 2: Запустить contract test and verify RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_contract -v`
+Команда: `python3 -m unittest tests.test_live_discovery_contract -v`
 
-Expected: `ModuleNotFoundError: No module named 'live_discovery'`.
+Ожидается: `ModuleNotFoundError: No module named 'live_discovery'`.
 
-- [ ] **Step 3: Implement the complete contract dataclasses**
+- [ ] **Шаг 3: Реализовать the complete contract dataclasses**
 
 ```python
 # scripts/live_discovery/contract.py
@@ -212,7 +212,7 @@ class CollectorResult:
 
 `scripts/live_discovery/__init__.py` must export the four dataclasses and `CONTRACT_VERSION`.
 
-- [ ] **Step 4: Write failing runner tests**
+- [ ] **Шаг 4: Написать failing-тесты для runner tests**
 
 ```python
 from pathlib import Path
@@ -262,15 +262,15 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 5: Run runner tests and verify RED**
+- [ ] **Шаг 5: Запустить runner tests and verify RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_runner -v`
+Команда: `python3 -m unittest tests.test_live_discovery_runner -v`
 
-Expected: import failure for `live_discovery.runner`.
+Ожидается: import failure for `live_discovery.runner`.
 
-- [ ] **Step 6: Implement argv-only runner and mutation classifier**
+- [ ] **Шаг 6: Реализовать argv-only runner and mutation classifier**
 
-Implement `CommandEvidence.to_dict()` and `ReadOnlyRunner` with these exact rules:
+Реализовать `CommandEvidence.to_dict()` и `ReadOnlyRunner` со следующими точными правилами:
 
 ```python
 MUTATING_TOKENS = {
@@ -304,26 +304,26 @@ def classify_mutation(argv):
 
 `run_sql` must accept only one comment-free statement matching `^SELECT\b[\s\S]*;$`, reject additional semicolons and the tokens `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `ALTER`, `CREATE`, `DROP`, `TRUNCATE`, `GRANT`, `REVOKE`, `CALL`, `DO`, `SET`, `INTO OUTFILE`, `LOAD_FILE`, and pass the SQL through `subprocess.run(..., input=sql)`. Docker-wrapped `mysql`/`mariadb` argv is allowed only through `run_sql`.
 
-- [ ] **Step 7: Run focused and full tests**
+- [ ] **Шаг 7: Запустить focused and full tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_contract tests.test_live_discovery_runner -v`
+Команда: `python3 -m unittest tests.test_live_discovery_contract tests.test_live_discovery_runner -v`
 
-Expected: 6 tests, all `OK`.
+Ожидается: 6 tests, all `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: all existing and new tests `OK`.
+Ожидается: all existing and new tests `OK`.
 
-- [ ] **Step 8: Commit Task 1**
+- [ ] **Шаг 8: Зафиксировать Task 1**
 
 ```bash
 git add scripts/live_discovery tests/test_live_discovery_contract.py tests/test_live_discovery_runner.py
 git commit -m "feat: add live discovery contract and safe runner"
 ```
 
-### Task 2: JSONL Database Transport and Directional Schema Mapping
+### Задача 2: JSONL-транспорт БД и направленное сопоставление схем
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/mysql_json.py`
 - Create: `scripts/live_discovery/schema.py`
@@ -334,7 +334,7 @@ git commit -m "feat: add live discovery contract and safe runner"
 - Create: `tests/fixtures/live_discovery/schema-policy.json`
 - Create: `inventory/live-discovery-schema-policy.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: `CollectorResult`, `CheckResult` from Task 1.
 - Produces: `validate_identifier(value)`, `uuid_in(column, values)`, `build_json_row_query(schema, table, columns, where_sql)`.
@@ -342,7 +342,7 @@ git commit -m "feat: add live discovery contract and safe runner"
 - Produces: `parse_information_schema(path) -> SchemaSnapshot`.
 - Produces: `build_directional_mapping(source, target, used_columns, policy) -> dict`.
 
-- [ ] **Step 1: Write failing JSON transport tests**
+- [ ] **Шаг 1: Написать failing-тесты для JSON transport tests**
 
 ```python
 from pathlib import Path
@@ -373,15 +373,15 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Verify JSON transport RED**
+- [ ] **Шаг 2: Проверить JSON transport RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_mysql_json -v`
+Команда: `python3 -m unittest tests.test_live_discovery_mysql_json -v`
 
-Expected: import failure for `live_discovery.mysql_json`.
+Ожидается: import failure for `live_discovery.mysql_json`.
 
-- [ ] **Step 3: Implement identifier validation and one-JSON-object-per-row SELECT generation**
+- [ ] **Шаг 3: Реализовать identifier validation and one-JSON-object-per-row SELECT generation**
 
-The generated SQL must have this form and end with a semicolon:
+Сгенерированный SQL должен иметь следующий вид и завершаться точкой с запятой:
 
 ```sql
 SELECT JSON_OBJECT(
@@ -393,12 +393,12 @@ FROM `nova`.`instance_info_caches`
 WHERE `instance_uuid` IN ('11111111-1111-1111-1111-111111111111');
 ```
 
-Use regex `^[A-Za-z_][A-Za-z0-9_]*$` for identifiers and Python
+Для идентификаторов использовать regex `^[A-Za-z_][A-Za-z0-9_]*$` и Python
 `uuid.UUID(value)` for every UUID literal. Do not use `--raw` TSV rows for live discovery.
 
-The module CLI must read one file, call the same single-statement validator as `ReadOnlyRunner.run_sql`, print `SELECT_ONLY_OK` on success, and return non-zero for comments hiding a second statement, DML/DDL, `INTO OUTFILE`, `LOAD_FILE` or malformed SQL.
+CLI модуля должен прочитать один файл, вызвать тот же валидатор одного statement, что и `ReadOnlyRunner.run_sql`, вывести `SELECT_ONLY_OK` при успехе и вернуть ненулевой код для комментариев, скрывающих второй statement, DML/DDL, `INTO OUTFILE`, `LOAD_FILE` или некорректного SQL.
 
-- [ ] **Step 4: Write failing directional mapping tests**
+- [ ] **Шаг 4: Написать failing-тесты для directional mapping tests**
 
 ```python
 def test_vendor_source_column_is_ignored_only_by_explicit_policy(self):
@@ -423,13 +423,13 @@ def test_target_required_column_without_default_blocks(self):
     self.assertIn("cinder.volumes.target_required", mapping["blockers"])
 ```
 
-- [ ] **Step 5: Verify schema mapping RED**
+- [ ] **Шаг 5: Проверить schema mapping RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_schema -v`
+Команда: `python3 -m unittest tests.test_live_discovery_schema -v`
 
-Expected: import failure or missing `build_directional_mapping`.
+Ожидается: import failure or missing `build_directional_mapping`.
 
-- [ ] **Step 6: Implement exact mapping classifications**
+- [ ] **Шаг 6: Реализовать exact mapping classifications**
 
 `build_directional_mapping` must emit only:
 
@@ -445,9 +445,9 @@ CLASSIFICATIONS = {
 }
 ```
 
-Type comparison must normalize `integer -> int`, ignore display widths such as `int(11)`, preserve signedness, string length, nullability, default and auto_increment. `cell_id`, `compute_id`, `service_uuid`, `volume_type_id` and configured backend identifiers classify as `NORMALIZATION_REQUIRED` even when SQL types match.
+Сравнение типов должно нормализовать `integer -> int`, игнорировать display width вроде `int(11)` и сохранять signedness, длину строки, nullability, default и auto_increment. `cell_id`, `compute_id`, `service_uuid`, `volume_type_id` и настроенные идентификаторы backend классифицируются как `NORMALIZATION_REQUIRED`, даже если SQL-типы совпадают.
 
-Create the initial reviewed policy with no table-wide ignores and only the two known non-runtime Keystack Nova service columns from the example schema:
+Создать первоначальную reviewed policy без table-wide ignores и только с двумя известными non-runtime колонками сервиса Nova Keystack из примерной схемы:
 
 ```json
 {
@@ -470,41 +470,41 @@ Create the initial reviewed policy with no table-wide ignores and only the two k
 }
 ```
 
-Every other source-only used column remains `BLOCKED` until the policy is reviewed and committed.
+Любая другая используемая только на source колонка остаётся `BLOCKED`, пока policy не проверена и не зафиксирована.
 
-- [ ] **Step 7: Run focused and full tests**
+- [ ] **Шаг 7: Запустить focused and full tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_mysql_json tests.test_live_discovery_schema -v`
+Команда: `python3 -m unittest tests.test_live_discovery_mysql_json tests.test_live_discovery_schema -v`
 
-Expected: all focused tests `OK`.
+Ожидается: all focused tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 8: Commit Task 2**
+- [ ] **Шаг 8: Зафиксировать Task 2**
 
 ```bash
 git add scripts/live_discovery/mysql_json.py scripts/live_discovery/schema.py inventory/live-discovery-schema-policy.json tests/test_live_discovery_mysql_json.py tests/test_live_discovery_schema.py tests/fixtures/live_discovery
 git commit -m "feat: add directional live schema mapping"
 ```
 
-### Task 3: OpenStack Read-Only Adapter and Canonical Epoxy Profile
+### Задача 3: Read-only адаптер OpenStack и канонический профиль Epoxy
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/openstack.py`
 - Create: `tests/test_live_discovery_openstack.py`
 - Create: `tests/fixtures/live_discovery/openstack-command-results.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: `ReadOnlyRunner` from Task 1.
 - Produces: `OpenStackClient(runner, cloud, container, clouds_path)`.
 - Produces: `OpenStackClient.json(command, evidence_id, required=True)`.
 - Produces: `collect_target_profile(client, manage_outputs, image_inspects) -> CollectorResult`.
 
-- [ ] **Step 1: Write failing adapter tests**
+- [ ] **Шаг 1: Написать failing-тесты для adapter tests**
 
 ```python
 class FakeRunner:
@@ -527,13 +527,13 @@ def test_kolla_client_builds_argv_without_shell():
     ]
 ```
 
-- [ ] **Step 2: Verify adapter RED**
+- [ ] **Шаг 2: Проверить adapter RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_openstack -v`
+Команда: `python3 -m unittest tests.test_live_discovery_openstack -v`
 
-Expected: import failure for `live_discovery.openstack`.
+Ожидается: import failure for `live_discovery.openstack`.
 
-- [ ] **Step 3: Implement JSON parsing without silent defaults**
+- [ ] **Шаг 3: Реализовать JSON parsing without silent defaults**
 
 `OpenStackClient.json` must:
 
@@ -543,9 +543,9 @@ Expected: import failure for `live_discovery.openstack`.
 4. raise `ProbeFailed` with reason `invalid-json` on parse failure;
 5. return `(payload, evidence_dict)`; never return `{}` or `[]` after an error.
 
-- [ ] **Step 4: Add target profile fixture test**
+- [ ] **Шаг 4: Добавить target profile fixture test**
 
-The fixture must cover:
+Fixture должна покрывать:
 
 ```json
 {
@@ -562,44 +562,44 @@ The fixture must cover:
 }
 ```
 
-Assert that any distribution other than `vanilla` or release other than `2025.1` adds a blocker to the target profile result.
+Проверить, что distribution, отличная от `vanilla`, или release, отличная от `2025.1`, добавляет blocker в результат target profile.
 
-The fixture and result must also contain `online_migration_evidence` for Nova and Cinder. This is an operator-supplied timestamped artifact proving that the relevant command previously completed with exit `0`; the collector never runs the command. Missing/stale evidence produces `UNKNOWN`, and evidence whose recorded exit is not `0` produces `BLOCKED`.
+Fixture и результат также должны содержать `online_migration_evidence` для Nova и Cinder. Это предоставленный оператором timestamped artifact, доказывающий, что соответствующая команда ранее завершилась с кодом `0`; collector эту команду никогда не запускает. Отсутствующее или устаревшее evidence даёт `UNKNOWN`, а evidence с ненулевым кодом — `BLOCKED`.
 
-- [ ] **Step 5: Run focused and full tests**
+- [ ] **Шаг 5: Запустить focused and full tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_openstack -v`
+Команда: `python3 -m unittest tests.test_live_discovery_openstack -v`
 
-Expected: adapter and profile tests `OK`.
+Ожидается: adapter and profile tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 6: Commit Task 3**
+- [ ] **Шаг 6: Зафиксировать Task 3**
 
 ```bash
 git add scripts/live_discovery/openstack.py tests/test_live_discovery_openstack.py tests/fixtures/live_discovery/openstack-command-results.json
 git commit -m "feat: collect canonical epoxy target profile"
 ```
 
-### Task 4: Nova Root Discovery
+### Задача 4: Поиск корневых объектов Nova
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/nova.py`
 - Create: `tests/test_live_discovery_nova.py`
 - Create: `tests/fixtures/live_discovery/nova-source.json`
 - Create: `tests/fixtures/live_discovery/nova-target.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: `OpenStackClient`, contract types.
 - Produces: `NovaCollector(client, side).collect(rehome_host) -> CollectorResult`.
 - Produces node kinds: `compute_host`, `nova_service`, `compute_node`, `instance`, `project`, `user`, `flavor`, `image_ref`, `cell_mapping`, `request_spec`, `placement_provider`.
 - Produces required edges used by Neutron/Cinder/Glance collectors.
 
-- [ ] **Step 1: Write failing Nova fixture test**
+- [ ] **Шаг 1: Написать failing-тесты для Nova fixture test**
 
 ```python
 def test_nova_collector_roots_graph_at_exact_rehome_host(self):
@@ -619,15 +619,15 @@ def test_missing_instance_mapping_is_blocker(self):
     self.assertIn("instance mapping missing: 11111111-1111-1111-1111-111111111111", result.blockers)
 ```
 
-- [ ] **Step 2: Verify Nova RED**
+- [ ] **Шаг 2: Проверить Nova RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_nova -v`
+Команда: `python3 -m unittest tests.test_live_discovery_nova -v`
 
-Expected: import failure for `live_discovery.nova`.
+Ожидается: import failure for `live_discovery.nova`.
 
-- [ ] **Step 3: Implement exact host and UUID validation**
+- [ ] **Шаг 3: Реализовать exact host and UUID validation**
 
-The collector must use these read-only commands:
+Collector должен использовать следующие read-only команды:
 
 ```text
 openstack server list --all-projects --host <rehome_host> --long -f json
@@ -639,35 +639,35 @@ openstack resource provider list --name <rehome_host> -f json
 openstack resource provider allocation show <consumer_uuid> -f json
 ```
 
-DB facts for `host_mappings`, `instance_mappings`, `request_specs`, `instances`, `block_device_mapping`, `instance_info_caches`, `compute_nodes` and `services` must arrive as JSONL records produced by Task 2 queries. Host mismatch, duplicate canonical service, missing cell mapping or missing instance DB row is a blocker.
+DB facts для `host_mappings`, `instance_mappings`, `request_specs`, `instances`, `block_device_mapping`, `instance_info_caches`, `compute_nodes` и `services` должны поступать как JSONL records, созданные запросами задачи 2. Несовпадение host, дублирование canonical service, отсутствие cell mapping или строки instance в БД является blocker.
 
-- [ ] **Step 4: Run focused and full tests**
+- [ ] **Шаг 4: Запустить focused and full tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_nova -v`
+Команда: `python3 -m unittest tests.test_live_discovery_nova -v`
 
-Expected: Nova tests `OK`.
+Ожидается: Nova tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 5: Commit Task 4**
+- [ ] **Шаг 5: Зафиксировать Task 4**
 
 ```bash
 git add scripts/live_discovery/nova.py tests/test_live_discovery_nova.py tests/fixtures/live_discovery/nova-source.json tests/fixtures/live_discovery/nova-target.json
 git commit -m "feat: discover nova rehome roots"
 ```
 
-### Task 5: Runtime Domain, Disk and Dataplane Normalization
+### Задача 5: Нормализация runtime-доменов, дисков и dataplane
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/runtime.py`
 - Create: `scripts/collect_live_runtime.py`
 - Create: `tests/test_live_discovery_runtime.py`
 - Create: `tests/fixtures/live_discovery/runtime-source.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: contract and runner types.
 - Produces: `collect_runtime(runner, virsh_argv, network_backend) -> CollectorResult`.
@@ -676,7 +676,7 @@ git commit -m "feat: discover nova rehome roots"
 - Produces: `compare_runtime_to_nova(runtime_result, nova_result) -> list[CheckResult]`.
 - Produces node kinds: `libvirt_domain`, `runtime_disk`, `runtime_interface`, `ovs_port`, `ovn_binding`.
 
-- [ ] **Step 1: Write failing runtime comparison tests**
+- [ ] **Шаг 1: Написать failing-тесты для runtime comparison tests**
 
 ```python
 def test_runtime_maps_domain_disk_and_interface_to_openstack_ids(self):
@@ -698,15 +698,15 @@ def test_source_machine_type_missing_on_target_is_blocker(self):
     self.assertTrue(any(item.status == "BLOCKED" for item in checks))
 ```
 
-- [ ] **Step 2: Verify runtime RED**
+- [ ] **Шаг 2: Проверить runtime RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_runtime -v`
+Команда: `python3 -m unittest tests.test_live_discovery_runtime -v`
 
-Expected: import failure for `live_discovery.runtime`.
+Ожидается: import failure for `live_discovery.runtime`.
 
-- [ ] **Step 3: Implement read-only runtime command set**
+- [ ] **Шаг 3: Реализовать read-only runtime command set**
 
-Use argv commands only:
+Использовать только команды в формате argv:
 
 ```text
 <virsh_argv> list --uuid --name
@@ -722,13 +722,13 @@ ovn-sbctl --format=json list Port_Binding
 <target_qemu_argv> -machine help
 ```
 
-Redact `<secret>` XML elements before evidence persistence. Extract instance UUID from libvirt metadata/name and port UUID from target dev/OVS external IDs. Do not call `virsh shutdown`, `destroy`, `detach-*` or any lifecycle command.
+Перед сохранением evidence редактировать XML-элементы `<secret>`. UUID instance извлекать из libvirt metadata/name, UUID port — из target dev/OVS external IDs. Не вызывать `virsh shutdown`, `destroy`, `detach-*` и другие lifecycle-команды.
 
-Run target capability probes on `target_reference_compute`; do not start a domain. Missing support for any source running domain machine type or disk bus is a blocker.
+Target capability probes запускать на `target_reference_compute`, не стартуя domain. Отсутствие поддержки machine type или disk bus любого запущенного source domain является blocker.
 
-- [ ] **Step 4: Add CLI fixture-mode smoke test**
+- [ ] **Шаг 4: Добавить CLI fixture-mode smoke test**
 
-Run:
+Команда:
 
 ```bash
 python3 scripts/collect_live_runtime.py \
@@ -737,22 +737,22 @@ python3 scripts/collect_live_runtime.py \
   --out /tmp/live-runtime-result.json
 ```
 
-Expected: exit `0`; output JSON has schema version `openstack-rehome-live-discovery/v1alpha1` and at least one `libvirt_domain` node.
+Ожидается: exit `0`; output JSON has schema version `openstack-rehome-live-discovery/v1alpha1` and at least one `libvirt_domain` node.
 
-- [ ] **Step 5: Run full tests and commit**
+- [ ] **Шаг 5: Запустить full tests and commit**
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
 ```bash
 git add scripts/live_discovery/runtime.py scripts/collect_live_runtime.py tests/test_live_discovery_runtime.py tests/fixtures/live_discovery/runtime-source.json
 git commit -m "feat: collect rehome runtime graph"
 ```
 
-### Task 6: Neutron Dependency and OVS/OVN Readiness Collector
+### Задача 6: Коллектор зависимостей Neutron и готовности OVS/OVN
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/neutron.py`
 - Create: `tests/test_live_discovery_neutron.py`
@@ -760,13 +760,13 @@ git commit -m "feat: collect rehome runtime graph"
 - Create: `tests/fixtures/live_discovery/neutron-ovs-target.json`
 - Create: `tests/fixtures/live_discovery/neutron-ovn-target.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: Nova instance IDs, port IDs and network IDs; runtime nodes; schema capabilities.
 - Produces: `NeutronCollector(client, side, schema).collect(port_ids) -> CollectorResult`.
 - Produces node kinds: `port`, `network`, `subnet`, `segment`, `ml2_binding`, `binding_level`, `security_group`, `qos_policy`, `trunk`, `router`, `floating_ip`, `address_group`, `network_agent`.
 
-- [ ] **Step 1: Write failing OVS dependency tests**
+- [ ] **Шаг 1: Написать failing-тесты для OVS dependency tests**
 
 ```python
 def test_ovs_port_requires_binding_level_and_matching_segment(self):
@@ -781,15 +781,15 @@ def test_missing_target_segment_blocks(self):
     self.assertIn("target segment missing for port port-1", result.blockers)
 ```
 
-- [ ] **Step 2: Verify Neutron RED**
+- [ ] **Шаг 2: Проверить Neutron RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_neutron -v`
+Команда: `python3 -m unittest tests.test_live_discovery_neutron -v`
 
-Expected: import failure for `live_discovery.neutron`.
+Ожидается: import failure for `live_discovery.neutron`.
 
-- [ ] **Step 3: Implement capability-driven dependency expansion**
+- [ ] **Шаг 3: Реализовать capability-driven dependency expansion**
 
-For each selected port, collect API fields and include a DB family only when the table exists and rows reference selected UUIDs. The exact families are:
+Для каждого выбранного port собрать API fields и включать DB family только если таблица существует, а строки ссылаются на выбранные UUID. Точный набор families:
 
 ```python
 OPTIONAL_TABLE_FAMILIES = {
@@ -802,32 +802,32 @@ OPTIONAL_TABLE_FAMILIES = {
 }
 ```
 
-Core tables always checked for selected UUIDs: `ports`, `ipallocations`, `networks`, `subnets`, `networksegments`, `ml2_port_bindings`, `ml2_distributed_port_bindings`, `ml2_port_binding_levels`, `securitygroups`, `securitygrouprules`, `securitygroupportbindings`.
+Основные таблицы всегда проверяются для выбранных UUID: `ports`, `ipallocations`, `networks`, `subnets`, `networksegments`, `ml2_port_bindings`, `ml2_distributed_port_bindings`, `ml2_port_binding_levels`, `securitygroups`, `securitygrouprules`, `securitygroupportbindings`.
 
-- [ ] **Step 4: Implement target compatibility checks**
+- [ ] **Шаг 4: Реализовать target compatibility checks**
 
-The target comparison must require exact port/network UUID where metadata already exists, and require a unique target segment matching `(network_type, physical_network, segmentation_id)`. It must compare OVS bridges/ports for `network_backend=ovs` and OVN chassis/logical bindings for `network_backend=ovn`. Unsupported backend returns `UNKNOWN`, not an empty result.
+Сравнение target должно требовать точные UUID port/network, если metadata уже существует, и единственный target segment, соответствующий `(network_type, physical_network, segmentation_id)`. Для `network_backend=ovs` сравниваются OVS bridges/ports, а для `network_backend=ovn` — OVN chassis/logical bindings. Неподдерживаемый backend возвращает `UNKNOWN`, а не пустой результат.
 
-- [ ] **Step 5: Run OVS and OVN fixture tests**
+- [ ] **Шаг 5: Запустить OVS and OVN fixture tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_neutron -v`
+Команда: `python3 -m unittest tests.test_live_discovery_neutron -v`
 
-Expected: OVS/OVN dependency and missing-segment tests `OK`.
+Ожидается: OVS/OVN dependency and missing-segment tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 6: Commit Task 6**
+- [ ] **Шаг 6: Зафиксировать Task 6**
 
 ```bash
 git add scripts/live_discovery/neutron.py tests/test_live_discovery_neutron.py tests/fixtures/live_discovery/neutron-*.json
 git commit -m "feat: discover neutron rehome dependencies"
 ```
 
-### Task 7: Cinder Metadata and Backing Storage Readiness
+### Задача 7: Метаданные Cinder и готовность backing storage
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/cinder.py`
 - Create: `scripts/live_discovery/storage.py`
@@ -836,14 +836,14 @@ git commit -m "feat: discover neutron rehome dependencies"
 - Create: `tests/fixtures/live_discovery/cinder-source.json`
 - Create: `tests/fixtures/live_discovery/cinder-target.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: Nova BDM volume IDs, Cinder API/DB facts, schema capabilities and storage probe config.
 - Produces: `CinderCollector(client, side, schema).collect(volume_ids) -> CollectorResult`.
 - Produces: `probe_storage(kind, resource, runner) -> CheckResult` for `nfs`, `rbd`, `lvm`.
 - Produces node kinds: `volume`, `volume_attachment`, `volume_type`, `cinder_service`, `storage_backend`, `encryption_key_ref`, `snapshot`.
 
-- [ ] **Step 1: Write failing Cinder graph tests**
+- [ ] **Шаг 1: Написать failing-тесты для Cinder graph tests**
 
 ```python
 def test_encrypted_volume_requires_type_service_attachment_and_key(self):
@@ -862,15 +862,15 @@ def test_missing_encryption_key_is_blocker(self):
     self.assertIn("encrypted volume volume-1 has no key UUID", result.blockers)
 ```
 
-- [ ] **Step 2: Verify Cinder RED**
+- [ ] **Шаг 2: Проверить Cinder RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_cinder -v`
+Команда: `python3 -m unittest tests.test_live_discovery_cinder -v`
 
-Expected: import failure for `live_discovery.cinder`.
+Ожидается: import failure for `live_discovery.cinder`.
 
-- [ ] **Step 3: Implement Cinder API and DB dependency collection**
+- [ ] **Шаг 3: Реализовать Cinder API and DB dependency collection**
 
-Use read-only API commands:
+Использовать read-only API команды:
 
 ```text
 openstack volume show <volume_uuid> -f json
@@ -881,11 +881,11 @@ openstack volume snapshot show <snapshot_uuid> -f json
 openstack secret get <encryption_key_uuid> -f json
 ```
 
-The Barbican call reads metadata only; never add `--payload`. A 404/403 for a required encryption key is `BLOCKED`, and a missing key service endpoint is `UNKNOWN`.
+Вызов Barbican читает только metadata; нельзя добавлять `--payload`. Ответ 404/403 для обязательного encryption key даёт `BLOCKED`, а отсутствие endpoint key service — `UNKNOWN`.
 
-Collect DB rows for `volumes`, `volume_attachment`, `volume_types`, `volume_type_extra_specs`, `quality_of_service_specs`, `services`, `encryption`, `snapshots`, volume metadata families and group/source dependencies. Emit explicit target normalizations for `service_uuid`, `volume_type_id`, `host` and `cluster_name`.
+Собрать DB rows для `volumes`, `volume_attachment`, `volume_types`, `volume_type_extra_specs`, `quality_of_service_specs`, `services`, `encryption`, `snapshots`, families метаданных volume и group/source dependencies. Явно выдать target normalizations для `service_uuid`, `volume_type_id`, `host` и `cluster_name`.
 
-- [ ] **Step 4: Write failing storage probe tests**
+- [ ] **Шаг 4: Написать failing-тесты для storage probe tests**
 
 ```python
 def test_nfs_probe_uses_stat_without_mounting(self):
@@ -900,9 +900,9 @@ def test_unknown_storage_driver_is_unknown(self):
     self.assertEqual("UNKNOWN", check.status)
 ```
 
-- [ ] **Step 5: Implement non-mutating storage probes**
+- [ ] **Шаг 5: Реализовать non-mutating storage probes**
 
-Use only:
+Использовать только:
 
 ```text
 NFS/file: stat --format %s <validated_path>
@@ -910,30 +910,30 @@ RBD: rbd info --format json <validated_pool>/<validated_image>
 LVM: lvs --reportformat json --units b --nosuffix <validated_vg>/<validated_lv>
 ```
 
-Paths and names must be derived from validated inventory facts and match strict allowlists. Do not mount NFS, map RBD, activate LVs or establish new attachments. Size mismatch and unreadable backing objects are blockers.
+Пути и имена должны выводиться из проверенных inventory facts и соответствовать строгим allowlists. Не монтировать NFS, не map-ить RBD, не активировать LV и не создавать новые attachments. Несовпадение размера и нечитаемые backing objects являются blockers.
 
-- [ ] **Step 6: Add redaction tests**
+- [ ] **Шаг 6: Добавить redaction tests**
 
-Assert that `connection_info`, CHAP secrets, auth tokens and connector credentials are replaced by `[REDACTED]` in normal artifacts while the check retains only driver type, target count and multipath boolean.
+Проверить, что `connection_info`, CHAP secrets, auth tokens и connector credentials заменены на `[REDACTED]` в обычных артефактах, а проверка сохраняет только driver type, число targets и multipath boolean.
 
-- [ ] **Step 7: Run focused/full tests and commit**
+- [ ] **Шаг 7: Запустить focused/full tests and commit**
 
-Run: `python3 -m unittest tests.test_live_discovery_cinder tests.test_live_discovery_storage -v`
+Команда: `python3 -m unittest tests.test_live_discovery_cinder tests.test_live_discovery_storage -v`
 
-Expected: all focused tests `OK`.
+Ожидается: all focused tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
 ```bash
 git add scripts/live_discovery/cinder.py scripts/live_discovery/storage.py tests/test_live_discovery_cinder.py tests/test_live_discovery_storage.py tests/fixtures/live_discovery/cinder-source.json tests/fixtures/live_discovery/cinder-target.json
 git commit -m "feat: discover cinder backing readiness"
 ```
 
-### Task 8: Glance Metadata, Stores and One-Byte Data Probe
+### Задача 8: Метаданные и хранилища Glance, однобайтовая проба данных
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/glance.py`
 - Create: `scripts/live_discovery/image_data.py`
@@ -942,14 +942,14 @@ git commit -m "feat: discover cinder backing readiness"
 - Create: `tests/fixtures/live_discovery/glance-source.json`
 - Create: `tests/fixtures/live_discovery/glance-target.json`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: Nova image refs, Cinder volume image metadata, OpenStackClient.
 - Produces: `GlanceCollector(client, side).collect(image_requirements) -> CollectorResult`.
 - Produces: `probe_image_data(url, token, expected_size, opener=None) -> CheckResult`.
 - Produces node kinds: `image`, `image_member`, `glance_store`, `image_location`.
 
-- [ ] **Step 1: Write failing image requirement tests**
+- [ ] **Шаг 1: Написать failing-тесты для image requirement tests**
 
 ```python
 def test_boot_from_image_requires_target_image_and_data(self):
@@ -965,15 +965,15 @@ def test_volume_backed_historical_image_is_warning_when_bdm_proves_no_local_root
     self.assertTrue(any(check.status == "WARN" for check in result.checks))
 ```
 
-- [ ] **Step 2: Verify Glance RED**
+- [ ] **Шаг 2: Проверить Glance RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_glance -v`
+Команда: `python3 -m unittest tests.test_live_discovery_glance -v`
 
-Expected: import failure for `live_discovery.glance`.
+Ожидается: import failure for `live_discovery.glance`.
 
-- [ ] **Step 3: Implement metadata/store collection**
+- [ ] **Шаг 3: Реализовать metadata/store collection**
 
-Use:
+Использовать:
 
 ```text
 openstack image show <image_uuid> -f json
@@ -981,9 +981,9 @@ openstack image member list <image_uuid> -f json
 GET <image_endpoint>/v2/info/stores
 ```
 
-Classify `active` as metadata-ready; `queued`, `saving`, `killed`, `deleted`, `pending_delete`, `deactivated`, `uploading` and `importing` are not data-ready. Prefer `os_hash_algo`/`os_hash_value`; retain legacy checksum only as secondary evidence.
+Классифицировать `active` как metadata-ready; `queued`, `saving`, `killed`, `deleted`, `pending_delete`, `deactivated`, `uploading` и `importing` не являются data-ready. Предпочитать `os_hash_algo`/`os_hash_value`, сохраняя legacy checksum только как вторичное evidence.
 
-- [ ] **Step 4: Write failing one-byte Range probe test**
+- [ ] **Шаг 4: Написать failing-тесты для one-byte Range probe test**
 
 ```python
 def test_image_probe_requests_one_byte_and_accepts_partial_content(self):
@@ -994,7 +994,7 @@ def test_image_probe_requests_one_byte_and_accepts_partial_content(self):
     self.assertNotIn("token-value", check.reason)
 ```
 
-- [ ] **Step 5: Implement urllib Range GET without persisting token**
+- [ ] **Шаг 5: Реализовать urllib Range GET without persisting token**
 
 `probe_image_data` must issue `GET` with `Range: bytes=0-0` and `X-Auth-Token`, read at most one byte, and accept:
 
@@ -1004,40 +1004,40 @@ def test_image_probe_requests_one_byte_and_accepts_partial_content(self):
 - `403/404/416` as `BLOCKED`;
 - transport error as `UNKNOWN`.
 
-The token must never be stored in `CheckResult`, evidence argv, exception text or fixtures.
+Token нельзя сохранять в `CheckResult`, evidence argv, тексте исключения или fixtures.
 
-- [ ] **Step 6: Run focused/full tests and commit**
+- [ ] **Шаг 6: Запустить focused/full tests and commit**
 
-Run: `python3 -m unittest tests.test_live_discovery_glance tests.test_live_discovery_image_data -v`
+Команда: `python3 -m unittest tests.test_live_discovery_glance tests.test_live_discovery_image_data -v`
 
-Expected: all focused tests `OK`.
+Ожидается: all focused tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
 ```bash
 git add scripts/live_discovery/glance.py scripts/live_discovery/image_data.py tests/test_live_discovery_glance.py tests/test_live_discovery_image_data.py tests/fixtures/live_discovery/glance-source.json tests/fixtures/live_discovery/glance-target.json
 git commit -m "feat: discover glance image readiness"
 ```
 
-### Task 9: Graph Assembly, Integrity Validation and Verdict
+### Задача 9: Сборка графа, проверка целостности и verdict
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/graph.py`
 - Create: `scripts/live_discovery/verdict.py`
 - Create: `tests/test_live_discovery_graph.py`
 - Create: `tests/test_live_discovery_verdict.py`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: all `CollectorResult` payloads and schema mapping.
 - Produces: `assemble_graph(results) -> dict`.
 - Produces: `validate_graph(graph) -> list[CheckResult]`.
 - Produces: `compute_verdict(graph, checks, mapping) -> dict`.
 
-- [ ] **Step 1: Write failing graph integrity tests**
+- [ ] **Шаг 1: Написать failing-тесты для graph integrity tests**
 
 ```python
 def test_required_edge_without_target_node_is_unknown(self):
@@ -1052,17 +1052,17 @@ def test_duplicate_node_with_conflicting_facts_is_blocker(self):
     self.assertTrue(any(item.status == "BLOCKED" and "conflicting facts" in item.reason for item in checks))
 ```
 
-- [ ] **Step 2: Verify graph RED**
+- [ ] **Шаг 2: Проверить graph RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_graph -v`
+Команда: `python3 -m unittest tests.test_live_discovery_graph -v`
 
-Expected: import failure for `live_discovery.graph`.
+Ожидается: import failure for `live_discovery.graph`.
 
-- [ ] **Step 3: Implement deterministic merge and validation**
+- [ ] **Шаг 3: Реализовать deterministic merge and validation**
 
-Sort nodes by `(side, kind, id)`, edges by `(source, target, relation)`, checks by `check_id`. Merge identical nodes; conflicting facts add a `BLOCKED` check. Every required edge must resolve to a node on the appropriate side or a documented external reference node.
+Сортировать nodes по `(side, kind, id)`, edges по `(source, target, relation)`, checks по `check_id`. Одинаковые nodes объединять; конфликтующие facts добавляют проверку `BLOCKED`. Каждый required edge должен разрешаться в node соответствующей стороны или документированный внешний reference node.
 
-- [ ] **Step 4: Write failing verdict tests**
+- [ ] **Шаг 4: Написать failing-тесты для verdict tests**
 
 ```python
 def test_unknown_is_fail_closed(self):
@@ -1082,7 +1082,7 @@ def test_blocked_has_precedence_over_unknown_and_warning(self):
     self.assertEqual(3, verdict["exit_code"])
 ```
 
-- [ ] **Step 5: Implement exact verdict precedence**
+- [ ] **Шаг 5: Реализовать exact verdict precedence**
 
 ```python
 EXIT_CODES = {
@@ -1095,26 +1095,26 @@ EXIT_CODES = {
 PRECEDENCE = ["BLOCKED", "UNKNOWN", "WARN", "PASS"]
 ```
 
-Any mapping blocker produces `BLOCKED`. No checks, no instances, or a missing required service collector produces `UNKNOWN`.
+Любой mapping blocker даёт `BLOCKED`. Отсутствие checks, instances или обязательного service collector даёт `UNKNOWN`.
 
-- [ ] **Step 6: Run focused/full tests and commit**
+- [ ] **Шаг 6: Запустить focused/full tests and commit**
 
-Run: `python3 -m unittest tests.test_live_discovery_graph tests.test_live_discovery_verdict -v`
+Команда: `python3 -m unittest tests.test_live_discovery_graph tests.test_live_discovery_verdict -v`
 
-Expected: focused tests `OK`.
+Ожидается: focused tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
 ```bash
 git add scripts/live_discovery/graph.py scripts/live_discovery/verdict.py tests/test_live_discovery_graph.py tests/test_live_discovery_verdict.py
 git commit -m "feat: assemble fail-closed readiness graph"
 ```
 
-### Task 10: Control Collector, Local Assembler and Artifact Rendering
+### Задача 10: Коллектор control plane, локальный assembler и рендеринг артефактов
 
-**Files:**
+**Файлы:**
 
 - Create: `scripts/live_discovery/render.py`
 - Create: `scripts/collect_live_control.py`
@@ -1123,13 +1123,13 @@ git commit -m "feat: assemble fail-closed readiness graph"
 - Create: `tests/test_live_discovery_cli.py`
 - Create: `tests/fixtures/live_discovery/full-run/`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: Tasks 1–9 public interfaces.
 - Produces source/target side artifacts from `collect_live_control.py`.
 - Produces final artifact directory and process exit code from `assemble_live_discovery.py`.
 
-- [ ] **Step 1: Write failing renderer tests**
+- [ ] **Шаг 1: Написать failing-тесты для renderer tests**
 
 ```python
 def test_markdown_contains_verdict_blockers_and_resource_counts(self):
@@ -1146,13 +1146,13 @@ def test_normal_artifacts_do_not_contain_sensitive_values(self):
     self.assertIn("[REDACTED]", rendered)
 ```
 
-- [ ] **Step 2: Verify renderer RED**
+- [ ] **Шаг 2: Проверить renderer RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_render -v`
+Команда: `python3 -m unittest tests.test_live_discovery_render -v`
 
-Expected: import failure for `live_discovery.render`.
+Ожидается: import failure for `live_discovery.render`.
 
-- [ ] **Step 3: Implement exact artifact set**
+- [ ] **Шаг 3: Реализовать exact artifact set**
 
 `write_artifacts(out_dir, graph, verdict, schema_capabilities, schema_mapping, evidence)` must atomically write:
 
@@ -1168,9 +1168,9 @@ evidence-index.json
 sensitive/evidence.json
 ```
 
-Use a temporary sibling directory followed by `os.replace`. Create `sensitive/` with mode `0700` and `sensitive/evidence.json` with mode `0600`; omit the file when there is no sensitive evidence. Implement the small YAML renderer with the existing project’s stdlib pattern; do not add PyYAML.
+Использовать временный sibling-каталог с последующим `os.replace`. Создать `sensitive/` с mode `0700` и `sensitive/evidence.json` с mode `0600`; при отсутствии sensitive evidence файл не создавать. Небольшой YAML renderer реализовать по существующему stdlib-паттерну проекта, не добавляя PyYAML.
 
-- [ ] **Step 4: Write CLI fixture smoke tests**
+- [ ] **Шаг 4: Написать smoke-тесты CLI на fixtures**
 
 ```python
 def test_assembler_returns_blocked_exit_code_and_writes_report(self):
@@ -1186,11 +1186,11 @@ def test_assembler_returns_blocked_exit_code_and_writes_report(self):
     self.assertTrue((self.out_dir / "readiness-report.md").is_file())
 ```
 
-- [ ] **Step 5: Implement control and assembler CLIs**
+- [ ] **Шаг 5: Реализовать control and assembler CLIs**
 
 `collect_live_control.py` is deliberately two-phase so API-derived UUID filters exist before DB reads.
 
-Phase `api` arguments:
+Аргументы фазы `api`:
 
 ```text
 --phase api
@@ -1203,9 +1203,9 @@ Phase `api` arguments:
 --fixture PATH
 ```
 
-It writes `api-result.json`, `uuid-filters.json` and `db-query-plan.json`. Every query in the plan is a Task 2 JSON-object `SELECT` scoped to those UUIDs.
+Она записывает `api-result.json`, `uuid-filters.json` и `db-query-plan.json`. Каждый запрос плана — JSON-object `SELECT` из задачи 2, ограниченный этими UUID.
 
-Phase `combine` arguments:
+Аргументы фазы `combine`:
 
 ```text
 --phase combine
@@ -1218,7 +1218,7 @@ Phase `combine` arguments:
 --fixture PATH
 ```
 
-It refuses to run when a required `.rc` file is missing/non-zero, a JSONL row is malformed, or a planned query has no corresponding output.
+Она отказывается работать, если обязательный файл `.rc` отсутствует или содержит ненулевой код, строка JSONL некорректна либо для запланированного запроса нет результата.
 
 `assemble_live_discovery.py` arguments:
 
@@ -1231,11 +1231,11 @@ It refuses to run when a required `.rc` file is missing/non-zero, a JSONL row is
 --fixture-dir PATH
 ```
 
-Fixture arguments are mutually exclusive with live arguments. CLI must return the exact verdict exit code from Task 9.
+Аргументы fixture взаимоисключаются с live-аргументами. CLI должен возвращать точный exit code verdict из задачи 9.
 
-- [ ] **Step 6: Run full fixture smoke and tests**
+- [ ] **Шаг 6: Запустить full fixture smoke and tests**
 
-Run:
+Команда:
 
 ```bash
 python3 scripts/assemble_live_discovery.py \
@@ -1243,22 +1243,22 @@ python3 scripts/assemble_live_discovery.py \
   --out-dir /tmp/openstack-rehome-live-discovery-smoke
 ```
 
-Expected: the ready fixture exits `0`; the blocked fixture exits `3`; both write the complete artifact set.
+Ожидается: the ready fixture exits `0`; the blocked fixture exits `3`; both write the complete artifact set.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 7: Commit Task 10**
+- [ ] **Шаг 7: Зафиксировать Task 10**
 
 ```bash
 git add scripts/live_discovery/render.py scripts/collect_live_control.py scripts/assemble_live_discovery.py tests/test_live_discovery_render.py tests/test_live_discovery_cli.py tests/fixtures/live_discovery/full-run
 git commit -m "feat: render live discovery artifacts"
 ```
 
-### Task 11: Ansible Read-Only Orchestration and Fail-Closed Gate
+### Задача 11: Read-only orchestration Ansible и fail-closed gate
 
-**Files:**
+**Файлы:**
 
 - Create: `playbooks/02b-discover-live-resource-graph.yml`
 - Create: `playbooks/tasks/collect-live-schema-service.yml`
@@ -1268,12 +1268,12 @@ git commit -m "feat: render live discovery artifacts"
 - Modify: `inventory/hosts.yml`
 - Modify: `inventory/lab-os1-to-os2.yml`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes: Task 10 CLIs and existing inventory groups `source_control`, `target_control`, `rehome_compute`.
 - Produces: `{{ local_artifact_dir }}/live-discovery/{{ live_discovery_run_id }}/readiness-report.json` and companion artifacts.
 
-- [ ] **Step 1: Write failing structural playbook test**
+- [ ] **Шаг 1: Написать failing-тесты для structural playbook test**
 
 ```python
 class LiveDiscoveryPlaybookTests(unittest.TestCase):
@@ -1292,15 +1292,15 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("failed_when: live_discovery_assemble.rc not in [0]", text)
 ```
 
-- [ ] **Step 2: Verify playbook RED**
+- [ ] **Шаг 2: Проверить playbook RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_playbook -v`
+Команда: `python3 -m unittest tests.test_live_discovery_playbook -v`
 
-Expected: `FileNotFoundError` for the new playbook.
+Ожидается: `FileNotFoundError` for the new playbook.
 
-- [ ] **Step 3: Add generic variables**
+- [ ] **Шаг 3: Добавить generic variables**
 
-Add to `group_vars/all.yml`:
+Добавить в `group_vars/all.yml`:
 
 ```yaml
 live_discovery_enabled: true
@@ -1326,16 +1326,16 @@ live_discovery_glance_range_probe_enabled: true
 live_discovery_fail_on_not_ready: true
 ```
 
-Lab inventory must set Kolla commands, `network_backend: ovs` and the actual
+Lab inventory должен задавать команды Kolla, `network_backend: ovs` и фактические
 typed storage backend map with source/target probe delegates. NFS is only the
 current lab example: NFS/file, RBD and LVM have read-only probes; iSCSI, Fibre
-Channel and vendor backends remain explicit `UNKNOWN` without a reviewed
+Channel и vendor backends остаются явно `UNKNOWN` без reviewed
 backend-specific probe. Generic inventory leaves the backend map empty, which
 also yields `UNKNOWN` for required storage evidence.
 
-- [ ] **Step 4: Implement seven-play orchestration**
+- [ ] **Шаг 4: Реализовать seven-play orchestration**
 
-The actual data-dependent sequence has exactly seven plays:
+Фактическая последовательность, зависящая от данных, содержит ровно семь plays:
 
 1. localhost setup, protected-input freeze, owner lock and frozen run ID;
 2. source controller API/schema acquisition, public verify-before-SQL and UUID-scoped JSONL collection;
@@ -1345,45 +1345,45 @@ The actual data-dependent sequence has exactly seven plays:
 6. source and target Cinder/Glance probes on typed-map delegates, signed API refresh, exact phase-triplet return and both controller combines;
 7. localhost assembly, artifact publication and owner completion; only assembler rc `0` is accepted.
 
-In short: plays 2-3 acquire API/schema/DB evidence, play 5 supplies target
+Итого: plays 2-3 собирают API/schema/DB evidence, play 5 предоставляет target
 capabilities, play 6 performs both probe families plus signed refresh and both
 combines, and play 7 performs final assembly.
 
 `collect-live-schema-service.yml` reuses the existing service-user credential model but writes a run-local information-schema artifact. `collect-live-db-jsonl-service.yml` accepts only generated `.sql` files, runs `python3 -m live_discovery.mysql_json --validate-sql <file>` before MySQL, records `.rc`/`.stderr`, and never suppresses failure during combine.
 
-Controller profile collection also records `nova-manage api_db version`, `nova-manage db version`, `neutron-db-manage current --verbose`, `cinder-manage db version`, Glance Alembic rows and `docker inspect` image/digest facts. Only version/current/show/inspect commands are permitted.
+Сбор профиля controller также фиксирует `nova-manage api_db version`, `nova-manage db version`, `neutron-db-manage current --verbose`, `cinder-manage db version`, строки Glance Alembic и image/digest facts из `docker inspect`. Разрешены только команды version/current/show/inspect.
 
-Every collection command has `changed_when: false`. Directory creation/fetch/archive tasks may report changed. Sensitive tasks use `no_log: true`.
+Каждая команда сбора имеет `changed_when: false`. Задачи создания каталогов, fetch и archive могут сообщать changed. Sensitive-задачи используют `no_log: true`.
 
-- [ ] **Step 5: Run structural and syntax tests**
+- [ ] **Шаг 5: Запустить structural and syntax tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_playbook -v`
+Команда: `python3 -m unittest tests.test_live_discovery_playbook -v`
 
-Expected: tests `OK`.
+Ожидается: tests `OK`.
 
-Run:
+Команда:
 
 ```bash
 ANSIBLE_LOCAL_TEMP=/tmp/openstack-rehome-live-discovery-ansible \
 ansible-playbook -i inventory/hosts.yml --syntax-check playbooks/02b-discover-live-resource-graph.yml
 ```
 
-Expected: exit `0`, playbook name printed.
+Ожидается: exit `0`, playbook name printed.
 
-- [ ] **Step 6: Run full tests and commit**
+- [ ] **Шаг 6: Запустить full tests and commit**
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
 ```bash
 git add playbooks/02b-discover-live-resource-graph.yml playbooks/tasks/collect-live-schema-service.yml playbooks/tasks/collect-live-db-jsonl-service.yml group_vars/all.yml inventory/hosts.yml inventory/lab-os1-to-os2.yml tests/test_live_discovery_playbook.py
 git commit -m "feat: orchestrate live cluster discovery"
 ```
 
-### Task 12: Complete Documentation Update
+### Задача 12: Полное обновление документации
 
-**Files:**
+**Файлы:**
 
 - Modify: `README.md`
 - Modify: `operator-inputs-ru.md`
@@ -1399,12 +1399,12 @@ git commit -m "feat: orchestrate live cluster discovery"
 - Modify: `tests/test_lab_topology_doc.py`
 - Create: `tests/test_live_discovery_docs.py`
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Documents exact Task 11 command, variables, artifacts, verdict and exclusion scope.
 - No later task depends on undocumented behavior.
 
-- [ ] **Step 1: Write failing documentation coverage test**
+- [ ] **Шаг 1: Написать failing-тесты для documentation coverage test**
 
 ```python
 class LiveDiscoveryDocumentationTests(unittest.TestCase):
@@ -1432,21 +1432,21 @@ class LiveDiscoveryDocumentationTests(unittest.TestCase):
         self.assertIn("не входят", text)
 ```
 
-- [ ] **Step 2: Verify documentation RED**
+- [ ] **Шаг 2: Проверить documentation RED**
 
-Run: `python3 -m unittest tests.test_live_discovery_docs -v`
+Команда: `python3 -m unittest tests.test_live_discovery_docs -v`
 
-Expected: missing documentation files or missing execution-order references.
+Ожидается: missing documentation files or missing execution-order references.
 
-- [ ] **Step 3: Update operator-facing documentation**
+- [ ] **Шаг 3: Обновить operator-facing documentation**
 
-Document this exact command before all DB import/cutover phases:
+Документировать эту точную команду перед всеми фазами DB import/cutover:
 
 ```bash
 ansible-playbook -i inventory/hosts.yml playbooks/02b-discover-live-resource-graph.yml
 ```
 
-Document verdicts and exits:
+Документировать verdict и exit codes:
 
 ```text
 READY=0
@@ -1455,9 +1455,9 @@ UNKNOWN=2
 BLOCKED=3
 ```
 
-Explain that live target vanilla Epoxy is canonical; schema dumps are examples only; `UNKNOWN` blocks; online data migrations are not executed; Masakari/DRS are excluded.
+Указать, что live target vanilla Epoxy является canonical; schema dumps служат только примерами; `UNKNOWN` блокирует продолжение; online data migrations не запускаются; Masakari/DRS исключены.
 
-- [ ] **Step 4: Add service readiness documents**
+- [ ] **Шаг 4: Добавить service readiness documents**
 
 `cinder-rehome-readiness-ru.md` must cover attachments, types, QoS, `service_uuid`, encryption keys, snapshots, shared/non-shared storage, NFS/RBD/LVM probes and redaction.
 
@@ -1465,42 +1465,42 @@ Explain that live target vanilla Epoxy is canonical; schema dumps are examples o
 
 `neutron-rehome-behavior-ru.md` must cover core bindings plus allowed-address-pairs, DNS/DHCP, QoS, trunks/subports, router/FIP/port forwarding, address groups and OVS/OVN runtime evidence.
 
-- [ ] **Step 5: Add artifact and data-flow documents**
+- [ ] **Шаг 5: Добавить artifact and data-flow documents**
 
 `docs/live-discovery-artifacts-ru.md` must define every JSON/YAML/Markdown file, contract version, evidence index, sensitive directory and retention rule.
 
 `docs/live-discovery-data-flow-ru.md` must include a Mermaid graph from Ansible runner to source control, target control, compute, storage/image probes and local assembler.
 
-- [ ] **Step 6: Run documentation and full tests**
+- [ ] **Шаг 6: Запустить documentation and full tests**
 
-Run: `python3 -m unittest tests.test_live_discovery_docs tests.test_playbook_logic_doc tests.test_lab_topology_doc -v`
+Команда: `python3 -m unittest tests.test_live_discovery_docs tests.test_playbook_logic_doc tests.test_lab_topology_doc -v`
 
-Expected: documentation tests `OK`.
+Ожидается: documentation tests `OK`.
 
-Run: `python3 -m unittest discover -s tests`
+Команда: `python3 -m unittest discover -s tests`
 
-Expected: suite `OK`.
+Ожидается: suite `OK`.
 
-- [ ] **Step 7: Commit Task 12**
+- [ ] **Шаг 7: Зафиксировать Task 12**
 
 ```bash
 git add README.md operator-inputs-ru.md playbook-logic-ru.md lab-rehome-runbook-ru.md docs/lab-topology-ru.md neutron-rehome-behavior-ru.md cinder-rehome-readiness-ru.md glance-rehome-readiness-ru.md docs/live-discovery-artifacts-ru.md docs/live-discovery-data-flow-ru.md tests/test_playbook_logic_doc.py tests/test_lab_topology_doc.py tests/test_live_discovery_docs.py
 git commit -m "docs: document live discovery workflow"
 ```
 
-### Task 13: Mutation Audit, Full Verification and Branch Handoff
+### Задача 13: Аудит мутаций, полная проверка и передача ветки
 
-**Files:**
+**Файлы:**
 
 - Create: `tests/test_live_discovery_mutation_audit.py`
 - Modify: `README.md` only if verification commands are not already listed.
 
-**Interfaces:**
+**Интерфейсы:**
 
 - Consumes all implementation and documentation tasks.
 - Produces final evidence that the branch is read-only, tested and reviewable.
 
-- [ ] **Step 1: Write the mutation audit test**
+- [ ] **Шаг 1: Написать mutation audit test**
 
 ```python
 from pathlib import Path
@@ -1544,21 +1544,21 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
                 runner.run(command, "mutation-audit")
 ```
 
-- [ ] **Step 2: Run mutation audit**
+- [ ] **Шаг 2: Запустить mutation audit**
 
-Run: `python3 -m unittest tests.test_live_discovery_mutation_audit -v`
+Команда: `python3 -m unittest tests.test_live_discovery_mutation_audit -v`
 
-Expected: test `OK`.
+Ожидается: test `OK`.
 
-- [ ] **Step 3: Run the complete unit suite**
+- [ ] **Шаг 3: Запустить complete unit suite**
 
-Run: `python3 -m unittest discover -s tests -v`
+Команда: `python3 -m unittest discover -s tests -v`
 
-Expected: all tests `OK`, zero failures/errors.
+Ожидается: all tests `OK`, zero failures/errors.
 
-- [ ] **Step 4: Syntax-check every top-level playbook**
+- [ ] **Шаг 4: Проверить синтаксис every top-level playbook**
 
-Run:
+Команда:
 
 ```bash
 rc=0
@@ -1569,11 +1569,11 @@ done
 exit "$rc"
 ```
 
-Expected: exit `0`; all existing playbooks plus `02b-discover-live-resource-graph.yml` pass.
+Ожидается: exit `0`; all existing playbooks plus `02b-discover-live-resource-graph.yml` pass.
 
-- [ ] **Step 5: Run ready and blocked fixture smoke tests**
+- [ ] **Шаг 5: Запустить ready and blocked fixture smoke tests**
 
-Run:
+Команда:
 
 ```bash
 python3 scripts/assemble_live_discovery.py \
@@ -1581,9 +1581,9 @@ python3 scripts/assemble_live_discovery.py \
   --out-dir /tmp/openstack-rehome-ready
 ```
 
-Expected: exit `0`, verdict `READY` or `READY_WITH_WARNINGS`.
+Ожидается: exit `0`, verdict `READY` or `READY_WITH_WARNINGS`.
 
-Run:
+Команда:
 
 ```bash
 python3 scripts/assemble_live_discovery.py \
@@ -1591,11 +1591,11 @@ python3 scripts/assemble_live_discovery.py \
   --out-dir /tmp/openstack-rehome-blocked
 ```
 
-Expected: exit `3`, verdict `BLOCKED`, report names the fixture blocker.
+Ожидается: exit `3`, verdict `BLOCKED`, report names the fixture blocker.
 
-- [ ] **Step 6: Verify repository hygiene**
+- [ ] **Шаг 6: Проверить repository hygiene**
 
-Run:
+Команда:
 
 ```bash
 git diff --check
@@ -1603,18 +1603,18 @@ git status --short
 find . -name __pycache__ -o -name '*.pyc' -o -path './artifacts/*'
 ```
 
-Expected: no whitespace errors; only intentional tracked changes before the final commit; no generated artifacts staged.
+Ожидается: no whitespace errors; only intentional tracked changes before the final commit; no generated artifacts staged.
 
-- [ ] **Step 7: Commit final audit test**
+- [ ] **Шаг 7: Зафиксировать final audit test**
 
 ```bash
 git add tests/test_live_discovery_mutation_audit.py README.md
 git commit -m "test: audit live discovery read-only boundary"
 ```
 
-- [ ] **Step 8: Review branch diff and hand off**
+- [ ] **Шаг 8: Проверить branch diff and hand off**
 
-Run:
+Команда:
 
 ```bash
 git log --oneline origin/main..HEAD
@@ -1622,9 +1622,9 @@ git diff --stat origin/main...HEAD
 git status --short --branch
 ```
 
-Expected: one focused commit per task, clean worktree, branch ahead of `origin/main`, no push or merge performed without explicit user request.
+Ожидается: one focused commit per task, clean worktree, branch ahead of `origin/main`, no push or merge performed without explicit user request.
 
-## Official Implementation References
+## Официальные источники для реализации
 
 - OpenStack 2025.1 Epoxy releases: <https://releases.openstack.org/epoxy/>
 - Nova management and migration states: <https://docs.openstack.org/nova/2025.1/cli/nova-manage.html>

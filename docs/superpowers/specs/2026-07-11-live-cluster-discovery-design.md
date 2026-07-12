@@ -71,6 +71,12 @@ Target schema и runtime target-кластера являются канонич
 - Glance DB version, enabled stores и default store;
 - фактические таблицы, колонки, types, nullability, defaults, indexes и FK из
   `information_schema`;
+- source profile считается доказанным только при совпадении live labels и
+  digests четырёх service images с `keystack-2025.1`; policy лишь разрешает
+  это значение, а отсутствие точного vendor signal даёт `UNKNOWN`/`BLOCKED`;
+- Nova cell schema определяется по выбранному host через
+  `nova_api.host_mappings`/`cell_mappings`; из connection URI сохраняется
+  только проверенное имя schema, credentials никогда не сериализуются;
 - конфигурацию только в объёме, необходимом для определения capabilities;
 - признаки незавершённых data migrations, доступные без выполнения мутаций.
 
@@ -327,6 +333,15 @@ source column -> target column | target default | normalization | ignored
 
 Каждый check фиксирует command/query kind, cluster side, timestamp, return
 code, нормализованный вывод, affected UUID и ссылку на raw evidence.
+Индекс обязательно содержит observed timestamp, return code, sanitized failure
+class, SHA-256 stderr и protected raw-artifact reference. Ожидаемый 404 на
+пустом pre-import target становится typed absence check, тогда как 403,
+отсутствующий endpoint и invalid JSON остаются fail-closed ошибками.
+
+Storage probes группируются по delegate отдельно для source и target. Каждая
+группа имеет собственную HMAC-bound phase и provenance; результаты нескольких
+NFS/RBD/LVM hosts объединяются только детерминированно после проверки общего
+scope.
 
 ## Ошибки и безопасность
 

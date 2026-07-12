@@ -40,7 +40,12 @@ sibling lock, а orchestration отдельно владеет
 ## Точный evidence index
 
 Каждый entry всегда содержит common fields `evidence_id`, `kind`, `side`,
-`service`. Допустимы только следующие kinds и exact дополнительные поля:
+`service`, `observed_at`, `returncode`, `failure_class`, `stderr_sha256` и
+`raw_artifact_ref`. Timestamp обязан содержать timezone, return code — целое
+число, stderr хранится только как SHA-256. `raw_artifact_ref` указывает на
+защищённый run-local источник вида `protected://<side>/<evidence-id>` и не
+содержит raw secrets. Допустимы только следующие kinds и exact дополнительные
+поля:
 
 | Kind | Обязательные дополнительные поля |
 | --- | --- |
@@ -50,10 +55,15 @@ sibling lock, а orchestration отдельно владеет
 | `storage-probe` | `resource_id`, `backend_kind`, `backend_identity`, `resource_identity`, `resource_fingerprint`, `scope`, `expected_size`, `observed_size`, `status` |
 | `glance-range` | `resource_id`, `endpoint_origin`, `expected_size`, `observed_size`, `required`, непустой `store_ids`, `status` |
 | `cinder-connection` | `volume_id`, `attachment_id`, `backend_kind`, `backend_id`, `resource_identity`, `resource_fingerprint` |
+| `source-cell-mapping` | `host`, `cell_uuid`, `database_schema` |
+| `api-absence` | `command`, `resource_id`, `status_code=404` |
 
 `side` равен только `source` или `target`; storage `scope` — только
 `source-compute`/`target-storage`. Status probe — `PASS`, `WARN`, `UNKNOWN` или
-`BLOCKED`. Raw stdout/stderr, tokens и connection data в index отсутствуют.
+`BLOCKED`. Ожидаемое отсутствие source-scoped объекта на пустом pre-import
+target фиксируется как `api-absence` и проверка `UNKNOWN`; 403, отсутствие
+endpoint и invalid JSON остаются ошибками входа. Raw stdout/stderr, tokens и
+connection data в index отсутствуют.
 
 ## Защищённый файл
 
