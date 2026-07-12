@@ -1,6 +1,7 @@
 """Deterministic, independently sanitized live-discovery artifact rendering."""
 
 from collections import Counter
+from datetime import datetime
 import html
 import hashlib
 import json
@@ -302,7 +303,10 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
     if len(evidence["index"]["entries"]) > 100_000:
         raise ValueError("evidence index exceeds safety bounds")
     for entry in evidence["index"]["entries"]:
-        common = {"evidence_id", "kind", "side", "service"}
+        common = {
+            "evidence_id", "kind", "side", "service", "observed_at",
+            "returncode", "failure_class", "stderr_sha256", "raw_artifact_ref",
+        }
         shapes = {
             "openstack-json": common | {"command"},
             "runtime-command": common | {"command"},
@@ -310,12 +314,29 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status"},
             "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
             "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"},
+            "source-cell-mapping": common | {"host", "cell_uuid", "database_schema"},
+            "api-absence": common | {"command", "resource_id", "status_code"},
         }
         if not isinstance(entry, Mapping) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
             raise ValueError("evidence index entry schema is invalid")
         if entry.get("side") not in {"source", "target"} or not all(isinstance(entry.get(key), str) and entry[key] for key in ("evidence_id", "service")):
             raise ValueError("evidence index provenance is invalid")
-        if entry["kind"] in {"openstack-json", "runtime-command"} and (not isinstance(entry["command"], list) or not entry["command"] or not all(isinstance(value, str) and value for value in entry["command"])):
+        try:
+            observed = datetime.fromisoformat(entry["observed_at"].replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            raise ValueError("evidence timestamp is invalid") from None
+        if (
+            observed.tzinfo is None
+            or not isinstance(entry["returncode"], int)
+            or isinstance(entry["returncode"], bool)
+            or (entry["failure_class"] is not None and not isinstance(entry["failure_class"], str))
+            or not isinstance(entry["stderr_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["stderr_sha256"]) is None
+            or not isinstance(entry["raw_artifact_ref"], str)
+            or not entry["raw_artifact_ref"].startswith(f"protected://{entry['side']}/")
+        ):
+            raise ValueError("evidence outcome metadata is invalid")
+        if entry["kind"] in {"openstack-json", "runtime-command", "api-absence"} and (not isinstance(entry["command"], list) or not entry["command"] or not all(isinstance(value, str) and value for value in entry["command"])):
             raise ValueError("evidence command is invalid")
         if entry["kind"] == "db-jsonl" and (not isinstance(entry["schema"], str) or not isinstance(entry["table"], str) or not isinstance(entry["filters"], Mapping) or not entry["filters"]):
             raise ValueError("DB evidence is invalid")
@@ -325,6 +346,10 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             raise ValueError("Glance evidence is invalid")
         if entry["kind"] == "cinder-connection" and not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint")):
             raise ValueError("Cinder connection evidence is invalid")
+        if entry["kind"] == "source-cell-mapping" and not all(isinstance(entry[key], str) and entry[key] for key in ("host", "cell_uuid", "database_schema")):
+            raise ValueError("Nova cell mapping evidence is invalid")
+        if entry["kind"] == "api-absence" and (entry["status_code"] != 404 or not isinstance(entry["resource_id"], str) or not entry["resource_id"]):
+            raise ValueError("target absence evidence is invalid")
     if not isinstance(evidence["sensitive"], Mapping):
         raise ValueError("sensitive evidence schema is invalid")
     _validate_sensitive(evidence["sensitive"])

@@ -3,6 +3,7 @@
 
 import argparse
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -23,12 +24,17 @@ from live_discovery.cinder import CinderCollector, CORE_TABLES as CINDER_CORE_TA
 from live_discovery.contract import CheckResult, CollectorResult
 from live_discovery.glance import GlanceCollector
 from live_discovery.neutron import NeutronCollector, CORE_TABLES as NEUTRON_CORE_TABLES, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL_TABLE_FAMILIES
-from live_discovery.nova import NovaCollector, DB_SCHEMAS as NOVA_DB_SCHEMAS, DB_TABLES as NOVA_DB_TABLES
+from live_discovery.nova import (
+    NovaCollector,
+    DB_SCHEMAS as NOVA_DB_SCHEMAS,
+    DB_TABLES as NOVA_DB_TABLES,
+)
+from live_discovery.cell_mapping import SCHEMA_VERSION as CELL_MAPPING_VERSION
 from live_discovery.openstack import collect_target_profile
 from live_discovery.render import render_json
 from live_discovery.runner import CommandEvidence, ProbeFailed, ReadOnlyRunner, validate_select_only_sql
 from live_discovery.runtime import collect_target_capabilities
-from live_discovery.schema import parse_information_schema
+from live_discovery.schema import parse_information_schema, schema_capability
 from live_discovery.storage import probe_storage, _parse_size as _storage_parse_size
 from live_discovery.image_data import probe_image_data
 
@@ -112,6 +118,22 @@ _TABLE_ROOT_FILTERS = {
     "cinder.groups": (("groups", "id"),),
     "cinder.group_snapshots": (("group_snapshots", "id"),),
 }
+_NOVA_CELL_TABLES = {
+    table for table, schema in NOVA_DB_SCHEMAS.items() if schema == "nova"
+}
+
+
+def _table_root_filters(identity):
+    configured = _TABLE_ROOT_FILTERS.get(identity)
+    if configured is not None:
+        return configured
+    try:
+        schema, table = identity.split(".", 1)
+    except ValueError:
+        return ()
+    if table in _NOVA_CELL_TABLES and re.fullmatch(r"nova(?:_cell[0-9]+)?", schema):
+        return _TABLE_ROOT_FILTERS[f"nova.{table}"]
+    return ()
 _ROOT_CATEGORIES = frozenset({
     "hosts", "instances", "ports", "networks", "subnets", "security_groups",
     "qos_policies", "trunks", "floating_ips", "routers", "address_groups",
@@ -122,7 +144,7 @@ _ROOT_CATEGORIES = frozenset({
 })
 
 
-def _collector_table_catalog():
+def _collector_table_catalog(available_tables=None):
     neutron = {
         f"neutron.{table}" for table in (
             set(NEUTRON_CORE_TABLES)
@@ -132,20 +154,30 @@ def _collector_table_catalog():
     cinder = {
         f"cinder.{table}" for table in set(CINDER_CORE_TABLES) | set(CINDER_OPTIONAL_TABLES)
     }
-    nova = {f"{NOVA_DB_SCHEMAS[table]}.{table}" for table in NOVA_DB_TABLES}
+    nova = {
+        f"{NOVA_DB_SCHEMAS[table]}.{table}"
+        for table in NOVA_DB_TABLES
+        if table != "cell_mappings" and NOVA_DB_SCHEMAS[table] != "nova"
+    }
+    cell_candidates = {
+        identity for identity in (available_tables or ())
+        if _table_root_filters(identity)
+        and identity.split(".", 1)[1] in _NOVA_CELL_TABLES
+    }
+    nova.update(cell_candidates or {f"nova.{table}" for table in _NOVA_CELL_TABLES})
     return {"nova": nova, "neutron": neutron, "cinder": cinder}
 
 
 def _expected_plan_tables(side, roots, available_tables):
-    catalog = _collector_table_catalog()
     available = set(available_tables)
+    catalog = _collector_table_catalog(available)
     expected = set()
     if side == "source":
         if not catalog["nova"].issubset(available):
             raise ValueError("required Nova schema table is missing")
         expected.update(
             table for table in catalog["nova"]
-            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+            if any(roots.get(category) for category, _ in _table_root_filters(table))
         )
     if roots.get("ports"):
         core = {f"neutron.{table}" for table in NEUTRON_CORE_TABLES}
@@ -153,7 +185,7 @@ def _expected_plan_tables(side, roots, available_tables):
             raise ValueError("required Neutron schema table is missing")
         expected.update(
             table for table in catalog["neutron"] & available
-            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+            if any(roots.get(category) for category, _ in _table_root_filters(table))
         )
     if roots.get("volumes"):
         core = {f"cinder.{table}" for table in CINDER_CORE_TABLES}
@@ -161,7 +193,7 @@ def _expected_plan_tables(side, roots, available_tables):
             raise ValueError("required Cinder schema table is missing")
         expected.update(
             table for table in catalog["cinder"] & available
-            if any(roots.get(category) for category, _ in _TABLE_ROOT_FILTERS[table])
+            if any(roots.get(category) for category, _ in _table_root_filters(table))
         )
     return expected
 
@@ -227,7 +259,7 @@ def _validate_query_coverage(side, api_result, queries):
         for column, values in query["filters"].items():
             if not any(
                 planned_column == column and set(values).issubset(set(roots.get(category, [])))
-                for category, planned_column in _TABLE_ROOT_FILTERS.get(table, ())
+                for category, planned_column in _table_root_filters(table)
             ):
                 raise ValueError("DB query filter column differs from collector root scope")
 
@@ -486,7 +518,7 @@ class _CombinedClient:
 
     def db_records(self, schema, table, filters=None):
         identity = f"{schema}.{table}"
-        if identity not in _TABLE_ROOT_FILTERS:
+        if not _table_root_filters(identity):
             raise ValueError("collector DB identity is not allowed")
         exact = [
             item for item in self._records
@@ -503,7 +535,7 @@ class _CombinedClient:
                 and all(any(
                     planned_column == column
                     and set(item["filters"][column]).issubset(set(self._api_result.get("roots", {}).get(category, [])))
-                    for category, planned_column in _TABLE_ROOT_FILTERS.get(identity, ())
+                    for category, planned_column in _table_root_filters(identity)
                 ) for column in filters)
             ]
         if len(matches) != 1:
@@ -599,6 +631,46 @@ class _SchemaBoundCombinedClient:
         schema = self._table_schemas.get(table)
         if schema is None:
             raise ValueError("collector DB table is not bound to a schema")
+        return self._client.db_records(schema, table, filters)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+class _NovaCombinedClient:
+    """Bind Nova API tables and the selected live cell without exposing its URI."""
+
+    def __init__(self, client, cell_mapping):
+        self._client = client
+        self.has_cell_mapping_evidence = True
+        self._cell_mapping = deepcopy(cell_mapping)
+        schema = self._cell_mapping.get("database_schema")
+        if not isinstance(schema, str) or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_$]{0,63}", schema
+        ) is None:
+            raise ValueError("source Nova cell mapping is invalid")
+        self.cell_schema = schema
+
+    def db_records(self, table, filters=None):
+        if table == "cell_mappings":
+            if filters not in (None, {}):
+                raise ValueError("cell mapping evidence cannot be re-scoped")
+            row = {
+                key: deepcopy(self._cell_mapping[key])
+                for key in ("id", "uuid", "name", "database_schema")
+            }
+            row["_evidence_id"] = self._cell_mapping["evidence_id"]
+            return ([{
+                "_schema": "nova_api",
+                "_table": "cell_mappings",
+                "row": row,
+            }], {
+                "evidence_id": self._cell_mapping["evidence_id"],
+                "schema": "nova_api",
+                "table": "cell_mappings",
+                "filters": {"host": [self._cell_mapping["host"]]},
+            })
+        schema = self.cell_schema if table in _NOVA_CELL_TABLES else "nova_api"
         return self._client.db_records(schema, table, filters)
 
     def __getattr__(self, name):
@@ -859,7 +931,12 @@ def _bind_cinder_connection_summaries(cinder, connection_summaries):
 def _compose_collectors(side, api_result, records, evidence, snapshot, sensitive_evidence=None):
     client = _CombinedClient(side, api_result, records, evidence)
     collector_schema = getattr(snapshot, "tables", snapshot)
-    nova_client = _SchemaBoundCombinedClient(client, NOVA_DB_SCHEMAS)
+    source_cell_mapping = api_result.get("source_cell_mapping")
+    nova_client = (
+        _NovaCombinedClient(client, source_cell_mapping)
+        if side == "source" and isinstance(source_cell_mapping, dict)
+        else _SchemaBoundCombinedClient(client, NOVA_DB_SCHEMAS)
+    )
     neutron_client = _SchemaBoundCombinedClient(client, {
         table: "neutron" for table in (
             set(NEUTRON_CORE_TABLES)
@@ -871,7 +948,11 @@ def _compose_collectors(side, api_result, records, evidence, snapshot, sensitive
     })
     results = []
     if side == "source":
-        nova = NovaCollector(nova_client, side).collect(api_result.get("rehome_host", ""))
+        nova = NovaCollector(
+            nova_client,
+            side,
+            cell_schema=getattr(nova_client, "cell_schema", "nova"),
+        ).collect(api_result.get("rehome_host", ""))
         results.append(nova)
         port_ids = _dependency_ids(nova, "port")
         volume_ids = _dependency_ids(nova, "volume")
@@ -931,7 +1012,19 @@ def _compose_collectors(side, api_result, records, evidence, snapshot, sensitive
 
 def _build_evidence_index(side, collectors, api_result, db_evidence):
     by_id = {}
+    observed_at = api_result.get("observed_at", "1970-01-01T00:00:00Z")
+    if not isinstance(observed_at, str) or not observed_at:
+        raise ValueError("evidence acquisition timestamp is invalid")
     def add(entry):
+        entry = deepcopy(entry)
+        identity = entry.get("evidence_id")
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("evidence identity is invalid")
+        entry.setdefault("observed_at", observed_at)
+        entry.setdefault("returncode", 0)
+        entry.setdefault("failure_class", None)
+        entry.setdefault("stderr_sha256", hashlib.sha256(b"").hexdigest())
+        entry.setdefault("raw_artifact_ref", f"protected://{side}/{identity}")
         identity = entry["evidence_id"]
         if identity in by_id and by_id[identity] != entry:
             raise ValueError("evidence index identity conflicts")
@@ -941,7 +1034,10 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
     for raw in db_evidence:
         entry = {
             "evidence_id": raw["evidence_id"], "kind":"db-jsonl", "side":side,
-            "service": service_by_schema.get(raw["schema"], raw["schema"]),
+            "service": (
+                "nova" if re.fullmatch(r"nova(?:_cell[0-9]+)?", raw["schema"])
+                else service_by_schema.get(raw["schema"], raw["schema"])
+            ),
             "schema":raw["schema"], "table":raw["table"], "filters":deepcopy(raw["filters"]),
         }
         if entry["evidence_id"] in by_id:
@@ -952,7 +1048,7 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
                 existing["filters"].setdefault(column, [])
                 existing["filters"][column] = sorted(set(existing["filters"][column]) | set(values))
         else:
-            by_id[entry["evidence_id"]] = entry
+            add(entry)
 
     for entry in api_result.get("capability_evidence", []):
         common = {"evidence_id", "kind", "side", "service", "command"}
@@ -966,6 +1062,35 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
         ):
             raise ValueError("capability evidence is invalid")
         add(deepcopy(entry))
+
+    cell_mapping = api_result.get("source_cell_mapping")
+    if cell_mapping is not None:
+        if side != "source" or not isinstance(cell_mapping, dict):
+            raise ValueError("source Nova cell mapping evidence is invalid")
+        add({
+            "evidence_id": cell_mapping["evidence_id"],
+            "kind": "source-cell-mapping",
+            "side": "source",
+            "service": "nova",
+            "host": cell_mapping["host"],
+            "cell_uuid": cell_mapping["uuid"],
+            "database_schema": cell_mapping["database_schema"],
+        })
+
+    for absence in api_result.get("expected_absences", []):
+        if not isinstance(absence, dict):
+            raise ValueError("expected target absence evidence is invalid")
+        add({
+            "evidence_id": absence.get("evidence_id"),
+            "kind": "api-absence",
+            "side": side,
+            "service": "target-object-existence",
+            "command": deepcopy(absence.get("command")),
+            "resource_id": absence.get("resource_id"),
+            "status_code": absence.get("status_code"),
+            "returncode": 1,
+            "failure_class": absence.get("failure_class"),
+        })
 
     for summary in api_result.get("cinder_connection_summaries", []):
         expected = {"volume_id", "evidence_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"}
@@ -986,7 +1111,10 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
         if isinstance(identity, str) and identity:
             if identity in cached and cached[identity] != item.get("command"):
                 raise ValueError("cached API evidence identity conflicts")
-            cached[identity] = deepcopy(item.get("command"))
+            cached[identity] = {
+                "command": deepcopy(item.get("command")),
+                "evidence": deepcopy(evidence),
+            }
 
     storage = {item.get("evidence_id"): item for item in api_result.get("storage_probe_results", []) if isinstance(item, dict)}
     glance = {item.get("evidence_id"): item for item in api_result.get("glance_data_probe_results", []) if isinstance(item, dict)}
@@ -1024,7 +1152,17 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
                  "resource_id":item["image_id"],"endpoint_origin":item["endpoint_origin"],"expected_size":item["expected_size"],
                  "observed_size":item["observed_size"],"required":item["required"],"store_ids":deepcopy(item["store_ids"]),"status":item["status"]})
         elif identity in cached:
-            add({"evidence_id":identity,"kind":"openstack-json","side":side,"service":service,"command":cached[identity]})
+            acquired = cached[identity]
+            metadata = acquired.get("evidence", {})
+            add({
+                "evidence_id":identity,"kind":"openstack-json","side":side,
+                "service":service,"command":acquired["command"],
+                "returncode": metadata.get("returncode", 0),
+                "failure_class": metadata.get("failure_class"),
+                "stderr_sha256": metadata.get(
+                    "stderr_sha256", hashlib.sha256(b"").hexdigest()
+                ),
+            })
         else:
             raise ValueError(f"collector evidence is absent from acquired closure: {identity}")
     return [by_id[key] for key in sorted(by_id)]
@@ -1048,6 +1186,38 @@ def _read_protected_json(path):
         return json.loads(_read_owned_file(path, _MAX_FILE, "protected JSON").decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("protected JSON is invalid") from error
+
+
+def _load_source_cell_mapping(path, rehome_host, snapshot):
+    value = _read_protected_json(path)
+    expected = {
+        "schema_version", "evidence_id", "host", "id", "uuid", "name",
+        "database_schema",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema_version") != CELL_MAPPING_VERSION
+        or value.get("host") != rehome_host
+        or not isinstance(value.get("id"), int)
+        or isinstance(value.get("id"), bool)
+        or value["id"] < 0
+        or _canonical_uuid(value.get("uuid")) is None
+        or not isinstance(value.get("name"), str)
+        or _SAFE_ROOT.fullmatch(value["name"]) is None
+        or not isinstance(value.get("evidence_id"), str)
+        or not value["evidence_id"]
+        or not isinstance(value.get("database_schema"), str)
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,63}", value["database_schema"])
+        is None
+    ):
+        raise ValueError("source Nova cell mapping is invalid")
+    required = {
+        f"{value['database_schema']}.{table}" for table in _NOVA_CELL_TABLES
+    }
+    if not required.issubset(set(snapshot.tables)):
+        raise ValueError("source Nova cell schema is incomplete")
+    return value
 
 
 def _load_cinder_sensitive_evidence(path, side):
@@ -1219,7 +1389,7 @@ def _auto_requests(side, snapshot, roots):
             ) is None
         ]
         active_filters = []
-        for category, filter_column in _TABLE_ROOT_FILTERS[identity]:
+        for category, filter_column in _table_root_filters(identity):
             values = roots.get(category, [])
             if not values:
                 continue
@@ -1473,11 +1643,34 @@ def _api_phase(args):
         client = OpenStackClient(ReadOnlyRunner(), args.cloud, args.container, str(args.clouds_file))
         cached = []
         acquired = {}
+        expected_absences = []
         def acquire(command, evidence_id):
             key = tuple(command)
             if key in acquired:
                 return deepcopy(acquired[key])
-            value, evidence = client.json(command, evidence_id)
+            try:
+                value, evidence = client.json(command, evidence_id)
+            except ProbeFailed as error:
+                if args.side != "target" or getattr(error, "status_code", None) != 404:
+                    raise
+                resource_id = next(
+                    (
+                        value for value in reversed(command)
+                        if isinstance(value, str)
+                        and value not in {"json", "-f", "--format"}
+                        and not value.startswith("-")
+                    ),
+                    "unknown",
+                )
+                expected_absences.append({
+                    "evidence_id": evidence_id,
+                    "command": list(command),
+                    "resource_id": resource_id,
+                    "status_code": 404,
+                    "failure_class": "not-found",
+                })
+                acquired[key] = None
+                return None
             cached.append({"command": list(command), "payload": value, "evidence": evidence})
             acquired[key] = deepcopy(value)
             return value
@@ -1523,7 +1716,18 @@ def _api_phase(args):
             "roots": roots, "available_tables": sorted(snapshot.tables),
             "openstack": cached,
             "image_store_ids": image_store_ids,
+            "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        cell_mapping_path = getattr(args, "source_cell_mapping", None)
+        if args.side == "source" and cell_mapping_path is not None:
+            api_result["source_cell_mapping"] = _load_source_cell_mapping(
+                cell_mapping_path, args.rehome_host, snapshot
+            )
+        if expected_absences:
+            api_result["expected_absences"] = sorted(
+                expected_absences,
+                key=lambda item: (item["evidence_id"], item["resource_id"]),
+            )
         if catalog_origin is not None:
             api_result["glance_catalog_origin"] = catalog_origin
         payload = {
@@ -1543,6 +1747,9 @@ def _api_phase(args):
         "target_qemu_argv", "schema_capabilities",
         "capability_evidence", "probe_statuses",
         "glance_catalog_origin", "image_store_ids",
+        "expected_absences",
+        "source_cell_mapping",
+        "observed_at",
     }
     if (
         not isinstance(payload["api_result"], dict)
@@ -1565,18 +1772,26 @@ def _api_phase(args):
             payload["api_result"][key] = value
     if args.capability_config is not None:
         capability = _read_protected_json(args.capability_config)
-        required = {
-            "schema_version", "target_manage_outputs", "target_image_inspects",
-            "target_runtime_outputs", "target_virsh_argv", "target_qemu_argv",
-            "schema_capabilities", "capability_evidence",
-        }
-        allowed = required | {"probe_statuses"}
+        if args.side == "source":
+            required = {"schema_version", "schema_capabilities", "capability_evidence"}
+            allowed = required
+            valid_version = "openstack-rehome-source-capability-input/v1alpha1"
+            error_message = "source capability input is invalid"
+        else:
+            required = {
+                "schema_version", "target_manage_outputs", "target_image_inspects",
+                "target_runtime_outputs", "target_virsh_argv", "target_qemu_argv",
+                "schema_capabilities", "capability_evidence",
+            }
+            allowed = required | {"probe_statuses"}
+            valid_version = "openstack-rehome-target-capability-input/v1alpha1"
+            error_message = "target capability input is invalid"
         if (
             not isinstance(capability, dict) or not required.issubset(capability)
             or not set(capability).issubset(allowed)
-            or capability.get("schema_version") != "openstack-rehome-target-capability-input/v1alpha1"
+            or capability.get("schema_version") != valid_version
         ):
-            raise ValueError("target capability input is invalid")
+            raise ValueError(error_message)
         for key in set(capability) - {"schema_version"}:
             if key in payload["api_result"]:
                 raise ValueError("target capability identity is duplicated")
@@ -1745,6 +1960,42 @@ def _closure_checks(side, api_cache_misses, db_cache_misses):
     return checks
 
 
+def _target_absence_checks(side, api_result):
+    values = api_result.get("expected_absences", [])
+    if values in (None, []):
+        return []
+    if side != "target" or not isinstance(values, list):
+        raise ValueError("expected target absence evidence is invalid")
+    checks = []
+    for index, item in enumerate(values, start=1):
+        expected = {
+            "evidence_id", "command", "resource_id", "status_code",
+            "failure_class",
+        }
+        if (
+            not isinstance(item, dict)
+            or set(item) != expected
+            or not isinstance(item["evidence_id"], str)
+            or not item["evidence_id"]
+            or not isinstance(item["command"], list)
+            or not item["command"]
+            or not all(isinstance(value, str) and value for value in item["command"])
+            or not isinstance(item["resource_id"], str)
+            or not item["resource_id"]
+            or item["status_code"] != 404
+            or item["failure_class"] != "not-found"
+        ):
+            raise ValueError("expected target absence evidence is invalid")
+        checks.append(CheckResult(
+            f"target.object-absence.{index:04d}",
+            "UNKNOWN",
+            "source-scoped object is not present on the pre-import target",
+            [item["resource_id"]],
+            [item["evidence_id"]],
+        ).to_dict())
+    return checks
+
+
 def _combine_phase(args):
     api = _read_json(args.api_result)
     filters_document = _read_json(Path(args.api_result).with_name("uuid-filters.json"))
@@ -1875,22 +2126,17 @@ def _combine_phase(args):
     used_columns = {}
     for query in plan["queries"]:
         used_columns.setdefault(f"{query['schema']}.{query['table']}", set()).update(query["columns"])
-    capabilities[f"{args.side}-information-schema"] = {
-        "tables": {
-            table: {
-                column: definition.to_dict()
-                for column, definition in sorted(columns.items())
-            }
-            for table, columns in sorted(snapshot.tables.items())
-        },
-        "used_columns": {
-            table: sorted(columns) for table, columns in sorted(used_columns.items())
-        },
-    }
+    capabilities[f"{args.side}-information-schema"] = schema_capability(
+        snapshot,
+        {table: sorted(columns) for table, columns in sorted(used_columns.items())},
+    )
     combined = {
         "schema_version": BUNDLE_VERSION,
         "collectors": collectors,
-        "checks": _closure_checks(args.side, cache_misses, db_cache_misses),
+        "checks": [
+            *_closure_checks(args.side, cache_misses, db_cache_misses),
+            *_target_absence_checks(args.side, api["api_result"]),
+        ],
         "schema_capabilities": capabilities,
         "uuid_filters": side_filters,
         "evidence_index": evidence_index,
@@ -1917,6 +2163,7 @@ def main(argv=None):
     parser.add_argument("--schema-policy", type=Path)
     parser.add_argument("--probe-config", type=Path)
     parser.add_argument("--root-manifest", type=Path)
+    parser.add_argument("--source-cell-mapping", type=Path)
     parser.add_argument("--capability-config", type=Path)
     parser.add_argument("--cinder-sensitive-evidence", type=Path)
     parser.add_argument("--fixture-phase", action="store_true")

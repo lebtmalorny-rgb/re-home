@@ -2,8 +2,10 @@
 """Assemble control/runtime results and render a fail-closed readiness report."""
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
+import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -121,7 +123,10 @@ def _validate_role(collectors, role):
 
 
 def _validate_evidence_entry(entry):
-    common = {"evidence_id", "kind", "side", "service"}
+    common = {
+        "evidence_id", "kind", "side", "service", "observed_at",
+        "returncode", "failure_class", "stderr_sha256", "raw_artifact_ref",
+    }
     shapes = {
         "openstack-json": common | {"command"},
         "runtime-command": common | {"command"},
@@ -129,12 +134,31 @@ def _validate_evidence_entry(entry):
         "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status"},
         "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
         "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"},
+        "source-cell-mapping": common | {"host", "cell_uuid", "database_schema"},
+        "api-absence": common | {"command", "resource_id", "status_code"},
     }
     if not isinstance(entry, dict) or entry.get("kind") not in shapes or set(entry) != shapes.get(entry.get("kind"), set()):
         raise ValueError("evidence index entry schema is invalid")
     if not all(isinstance(entry.get(key), str) and entry[key] for key in ("evidence_id", "side", "service")) or entry["side"] not in {"source", "target"}:
         raise ValueError("evidence index provenance is invalid")
-    if entry["kind"] in {"openstack-json", "runtime-command"}:
+    try:
+        observed = datetime.fromisoformat(entry["observed_at"].replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise ValueError("evidence timestamp is invalid") from None
+    if (
+        observed.tzinfo is None
+        or not isinstance(entry["returncode"], int)
+        or isinstance(entry["returncode"], bool)
+        or (entry["failure_class"] is not None and (
+            not isinstance(entry["failure_class"], str) or not entry["failure_class"]
+        ))
+        or not isinstance(entry["stderr_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", entry["stderr_sha256"]) is None
+        or not isinstance(entry["raw_artifact_ref"], str)
+        or not entry["raw_artifact_ref"].startswith(f"protected://{entry['side']}/")
+    ):
+        raise ValueError("evidence outcome metadata is invalid")
+    if entry["kind"] in {"openstack-json", "runtime-command", "api-absence"}:
         if not isinstance(entry["command"], list) or not entry["command"] or not all(isinstance(value, str) and value for value in entry["command"]):
             raise ValueError("evidence command is invalid")
     elif entry["kind"] == "db-jsonl":
@@ -149,6 +173,12 @@ def _validate_evidence_entry(entry):
     elif entry["kind"] == "cinder-connection":
         if not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint")):
             raise ValueError("Cinder connection evidence is invalid")
+    elif entry["kind"] == "source-cell-mapping":
+        if not all(isinstance(entry[key], str) and entry[key] for key in ("host", "cell_uuid", "database_schema")):
+            raise ValueError("Nova cell mapping evidence is invalid")
+    elif entry["kind"] == "api-absence":
+        if entry["status_code"] != 404 or not isinstance(entry["resource_id"], str) or not entry["resource_id"]:
+            raise ValueError("target absence evidence is invalid")
 
 
 def _validate_evidence_closure(collectors, checks, bundle):
@@ -212,11 +242,38 @@ def _directional_mapping(policy, capabilities):
             used_columns.setdefault(table, set()).update(columns)
     if not used_columns:
         raise ValueError("used schema columns are missing")
-    return build_directional_mapping(
+    mapping = build_directional_mapping(
         snapshots["source"], snapshots["target"],
         {table: sorted(columns) for table, columns in sorted(used_columns.items())},
         policy,
     )
+    source_profile = capabilities.get("services", {}).get("source-profile")
+    expected_profile_keys = {
+        "status", "profile", "reason", "release", "distribution",
+        "evidence_ids", "signals",
+    }
+    profile_proven = (
+        isinstance(source_profile, dict)
+        and set(source_profile) == expected_profile_keys
+        and source_profile.get("status") == "PASS"
+        and source_profile.get("profile") == policy.get("source_profile")
+        and source_profile.get("profile") == "keystack-2025.1"
+        and source_profile.get("release") == "2025.1"
+        and source_profile.get("distribution") == "keystack"
+        and isinstance(source_profile.get("evidence_ids"), list)
+        and len(source_profile["evidence_ids"]) >= 4
+        and all(isinstance(value, str) and value for value in source_profile["evidence_ids"])
+        and isinstance(source_profile.get("signals"), dict)
+    )
+    if not profile_proven:
+        mapping["source_profile"] = None
+        mapping["blockers"] = list(dict.fromkeys([
+            *mapping.get("blockers", []),
+            "source profile keystack-2025.1 is not proven by live evidence",
+        ]))
+    else:
+        mapping["source_profile"] = source_profile["profile"]
+    return mapping
 
 
 def main(argv=None):

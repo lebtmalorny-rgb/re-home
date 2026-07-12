@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -82,6 +83,9 @@ def _sanitized_json_evidence(evidence: object) -> Dict[str, Any]:
         sanitized["stdout"] = "[REDACTED]"
     if "stderr" in raw:
         sanitized["stderr"] = "[REDACTED]"
+        sanitized["stderr_sha256"] = hashlib.sha256(
+            str(raw["stderr"]).encode("utf-8")
+        ).hexdigest()
     return sanitized
 
 

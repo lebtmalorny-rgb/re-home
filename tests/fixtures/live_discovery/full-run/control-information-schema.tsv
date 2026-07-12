@@ -34,3 +34,5 @@ nova_api	instance_mappings	3	cell_id	varchar(36)	NO	NULL	\N
 nova_api	request_specs	1	id	int(11)	NO	NULL	\N
 nova_api	request_specs	2	instance_uuid	varchar(36)	NO	NULL	\N
 nova_api	request_specs	3	spec	longtext	YES	NULL	\N
+SECTION:STATISTICS
+SECTION:FOREIGN_KEYS

@@ -15,3 +15,5 @@ SECTION:COLUMNS
 cinder	volumes	1	id	varchar(36)	NO	NULL	\N
 cinder	volumes	2	service_uuid	varchar(36)	YES	NULL	\N
 cinder	volumes	3	source_code	varchar(16)	YES	NULL	\N
+SECTION:STATISTICS
+SECTION:FOREIGN_KEYS

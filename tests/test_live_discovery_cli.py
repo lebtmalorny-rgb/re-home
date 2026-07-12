@@ -25,6 +25,189 @@ from live_discovery.schema import SchemaSnapshot
 
 
 class LiveDiscoveryCliTests(unittest.TestCase):
+    def test_empty_target_records_expected_absence_without_aborting_api_phase(self):
+        instance_id = "11111111-1111-1111-1111-111111111111"
+        port_id = "33333333-3333-3333-3333-333333333333"
+        volume_id = "22222222-2222-2222-2222-222222222222"
+        image_id = "44444444-4444-4444-4444-444444444444"
+
+        class Client:
+            def __init__(self, *args):
+                pass
+
+            def json(self, command, evidence_id):
+                if command[:2] == ["server", "list"]:
+                    return [], {"id": evidence_id}
+                if command[:3] in (
+                    ["compute", "service", "list"],
+                    ["resource", "provider", "list"],
+                ):
+                    return [], {"id": evidence_id}
+                evidence = control.CommandEvidence(
+                    evidence_id,
+                    [str(value) for value in command],
+                    1,
+                    "",
+                    "HTTP 404 object not found",
+                )
+                error = control.ProbeFailed(evidence)
+                error.status_code = 404
+                raise error
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "roots.json"
+            manifest.write_text(json.dumps({
+                "schema_version": "openstack-rehome-root-manifest/v1alpha1",
+                "side": "target",
+                "roots": {
+                    "instances": [instance_id],
+                    "ports": [port_id],
+                    "volumes": [volume_id],
+                    "images": [image_id],
+                },
+            }), encoding="utf-8")
+            manifest.chmod(0o600)
+            schema = root / "information-schema.tsv"
+            lines = ["SERVICE:all", "SECTION:COLUMNS"]
+            for identity in sorted(set().union(*_collector_table_catalog().values())):
+                schema_name, table = identity.split(".", 1)
+                columns = {"id", *(column for _, column in _TABLE_ROOT_FILTERS[identity])}
+                for ordinal, column in enumerate(sorted(columns), start=1):
+                    lines.append(
+                        f"{schema_name}\t{table}\t{ordinal}\t{column}"
+                        "\tvarchar(255)\tYES\tNULL\t\\N"
+                    )
+            schema.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            args = type("Args", (), {
+                "fixture": None,
+                "rehome_host": "compute-023",
+                "cloud": "target",
+                "clouds_file": Path("/clouds.yaml"),
+                "container": "toolbox",
+                "side": "target",
+                "information_schema": schema,
+                "root_manifest": manifest,
+                "probe_config": None,
+                "capability_config": None,
+                "phase_key_file": None,
+                "phase_key_env": "LIVE_DISCOVERY_TEST_KEY",
+                "out": root / "out",
+            })()
+            with (
+                mock.patch("live_discovery.openstack.OpenStackClient", Client),
+                mock.patch.dict(os.environ, {
+                    "LIVE_DISCOVERY_TEST_KEY": "test-phase-anchor-at-least-sixteen",
+                }),
+            ):
+                _api_phase(args)
+
+            document = json.loads((root / "out" / "api-result.json").read_text())
+            absences = document["api_result"]["expected_absences"]
+            absent_ids = {item["resource_id"] for item in absences}
+            self.assertTrue({instance_id, port_id, volume_id, image_id}.issubset(absent_ids))
+            self.assertTrue(all(item["status_code"] == 404 for item in absences))
+            self.assertTrue((root / "out" / "db-query-plan.json").is_file())
+
+    def test_target_404_absence_becomes_typed_readiness_check(self):
+        resource_id = "11111111-1111-1111-1111-111111111111"
+        api_result = {
+            "expected_absences": [{
+                "evidence_id": f"nova-target-server-show-{resource_id}",
+                "command": ["server", "show", resource_id, "-f", "json"],
+                "resource_id": resource_id,
+                "status_code": 404,
+                "failure_class": "not-found",
+            }],
+        }
+
+        checks = control._target_absence_checks("target", api_result)
+
+        self.assertEqual(1, len(checks))
+        self.assertEqual("UNKNOWN", checks[0]["status"])
+        self.assertEqual([resource_id], checks[0]["resource_ids"])
+        self.assertEqual(
+            [f"nova-target-server-show-{resource_id}"],
+            checks[0]["evidence_ids"],
+        )
+
+    def test_empty_preimport_target_fixture_still_emits_typed_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "empty-target"
+            fixture.mkdir()
+            source = json.loads((FIXTURES / "ready/source-control.json").read_text())
+            target = json.loads((FIXTURES / "ready/target-control.json").read_text())
+            resource_id = "11111111-1111-1111-1111-111111111111"
+            evidence_id = f"nova-target-server-show-{resource_id}"
+            for collector in target["collectors"]:
+                if collector["service"] in {"neutron", "cinder", "glance"}:
+                    collector["nodes"] = []
+                    collector["edges"] = []
+                    collector["checks"] = []
+                    collector["unknowns"] = []
+                    collector["blockers"] = []
+                    collector["evidence"] = []
+            target["checks"].append({
+                "check_id": "target.object-absence.0001",
+                "status": "UNKNOWN",
+                "reason": "source-scoped object is not present on the pre-import target",
+                "resource_ids": [resource_id],
+                "evidence_ids": [evidence_id],
+            })
+            target["evidence_index"].append({
+                "evidence_id": evidence_id,
+                "kind": "api-absence",
+                "side": "target",
+                "service": "target-object-existence",
+                "command": ["server", "show", resource_id, "-f", "json"],
+                "resource_id": resource_id,
+                "status_code": 404,
+                "observed_at": "2026-07-12T09:00:00Z",
+                "returncode": 1,
+                "failure_class": "not-found",
+                "stderr_sha256": hashlib.sha256(b"not found").hexdigest(),
+                "raw_artifact_ref": f"protected://target/{evidence_id}",
+            })
+            (fixture / "source-control.json").write_text(json.dumps(source), encoding="utf-8")
+            (fixture / "target-control.json").write_text(json.dumps(target), encoding="utf-8")
+            (fixture / "runtime.json").write_text((FIXTURES / "ready/runtime.json").read_text(), encoding="utf-8")
+            (fixture / "schema-policy.json").write_text((FIXTURES / "schema-policy.json").read_text(), encoding="utf-8")
+            out = root / "out"
+
+            process = subprocess.run(
+                [sys.executable, "scripts/assemble_live_discovery.py", "--fixture-dir", str(fixture), "--out-dir", str(out)],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(2, process.returncode, process.stderr)
+            report = json.loads((out / "readiness-report.json").read_text())
+            self.assertEqual("UNKNOWN", report["verdict"])
+            self.assertIn("target.object-absence.0001", {
+                item["check_id"] for item in report["checks"]
+            })
+
+    def test_multi_cell_catalog_uses_live_cell_schema_names(self):
+        available = {
+            "nova_api.host_mappings",
+            "nova_api.instance_mappings",
+            "nova_api.request_specs",
+            *{
+                f"nova_cell1.{table}"
+                for table, schema in DB_SCHEMAS.items()
+                if schema == "nova"
+            },
+        }
+
+        catalog = _collector_table_catalog(available)["nova"]
+
+        self.assertIn("nova_cell1.instances", catalog)
+        self.assertNotIn("nova.instances", catalog)
+
     def test_fixture_combine_requires_explicit_cli_trust_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -47,6 +230,40 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         collector = {"side":"target","service":"target-profile","nodes":[{"evidence_ids":["target-profile-real"]}],"checks":[]}
         with self.assertRaises(ValueError):
             control._build_evidence_index("target", [collector], {"openstack":[]}, [])
+
+    def test_evidence_index_has_acquisition_outcome_and_protected_raw_reference(self):
+        evidence_id = "nova-source-server-list-compute-023"
+        collector = {
+            "side": "source",
+            "service": "nova",
+            "nodes": [{"evidence_ids": [evidence_id]}],
+            "checks": [],
+            "evidence": [],
+        }
+        api_result = {
+            "observed_at": "2026-07-12T09:00:00Z",
+            "openstack": [{
+                "command": ["server", "list", "-f", "json"],
+                "payload": [],
+                "evidence": {
+                    "evidence_id": evidence_id,
+                    "returncode": 0,
+                    "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            }],
+        }
+
+        entry = control._build_evidence_index(
+            "source", [collector], api_result, []
+        )[0]
+
+        self.assertEqual("2026-07-12T09:00:00Z", entry["observed_at"])
+        self.assertEqual(0, entry["returncode"])
+        self.assertIsNone(entry["failure_class"])
+        self.assertEqual(hashlib.sha256(b"").hexdigest(), entry["stderr_sha256"])
+        self.assertEqual(
+            f"protected://source/{evidence_id}", entry["raw_artifact_ref"]
+        )
 
     def test_storage_pass_cannot_cross_backend_kind_or_resource(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
@@ -398,7 +615,10 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             self.assertTrue(all(item["filters"] for item in plan["queries"]))
     def test_full_root_plan_catalog_equals_all_collector_db_table_calls(self):
         catalog = _collector_table_catalog()
-        self.assertEqual({f"{DB_SCHEMAS[table]}.{table}" for table in DB_TABLES}, catalog["nova"])
+        self.assertEqual(
+            {f"{DB_SCHEMAS[table]}.{table}" for table in DB_TABLES if table != "cell_mappings"},
+            catalog["nova"],
+        )
         self.assertEqual({f"neutron.{table}" for table in set(NEUTRON_CORE) | {table for family in NEUTRON_OPTIONAL.values() for table in family}}, catalog["neutron"])
         self.assertEqual({f"cinder.{table}" for table in set(CINDER_CORE) | set(CINDER_OPTIONAL)}, catalog["cinder"])
         roots = {
@@ -528,8 +748,9 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             for identity in sorted(available):
                 schema,table=identity.split(".",1); columns=set()
                 for row in table_rows.get(identity,[]): columns.update(row)
-                columns.update(column for _,column in _TABLE_ROOT_FILTERS[identity])
+                columns.update(column for _,column in _TABLE_ROOT_FILTERS.get(identity, ()))
                 for ordinal,column in enumerate(sorted(columns),start=1): lines.append(f"{schema}\t{table}\t{ordinal}\t{column}\tvarchar(255)\tYES\tNULL\t\\N")
+            lines.extend(["SECTION:STATISTICS", "SECTION:FOREIGN_KEYS"])
             path.write_text("\n".join(lines)+"\n",encoding="utf-8")
         def write_db(plan,path,missing_service_schema=None):
             path.mkdir()

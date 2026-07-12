@@ -14,6 +14,7 @@ from live_discovery.nova import NovaCollector
 
 DB_TABLES = (
     "host_mappings",
+    "cell_mappings",
     "instance_mappings",
     "request_specs",
     "instances",
@@ -26,6 +27,7 @@ DB_TABLES = (
 
 class FixtureClient:
     def __init__(self, fixture):
+        self.has_cell_mapping_evidence = bool(fixture.get("cell_mappings"))
         self.db_facts = {
             table: deepcopy(fixture.get(table, [])) for table in DB_TABLES
         }
@@ -80,6 +82,57 @@ class NovaCollectorTests(unittest.TestCase):
         required_targets = {edge.target for edge in result.edges if edge.required}
         self.assertIn("cell_mapping:cell-source", required_targets)
         self.assertIn("flavor:flavor-1", required_targets)
+
+    def test_resolves_cell_database_schema_without_serializing_credentials(self):
+        fixture = deepcopy(self.fixture)
+        fixture["cell_mappings"] = [{
+            "_schema": "nova_api",
+            "_table": "cell_mappings",
+            "row": {
+                "id": "cell-source",
+                "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "name": "cell1",
+                "database_connection": (
+                    "mysql+pymysql://nova:never-serialize@db.internal/nova_cell1"
+                ),
+            },
+        }]
+
+        result = collect_from_fixture(fixture, "compute-023", "source")
+
+        cell = next(node for node in result.nodes if node.kind == "cell_mapping")
+        self.assertEqual("nova_cell1", cell.facts["database_schema"])
+        rendered = json.dumps(result.to_dict(), sort_keys=True)
+        self.assertNotIn("never-serialize", rendered)
+        self.assertNotIn("mysql+pymysql", rendered)
+
+    def test_multi_cell_records_are_bound_to_resolved_cell_schema(self):
+        fixture = deepcopy(self.fixture)
+        fixture["cell_mappings"] = [{
+            "_schema": "nova_api",
+            "_table": "cell_mappings",
+            "row": {
+                "id": "cell-source",
+                "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "name": "cell1",
+                "database_connection": "mysql://nova:secret@db/nova_cell1",
+            },
+        }]
+        for table in (
+            "instances", "block_device_mapping", "instance_info_caches",
+            "compute_nodes", "services",
+        ):
+            for record in fixture[table]:
+                record["_schema"] = "nova_cell1"
+        client = FixtureClient(fixture)
+
+        result = NovaCollector(
+            client, "source", cell_schema="nova_cell1"
+        ).collect("compute-023")
+
+        self.assertEqual([], result.blockers)
+        cell = next(node for node in result.nodes if node.kind == "cell_mapping")
+        self.assertEqual("nova_cell1", cell.facts["database_schema"])
 
     def test_missing_instance_mapping_is_blocker(self):
         fixture = deepcopy(self.fixture)

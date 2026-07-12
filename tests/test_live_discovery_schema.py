@@ -11,6 +11,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_discovery"
 
 from live_discovery.schema import (
     CLASSIFICATIONS,
+    SchemaSnapshot,
     build_directional_mapping,
     parse_information_schema,
     schema_capability,
@@ -213,8 +214,9 @@ SECTION:FOREIGN_KEYS
                     parse_information_schema(path)
 
     def test_directional_capability_requires_complete_metadata_sections(self):
+        incomplete = SchemaSnapshot(tables=self.source_snapshot.tables)
         with self.assertRaisesRegex(ValueError, "constraint metadata"):
-            schema_capability(self.source_snapshot, {"nova.instances": ["progress"]})
+            schema_capability(incomplete, {"nova.instances": ["progress"]})
 
         artifact = """SERVICE:target-control
 SECTION:COLUMNS

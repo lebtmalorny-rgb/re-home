@@ -3,6 +3,7 @@ import json
 import re
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from .contract import (
     CheckResult,
@@ -14,6 +15,7 @@ from .contract import (
 
 DB_TABLES = (
     "host_mappings",
+    "cell_mappings",
     "instance_mappings",
     "request_specs",
     "instances",
@@ -25,6 +27,7 @@ DB_TABLES = (
 
 DB_SCHEMAS = {
     "host_mappings": "nova_api",
+    "cell_mappings": "nova_api",
     "instance_mappings": "nova_api",
     "request_specs": "nova_api",
     "instances": "nova",
@@ -33,6 +36,24 @@ DB_SCHEMAS = {
     "compute_nodes": "nova",
     "services": "nova",
 }
+
+_MYSQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,63}$")
+
+
+def cell_database_schema(connection: object) -> Optional[str]:
+    """Return only a validated schema name from a Nova cell connection URI."""
+    if not isinstance(connection, str) or not connection or "%" in connection:
+        return None
+    try:
+        parsed = urlsplit(connection)
+    except ValueError:
+        return None
+    if not parsed.scheme.startswith("mysql") or not parsed.netloc:
+        return None
+    path = parsed.path.lstrip("/")
+    if "/" in path or _MYSQL_IDENTIFIER.fullmatch(path) is None:
+        return None
+    return path
 
 _SAFE_FLAVOR_FIELDS = (
     "id",
@@ -120,9 +141,19 @@ def _network_port_ids(value: object) -> Tuple[List[str], List[object], bool]:
 
 
 class NovaCollector:
-    def __init__(self, client, side: str) -> None:
+    def __init__(self, client, side: str, cell_schema: str = "nova") -> None:
+        if _MYSQL_IDENTIFIER.fullmatch(cell_schema) is None:
+            raise ValueError("Nova cell schema is invalid")
         self.client = client
         self.side = side
+        self.cell_schema = cell_schema
+
+    def _db_schema(self, table: str) -> str:
+        return (
+            self.cell_schema
+            if DB_SCHEMAS[table] == "nova"
+            else DB_SCHEMAS[table]
+        )
 
     def collect(self, rehome_host: str) -> CollectorResult:
         result = CollectorResult(service="nova", side=self.side)
@@ -130,10 +161,13 @@ class NovaCollector:
             result.blockers.append("rehome host missing")
             return result
 
-        rows = {
-            table: self._db_rows(table, result)
-            for table in DB_TABLES
-        }
+        live_tables = DB_TABLES
+        if self.side != "source" or not getattr(
+            self.client, "has_cell_mapping_evidence", False
+        ):
+            live_tables = tuple(table for table in DB_TABLES if table != "cell_mappings")
+        rows = {table: self._db_rows(table, result) for table in live_tables}
+        rows.setdefault("cell_mappings", [])
         nodes: Dict[str, ResourceNode] = {}
         edge_keys = set()
 
@@ -228,6 +262,13 @@ class NovaCollector:
         host_mapping = self._canonical_host_mapping(
             rehome_host, rows["host_mappings"], result
         )
+        cell_mapping = (
+            self._canonical_cell_mapping(host_mapping, rows["cell_mappings"], result)
+            if self.side == "source" and getattr(
+                self.client, "has_cell_mapping_evidence", False
+            )
+            else None
+        )
 
         instance_entries = server_list if isinstance(server_list, list) else []
         if not isinstance(server_list, list):
@@ -256,6 +297,7 @@ class NovaCollector:
                 summary,
                 rows,
                 host_mapping,
+                cell_mapping,
                 placement_node,
                 flavor_nodes,
                 result,
@@ -324,7 +366,7 @@ class NovaCollector:
                 result.blockers.append(f"DB JSONL record invalid: {table}[{index}]")
                 continue
             if (
-                record.get("_schema") != DB_SCHEMAS[table]
+                record.get("_schema") != self._db_schema(table)
                 or record.get("_table") != table
                 or not isinstance(record.get("row"), Mapping)
             ):
@@ -601,6 +643,39 @@ class NovaCollector:
             return None
         return canonical[0]
 
+    def _canonical_cell_mapping(
+        self,
+        host_mapping: Optional[Mapping[str, Any]],
+        mappings: List[Mapping[str, Any]],
+        result: CollectorResult,
+    ) -> Optional[Mapping[str, Any]]:
+        if host_mapping is None:
+            return None
+        cell_id = host_mapping.get("cell_id")
+        canonical = [
+            row for row in mappings
+            if row.get("id") == cell_id or row.get("uuid") == cell_id
+        ]
+        if len(canonical) != 1:
+            result.blockers.append(
+                "cell mapping missing" if not canonical else "cell mapping duplicate"
+            )
+            return None
+        schema = canonical[0].get("database_schema")
+        if not isinstance(schema, str):
+            schema = cell_database_schema(canonical[0].get("database_connection"))
+        if not isinstance(schema, str) or _MYSQL_IDENTIFIER.fullmatch(schema) is None:
+            schema = None
+        if schema is None:
+            result.blockers.append("cell mapping database schema invalid")
+            return None
+        return {
+            "id": cell_id,
+            "uuid": canonical[0].get("uuid"),
+            "schema": schema,
+            "evidence_id": canonical[0].get("_evidence_id"),
+        }
+
     def _collect_instance(
         self,
         rehome_host: str,
@@ -608,6 +683,7 @@ class NovaCollector:
         summary: Mapping[str, Any],
         rows: Mapping[str, List[Mapping[str, Any]]],
         host_mapping: Optional[Mapping[str, Any]],
+        cell_mapping: Optional[Mapping[str, Any]],
         placement_node: Optional[ResourceNode],
         flavor_nodes: Dict[str, ResourceNode],
         result: CollectorResult,
@@ -807,10 +883,18 @@ class NovaCollector:
             image = add_node("image_ref", image_id, {"id": image_id})
             add_edge(instance_node.key, image.key, "references_image", True)
         if cell_id:
+            cell_facts = {"cell_id": cell_id, "host": rehome_host}
+            if cell_mapping is not None and cell_mapping.get("id") == cell_id:
+                cell_facts["database_schema"] = cell_mapping["schema"]
+                if cell_mapping.get("uuid"):
+                    cell_facts["uuid"] = cell_mapping["uuid"]
             cell = add_node(
                 "cell_mapping",
                 cell_id,
-                {"cell_id": cell_id, "host": rehome_host},
+                cell_facts,
+                [cell_mapping["evidence_id"]]
+                if cell_mapping is not None and cell_mapping.get("evidence_id")
+                else [],
             )
             add_edge(instance_node.key, cell.key, "mapped_to_cell", True)
         if request_spec is not None:

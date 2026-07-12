@@ -52,6 +52,9 @@
   "host_mappings": [
     {"_schema": "nova_api", "_table": "host_mappings", "row": {"id": 5, "host": "compute-023", "cell_id": "cell-source"}}
   ],
+  "cell_mappings": [
+    {"_schema": "nova_api", "_table": "cell_mappings", "row": {"id": "cell-source", "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "name": "cell1", "database_connection": "mysql+pymysql://nova:fixture-secret@db.internal/nova"}}
+  ],
   "instance_mappings": [
     {"_schema": "nova_api", "_table": "instance_mappings", "row": {"id": 11, "instance_uuid": "11111111-1111-1111-1111-111111111111", "cell_id": "cell-source", "project_id": "project-1"}}
   ],
