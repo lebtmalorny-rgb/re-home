@@ -150,6 +150,9 @@ ansible-playbook -i inventory/hosts.yml playbooks/90-rollback-to-source.yml
 6. Для Glance нужны project/member/store provenance, hashes и one-byte Range
    probe, когда image обязателен.
 7. Source DB/config остаются rollback authority до окончания burn-in.
+8. Каждый DB SELECT и каждый delegate probe обязан иметь acquisition-bound
+   timestamp/rc/failure digest/raw reference; недостающие поля не дополняются
+   значениями по умолчанию, а ненулевой DB rc формирует `BLOCKED`.
 
 ## Файлы проекта
 

@@ -1539,14 +1539,21 @@ class CinderCollector:
         if isinstance(response, tuple) and len(response) == 2:
             records, evidence = response
         expected = {
-            "evidence_id": f"{self.side}-db:cinder.{table}",
             "schema": "cinder", "table": table, "filters": deepcopy(safe_filters),
         }
-        if evidence != expected:
+        if (
+            not isinstance(evidence, Mapping)
+            or not isinstance(evidence.get("evidence_id"), str)
+            or not evidence["evidence_id"]
+            or {
+                key: deepcopy(evidence.get(key))
+                for key in ("schema", "table", "filters")
+            } != expected
+        ):
             result.blockers.append(f"DB evidence invalid: {table}")
         else:
             result.evidence.append({
-                "evidence_id": expected["evidence_id"], "kind": "db-jsonl",
+                "evidence_id": evidence["evidence_id"], "kind": "db-jsonl",
                 "schema": "cinder", "table": table, "filters": deepcopy(safe_filters),
             })
         if not isinstance(records, list):

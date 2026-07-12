@@ -47,6 +47,7 @@ def build_source_profile(image_records):
     if not isinstance(image_records, dict) or set(image_records) != set(SERVICES):
         raise ValueError("source image evidence set is invalid")
     evidence = []
+    statuses = {}
     signals = {}
     proven = True
     for service in SERVICES:
@@ -83,6 +84,14 @@ def build_source_profile(image_records):
             "service": "source-profile",
             "command": deepcopy(record["command"]),
         })
+        statuses[record["evidence_id"]] = {
+            "returncode": record["returncode"],
+            "status": "PASS" if valid else "UNKNOWN",
+            "failure_class": None if valid else "profile-unproven",
+            "stderr_sha256": hashlib.sha256(
+                record["stderr"].encode("utf-8")
+            ).hexdigest(),
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "schema_capabilities": {
@@ -101,6 +110,7 @@ def build_source_profile(image_records):
             },
         },
         "capability_evidence": evidence,
+        "probe_statuses": statuses,
     }
 
 

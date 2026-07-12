@@ -85,8 +85,7 @@ def _status(record: Mapping[str, Any]) -> Dict[str, Any]:
     }
     if record["returncode"] != 0:
         payload["stdout_sha256"] = _sha256(record["stdout"])
-    if stderr:
-        payload["stderr_sha256"] = hashlib.sha256(stderr.encode("utf-8")).hexdigest()
+    payload["stderr_sha256"] = hashlib.sha256(stderr.encode("utf-8")).hexdigest()
     return payload
 
 

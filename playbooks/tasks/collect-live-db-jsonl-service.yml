@@ -155,10 +155,33 @@
     label: "{{ item.item.query_id }}"
   no_log: true
 
-- name: Live DB JSONL | fail closed after evidence is persisted
-  ansible.builtin.assert:
-    that:
-      - live_discovery_db_query_results.results | map(attribute='rc') | select('ne', 0) | list | length == 0
-    fail_msg: >-
-      At least one scoped DB SELECT failed. Exact .rc and protected .stderr
-      artifacts were retained; combine is intentionally not executed.
+- name: Live DB JSONL | build acquisition-bound sanitized evidence sidecars
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - live_discovery.db_evidence
+      - --record-stdin
+      - --out
+      - "{{ live_discovery_side_remote_dir }}/db-jsonl/{{ item.item.query_id }}.evidence.json"
+    chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+    stdin: >-
+      {{ {'side': live_discovery_schema_side,
+          'query_id': item.item.query_id,
+          'returncode': item.rc,
+          'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%S.%fZ'),
+          'stderr': item.stderr} | to_json }}
+    stdin_add_newline: false
+  loop: "{{ live_discovery_db_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.query_id }}"
+  changed_when: false
+  no_log: true
+
+- name: Live DB JSONL | retain failure set for typed combine verdict
+  ansible.builtin.set_fact:
+    live_discovery_db_failed_query_ids: >-
+      {{ live_discovery_db_query_results.results |
+         rejectattr('rc', 'equalto', 0) |
+         map(attribute='item.query_id') | list }}
+  no_log: true

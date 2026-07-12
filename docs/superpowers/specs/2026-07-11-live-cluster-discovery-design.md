@@ -343,6 +343,13 @@ Storage probes группируются по delegate отдельно для so
 NFS/RBD/LVM hosts объединяются только детерминированно после проверки общего
 scope.
 
+У каждого DB query есть acquisition sidecar с фактическими timestamp, rc,
+failure class, stderr digest и protected raw reference. Consumer не создаёт
+значения по умолчанию. Ненулевой rc сохраняется как evidence и даёт `BLOCKED`.
+Storage/Glance evidence сохраняет provenance конкретного delegate, включая
+phase binding и собственный timestamp. Prebuilt directional mapping допустим
+только в fixture mode; live mapping всегда выводится из live capabilities.
+
 ## Ошибки и безопасность
 
 - Ошибка команды не заменяется `{}` или `[]`.

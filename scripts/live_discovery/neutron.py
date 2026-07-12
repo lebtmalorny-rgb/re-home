@@ -1006,17 +1006,24 @@ class NeutronCollector:
             return []
         if callable(source):
             expected_evidence = {
-                "evidence_id": f"{self.side}-db:neutron.{table}",
                 "schema": "neutron",
                 "table": table,
                 "filters": deepcopy(dict(filters)),
             }
-            if evidence != expected_evidence:
+            if (
+                not isinstance(evidence, Mapping)
+                or not isinstance(evidence.get("evidence_id"), str)
+                or not evidence["evidence_id"]
+                or {
+                    key: deepcopy(evidence.get(key))
+                    for key in ("schema", "table", "filters")
+                } != expected_evidence
+            ):
                 result.blockers.append(f"DB evidence invalid: {table}")
             else:
                 result.evidence.append(
                     {
-                        "evidence_id": expected_evidence["evidence_id"],
+                        "evidence_id": evidence["evidence_id"],
                         "kind": "db-jsonl",
                         "schema": "neutron",
                         "table": table,

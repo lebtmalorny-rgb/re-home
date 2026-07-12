@@ -131,8 +131,8 @@ def _validate_evidence_entry(entry):
         "openstack-json": common | {"command"},
         "runtime-command": common | {"command"},
         "db-jsonl": common | {"schema", "table", "filters"},
-        "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status"},
-        "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+        "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status", "delegate_provenance"},
+        "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status", "delegate_provenance"},
         "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"},
         "source-cell-mapping": common | {"host", "cell_uuid", "database_schema"},
         "api-absence": common | {"command", "resource_id", "status_code"},
@@ -165,11 +165,26 @@ def _validate_evidence_entry(entry):
         if not all(isinstance(entry[key], str) and entry[key] for key in ("schema", "table")) or not isinstance(entry["filters"], dict) or not entry["filters"]:
             raise ValueError("DB evidence is invalid")
     elif entry["kind"] == "storage-probe":
-        if entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]):
+        if entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["delegate_provenance"], list):
             raise ValueError("storage evidence is invalid")
     elif entry["kind"] == "glance-range":
-        if entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]:
+        if entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"] or not isinstance(entry["delegate_provenance"], list):
             raise ValueError("Glance evidence is invalid")
+    if entry["kind"] in {"storage-probe", "glance-range"}:
+        for item in entry["delegate_provenance"]:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"delegate", "phase_id", "phase_binding_sha256", "observed_at"}
+                or not all(isinstance(item[key], str) and item[key] for key in ("delegate", "phase_id"))
+                or re.fullmatch(r"[0-9a-f]{64}", item.get("phase_binding_sha256", "")) is None
+            ):
+                raise ValueError("delegate provenance is invalid")
+            try:
+                acquired = datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise ValueError("delegate provenance is invalid") from None
+            if acquired.tzinfo is None:
+                raise ValueError("delegate provenance is invalid")
     elif entry["kind"] == "cinder-connection":
         if not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint")):
             raise ValueError("Cinder connection evidence is invalid")
@@ -223,10 +238,12 @@ def _fixture_paths(directory: Path):
     return [*role_paths, policy, directory / "status.json"]
 
 
-def _directional_mapping(policy, capabilities):
+def _directional_mapping(policy, capabilities, *, allow_prebuilt=False):
     if not isinstance(policy, dict):
         raise ValueError("schema policy is invalid")
     if policy.get("schema_version") == "openstack-rehome-directional-schema-mapping/v1alpha1":
+        if not allow_prebuilt:
+            raise ValueError("prebuilt directional mapping is fixture-only")
         return policy
     if policy.get("schema_version") != "openstack-rehome-schema-policy/v1alpha1":
         raise ValueError("schema policy version is invalid")
@@ -354,7 +371,11 @@ def main(argv=None):
         evidence_ids = [item.get("evidence_id") for item in entries if isinstance(item, dict)]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("evidence index identity is duplicated")
-        mapping = _directional_mapping(policy, capabilities)
+        mapping = _directional_mapping(
+            policy,
+            capabilities,
+            allow_prebuilt=args.fixture_dir is not None,
+        )
         graph = assemble_graph(collectors)
         verdict = compute_verdict(graph, checks, mapping)
         evidence = {"uuid_filters": filters, "index": {"schema_version": "openstack-rehome-evidence-index/v1alpha1", "entries": entries}, "sensitive": sensitive}

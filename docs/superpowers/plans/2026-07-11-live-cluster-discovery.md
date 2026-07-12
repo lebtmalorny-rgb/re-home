@@ -1349,7 +1349,7 @@ also yields `UNKNOWN` for required storage evidence.
 capabilities, play 6 performs both probe families plus signed refresh and both
 combines, and play 7 performs final assembly.
 
-`collect-live-schema-service.yml` reuses the existing service-user credential model but writes a run-local information-schema artifact. `collect-live-db-jsonl-service.yml` accepts only generated `.sql` files, runs `python3 -m live_discovery.mysql_json --validate-sql <file>` before MySQL, records `.rc`/`.stderr`, and never suppresses failure during combine.
+`collect-live-schema-service.yml` reuses the existing service-user credential model but writes a run-local information-schema artifact. `collect-live-db-jsonl-service.yml` accepts only generated `.sql` files, runs `python3 -m live_discovery.mysql_json --validate-sql <file>` before MySQL, records `.jsonl`/`.rc`/protected `.stderr` and creates a query-specific acquisition sidecar through the exact-reviewed `live_discovery.db_evidence` argv. Combine requires the sidecar, preserves its real rc/timestamp/digests, and emits `BLOCKED` for a failed SELECT instead of fabricating success metadata.
 
 Сбор профиля controller также фиксирует `nova-manage api_db version`, `nova-manage db version`, `neutron-db-manage current --verbose`, `cinder-manage db version`, строки Glance Alembic и image/digest facts из `docker inspect`. Разрешены только команды version/current/show/inspect.
 

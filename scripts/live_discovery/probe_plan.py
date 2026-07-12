@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import argparse
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -18,6 +19,10 @@ _DELEGATE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$")
 _PROBE_RESULT_KEYS = {
     "storage_probe_results", "glance_data_probe_results",
     "glance_store_capabilities",
+}
+_EVIDENCE_METADATA_KEYS = {
+    "observed_at", "returncode", "failure_class", "stderr_sha256",
+    "raw_artifact_ref",
 }
 
 
@@ -182,6 +187,8 @@ def merge_probe_documents(side, key, phases):
     storage = []
     evidence_ids = set()
     provenance = []
+    observed_timestamps = []
+    glance_acquisitions = {}
     for phase in ordered:
         delegate = phase["delegate"]
         if phase.get("phase_id") != _phase_id(side, delegate):
@@ -211,24 +218,60 @@ def merge_probe_documents(side, key, phases):
         probe_values = {
             name: api_payload.pop(name, []) for name in sorted(_PROBE_RESULT_KEYS)
         }
+        phase_observed_at = api_payload.pop("observed_at", None)
+        try:
+            parsed_observed_at = datetime.fromisoformat(
+                phase_observed_at.replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError):
+            raise ValueError("delegate phase timestamp is invalid") from None
+        if parsed_observed_at.tzinfo is None:
+            raise ValueError("delegate phase timestamp is invalid")
+        observed_timestamps.append((parsed_observed_at, phase_observed_at))
+        semantic_glance = []
+        for item in probe_values["glance_data_probe_results"]:
+            if not isinstance(item, dict) or not _EVIDENCE_METADATA_KEYS.issubset(item):
+                raise ValueError("delegate Glance evidence metadata is invalid")
+            evidence_id = item.get("evidence_id")
+            if not isinstance(evidence_id, str) or not evidence_id:
+                raise ValueError("delegate Glance evidence identity is invalid")
+            semantic_glance.append({
+                key: deepcopy(value) for key, value in item.items()
+                if key not in _EVIDENCE_METADATA_KEYS and key != "delegate_provenance"
+            })
+            glance_acquisitions.setdefault(evidence_id, []).append({
+                "metadata": {
+                    key: deepcopy(item[key]) for key in _EVIDENCE_METADATA_KEYS
+                },
+                "delegate": delegate,
+                "phase_id": phase["phase_id"],
+                "phase_binding_sha256": expected_binding,
+                "observed_at": phase_observed_at,
+            })
         if not all(isinstance(value, list) for value in probe_values.values()):
             raise ValueError("delegate probe result is invalid")
         if common_api is None:
             common_api = api_payload
             common_filters = filters_base
             common_plan = plan_base
-            common_glance = probe_values["glance_data_probe_results"]
+            common_glance = semantic_glance
             common_stores = probe_values["glance_store_capabilities"]
         elif (
             api_payload != common_api
             or filters_base != common_filters
             or plan_base != common_plan
-            or probe_values["glance_data_probe_results"] != common_glance
+            or semantic_glance != common_glance
             or probe_values["glance_store_capabilities"] != common_stores
         ):
             raise ValueError("delegate phases do not share one API and query scope")
 
         phase_evidence_ids = []
+        phase_provenance = {
+            "delegate": delegate,
+            "phase_id": phase["phase_id"],
+            "phase_binding_sha256": expected_binding,
+            "observed_at": phase_observed_at,
+        }
         for item in probe_values["storage_probe_results"]:
             evidence_id = item.get("evidence_id") if isinstance(item, dict) else None
             if (
@@ -238,7 +281,12 @@ def merge_probe_documents(side, key, phases):
                 raise ValueError("delegate storage evidence identity is invalid")
             evidence_ids.add(evidence_id)
             phase_evidence_ids.append(evidence_id)
-            storage.append(deepcopy(item))
+            if not _EVIDENCE_METADATA_KEYS.issubset(item):
+                raise ValueError("delegate storage evidence metadata is invalid")
+            storage.append({
+                **deepcopy(item),
+                "delegate_provenance": [deepcopy(phase_provenance)],
+            })
         glance_evidence_ids = []
         for item in probe_values["glance_data_probe_results"]:
             evidence_id = item.get("evidence_id") if isinstance(item, dict) else None
@@ -251,13 +299,43 @@ def merge_probe_documents(side, key, phases):
             "phase_binding_sha256": expected_binding,
             "storage_evidence_ids": sorted(phase_evidence_ids),
             "glance_evidence_ids": sorted(glance_evidence_ids),
+            "observed_at": phase_observed_at,
         })
 
     merged_api_base = deepcopy(common_api)
+    merged_api_base["observed_at"] = max(observed_timestamps)[1]
     merged_api_base["storage_probe_results"] = sorted(
         storage, key=lambda item: item["evidence_id"],
     )
-    merged_api_base["glance_data_probe_results"] = deepcopy(common_glance)
+    merged_glance = []
+    for item in common_glance:
+        evidence_id = item["evidence_id"]
+        acquisitions = glance_acquisitions.get(evidence_id, [])
+        if len(acquisitions) != len(ordered):
+            raise ValueError("delegate Glance acquisition set is incomplete")
+        latest = max(
+            acquisitions,
+            key=lambda value: datetime.fromisoformat(
+                value["metadata"]["observed_at"].replace("Z", "+00:00")
+            ),
+        )
+        merged_glance.append({
+            **deepcopy(item),
+            **deepcopy(latest["metadata"]),
+            "delegate_provenance": [
+                {
+                    key: deepcopy(acquisition[key])
+                    for key in (
+                        "delegate", "phase_id", "phase_binding_sha256",
+                        "observed_at",
+                    )
+                }
+                for acquisition in sorted(
+                    acquisitions, key=lambda value: value["delegate"]
+                )
+            ],
+        })
+    merged_api_base["glance_data_probe_results"] = merged_glance
     merged_api_base["glance_store_capabilities"] = deepcopy(common_stores)
     merged_api_base["probe_delegate_provenance"] = provenance
     api_base = {

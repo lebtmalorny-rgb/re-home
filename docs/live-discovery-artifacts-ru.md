@@ -44,7 +44,9 @@ sibling lock, а orchestration отдельно владеет
 `raw_artifact_ref`. Timestamp обязан содержать timezone, return code — целое
 число, stderr хранится только как SHA-256. `raw_artifact_ref` указывает на
 защищённый run-local источник вида `protected://<side>/<evidence-id>` и не
-содержит raw secrets. Допустимы только следующие kinds и exact дополнительные
+содержит raw secrets. Эти поля берутся из конкретной операции acquisition:
+consumer не подставляет `rc=0`, фиктивный timestamp, пустой digest или
+синтетическую ссылку при их отсутствии. Допустимы только следующие kinds и exact дополнительные
 поля:
 
 | Kind | Обязательные дополнительные поля |
@@ -52,8 +54,8 @@ sibling lock, а orchestration отдельно владеет
 | `openstack-json` | `command` (непустой argv list) |
 | `runtime-command` | `command` (непустой argv list) |
 | `db-jsonl` | `schema`, `table`, непустой `filters` |
-| `storage-probe` | `resource_id`, `backend_kind`, `backend_identity`, `resource_identity`, `resource_fingerprint`, `scope`, `expected_size`, `observed_size`, `status` |
-| `glance-range` | `resource_id`, `endpoint_origin`, `expected_size`, `observed_size`, `required`, непустой `store_ids`, `status` |
+| `storage-probe` | `resource_id`, `backend_kind`, `backend_identity`, `resource_identity`, `resource_fingerprint`, `scope`, `expected_size`, `observed_size`, `status`, `delegate_provenance` |
+| `glance-range` | `resource_id`, `endpoint_origin`, `expected_size`, `observed_size`, `required`, непустой `store_ids`, `status`, `delegate_provenance` |
 | `cinder-connection` | `volume_id`, `attachment_id`, `backend_kind`, `backend_id`, `resource_identity`, `resource_fingerprint` |
 | `source-cell-mapping` | `host`, `cell_uuid`, `database_schema` |
 | `api-absence` | `command`, `resource_id`, `status_code=404` |
@@ -64,6 +66,18 @@ sibling lock, а orchestration отдельно владеет
 target фиксируется как `api-absence` и проверка `UNKNOWN`; 403, отсутствие
 endpoint и invalid JSON остаются ошибками входа. Raw stdout/stderr, tokens и
 connection data в index отсутствуют.
+
+Для каждого reviewed DB SELECT рядом с `.jsonl` и `.rc` создаётся
+`<query-id>.evidence.json`. Sidecar содержит фактические `observed_at`, rc,
+failure class, SHA-256 stderr и ссылку на защищённый raw stderr. Ненулевой rc
+не теряется и не маскируется ошибкой парсинга пустого JSONL: combine сохраняет
+entry и выпускает типизированную проверку `BLOCKED`. Отсутствующий,
+несовпадающий или malformed sidecar отклоняется fail-closed.
+
+`delegate_provenance` содержит проверенные `delegate`, `phase_id`,
+`phase_binding_sha256` и `observed_at` каждой probe phase. Разные timestamps
+делегатов допустимы; timestamp итоговой API phase выбирается детерминированно,
+а provenance отдельных storage/Glance результатов не удаляется.
 
 ## Защищённый файл
 

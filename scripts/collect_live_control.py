@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from live_discovery.mysql_json import build_json_row_query, validate_identifier
+from live_discovery.db_evidence import SCHEMA_VERSION as DB_EVIDENCE_VERSION
 from live_discovery.cinder import CinderCollector, CORE_TABLES as CINDER_CORE_TABLES, OPTIONAL_TABLES as CINDER_OPTIONAL_TABLES
 from live_discovery.contract import CheckResult, CollectorResult
 from live_discovery.glance import GlanceCollector
@@ -380,13 +381,14 @@ def _endpoint_origin(value):
 
 def _execute_probe_config(
     config, runner, *, opener=None, token_loader=_load_protected_token,
-    catalog_origin=None, image_store_ids=None,
+    catalog_origin=None, image_store_ids=None, side=None, observed_at=None,
 ):
     if not isinstance(config, dict) or set(config) != {"schema_version", "storage", "glance"} or config.get("schema_version") != "openstack-rehome-probe-config/v1alpha1":
         raise ValueError("probe configuration envelope is invalid")
     if not isinstance(config["storage"], list) or len(config["storage"]) > 4096:
         raise ValueError("storage probe configuration is invalid")
     storage_results = []
+    acquired_at = observed_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for item in config["storage"]:
         if not isinstance(item, dict) or set(item) != {"volume_id", "scope", "kind", "backend_id", "resource"}:
             raise ValueError("storage probe row is invalid")
@@ -394,9 +396,15 @@ def _execute_probe_config(
         if volume_id is None or item["scope"] not in {"source-compute", "target-storage"} or not isinstance(item["kind"], str) or not isinstance(item["backend_id"], str) or _SAFE_ROOT.fullmatch(item["backend_id"]) is None:
             raise ValueError("storage probe identity is invalid")
         observed = [None]
+        command_evidence = [None]
         class RecordingRunner:
             def run(self, argv, evidence_id):
-                artifact = runner.run(argv, evidence_id)
+                try:
+                    artifact = runner.run(argv, evidence_id)
+                except ProbeFailed as error:
+                    command_evidence[0] = error.evidence
+                    raise
+                command_evidence[0] = artifact
                 observed[0] = _storage_parse_size("nfs" if item["kind"] == "file" else item["kind"], getattr(artifact, "stdout", None))
                 return artifact
         check = probe_storage(item["kind"], item["resource"], RecordingRunner())
@@ -410,6 +418,17 @@ def _execute_probe_config(
         }.get(item["kind"], str(resource.get("backend_id", "unsupported")))
         probe_kind = "nfs" if item["kind"] == "file" else item["kind"]
         evidence_id = f"storage:{volume_id}:{item['scope']}:{probe_kind}:{item['backend_id']}"
+        probe_side = side or ("source" if item["scope"] == "source-compute" else "target")
+        if probe_side not in {"source", "target"}:
+            raise ValueError("storage probe side is invalid")
+        artifact = command_evidence[0]
+        returncode = getattr(artifact, "returncode", 0)
+        stderr = getattr(artifact, "stderr", "")
+        failure_class = (
+            "command-failed" if returncode != 0
+            else None if check.status in {"PASS", "WARN"}
+            else "probe-" + check.status.lower()
+        )
         resource_fingerprint = hashlib.sha256(f"{probe_kind}:{scoped_resource}".encode("utf-8")).hexdigest()
         storage_results.append({
             "volume_id": volume_id, "scope": item["scope"], "kind": probe_kind,
@@ -417,6 +436,11 @@ def _execute_probe_config(
             "resource_fingerprint": resource_fingerprint,
             "expected_size": resource.get("expected_size"), "observed_size": observed[0],
             "evidence_id": evidence_id, "status": check.status, "reason": check.reason,
+            "observed_at": acquired_at,
+            "returncode": returncode,
+            "failure_class": failure_class,
+            "stderr_sha256": hashlib.sha256(str(stderr).encode("utf-8")).hexdigest(),
+            "raw_artifact_ref": f"protected://{probe_side}/storage/{evidence_id}",
         })
     glance = config["glance"]
     if not isinstance(glance, dict) or set(glance) not in (
@@ -479,6 +503,14 @@ def _execute_probe_config(
                 "store_ids": sorted(stores_for_image),
                 "evidence_id": f"glance-range:{image_id}",
                 "status": check.status, "reason": check.reason,
+                "observed_at": acquired_at,
+                "returncode": 0,
+                "failure_class": (
+                    None if check.status in {"PASS", "WARN"}
+                    else "probe-" + check.status.lower()
+                ),
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                "raw_artifact_ref": f"protected://{side or 'source'}/glance/glance-range:{image_id}",
             })
     finally:
         token = None
@@ -615,8 +647,20 @@ class _CombinedClient:
             and set(item.get("store_ids", [])).issubset(set(capability_store_ids))
             and item.get("endpoint_origin") == trusted_origin
         ]
-        expected_keys = {"image_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "evidence_id", "status", "reason"}
-        if len(matches) != 1 or set(matches[0]) != expected_keys or not matches[0]["endpoint_origin"] or not matches[0]["store_ids"]:
+        expected_keys = {
+            "image_id", "endpoint_origin", "expected_size", "observed_size",
+            "required", "store_ids", "evidence_id", "status", "reason",
+            "observed_at", "returncode", "failure_class", "stderr_sha256",
+            "raw_artifact_ref",
+        }
+        if (
+            len(matches) != 1
+            or set(matches[0]) not in (
+                expected_keys, expected_keys | {"delegate_provenance"}
+            )
+            or not matches[0]["endpoint_origin"]
+            or not matches[0]["store_ids"]
+        ):
             return CheckResult(
                 f"glance.image-data.{image_id}", "UNKNOWN",
                 "Glance image data probe evidence is missing",
@@ -802,8 +846,16 @@ def _integrate_storage_readiness(result, volume_ids, api_result):
         ]
         scopes = set()
         for item in matches:
-            expected_keys = {"volume_id", "scope", "kind", "backend_identity", "resource_identity", "resource_fingerprint", "expected_size", "observed_size", "evidence_id", "status", "reason"}
-            if set(item) != expected_keys:
+            expected_keys = {
+                "volume_id", "scope", "kind", "backend_identity",
+                "resource_identity", "resource_fingerprint", "expected_size",
+                "observed_size", "evidence_id", "status", "reason",
+                "observed_at", "returncode", "failure_class",
+                "stderr_sha256", "raw_artifact_ref",
+            }
+            if set(item) not in (
+                expected_keys, expected_keys | {"delegate_provenance"}
+            ):
                 continue
             scope = item["scope"]
             kind = item["kind"]
@@ -1028,19 +1080,52 @@ def _compose_collectors(side, api_result, records, evidence, snapshot, sensitive
 
 def _build_evidence_index(side, collectors, api_result, db_evidence):
     by_id = {}
-    observed_at = api_result.get("observed_at", "1970-01-01T00:00:00Z")
-    if not isinstance(observed_at, str) or not observed_at:
+    observed_at = api_result.get("observed_at")
+    try:
+        parsed_observed_at = datetime.fromisoformat(
+            observed_at.replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError):
+        raise ValueError("evidence acquisition timestamp is invalid") from None
+    if parsed_observed_at.tzinfo is None:
         raise ValueError("evidence acquisition timestamp is invalid")
+
+    def metadata(returncode, failure_class, stderr_sha256, raw_artifact_ref, timestamp=observed_at):
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            raise ValueError("evidence metadata is invalid") from None
+        if (
+            parsed.tzinfo is None
+            or not isinstance(returncode, int)
+            or isinstance(returncode, bool)
+            or (failure_class is not None and (
+                not isinstance(failure_class, str) or not failure_class
+            ))
+            or not isinstance(stderr_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", stderr_sha256) is None
+            or not isinstance(raw_artifact_ref, str)
+            or not raw_artifact_ref.startswith(f"protected://{side}/")
+        ):
+            raise ValueError("evidence metadata is invalid")
+        return {
+            "observed_at": timestamp,
+            "returncode": returncode,
+            "failure_class": failure_class,
+            "stderr_sha256": stderr_sha256,
+            "raw_artifact_ref": raw_artifact_ref,
+        }
+
     def add(entry):
         entry = deepcopy(entry)
         identity = entry.get("evidence_id")
         if not isinstance(identity, str) or not identity:
             raise ValueError("evidence identity is invalid")
-        entry.setdefault("observed_at", observed_at)
-        entry.setdefault("returncode", 0)
-        entry.setdefault("failure_class", None)
-        entry.setdefault("stderr_sha256", hashlib.sha256(b"").hexdigest())
-        entry.setdefault("raw_artifact_ref", f"protected://{side}/{identity}")
+        metadata(
+            entry.get("returncode"), entry.get("failure_class"),
+            entry.get("stderr_sha256"), entry.get("raw_artifact_ref"),
+            entry.get("observed_at"),
+        )
         identity = entry["evidence_id"]
         if identity in by_id and by_id[identity] != entry:
             raise ValueError("evidence index identity conflicts")
@@ -1055,6 +1140,11 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
                 else service_by_schema.get(raw["schema"], raw["schema"])
             ),
             "schema":raw["schema"], "table":raw["table"], "filters":deepcopy(raw["filters"]),
+            **metadata(
+                raw.get("returncode"), raw.get("failure_class"),
+                raw.get("stderr_sha256"), raw.get("raw_artifact_ref"),
+                raw.get("observed_at"),
+            ),
         }
         if entry["evidence_id"] in by_id:
             existing = by_id[entry["evidence_id"]]
@@ -1066,6 +1156,9 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
         else:
             add(entry)
 
+    probe_statuses = api_result.get("probe_statuses", {})
+    if not isinstance(probe_statuses, dict):
+        raise ValueError("capability probe statuses are invalid")
     for entry in api_result.get("capability_evidence", []):
         common = {"evidence_id", "kind", "side", "service", "command"}
         if (
@@ -1077,7 +1170,17 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             or not all(isinstance(value, str) and value for value in entry["command"])
         ):
             raise ValueError("capability evidence is invalid")
-        add(deepcopy(entry))
+        status = probe_statuses.get(entry["evidence_id"])
+        if not isinstance(status, dict):
+            raise ValueError("capability evidence metadata is missing")
+        add({
+            **deepcopy(entry),
+            **metadata(
+                status.get("returncode"), status.get("failure_class"),
+                status.get("stderr_sha256"),
+                f"protected://{side}/capability/{entry['evidence_id']}",
+            ),
+        })
 
     cell_mapping = api_result.get("source_cell_mapping")
     if cell_mapping is not None:
@@ -1091,6 +1194,10 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             "host": cell_mapping["host"],
             "cell_uuid": cell_mapping["uuid"],
             "database_schema": cell_mapping["database_schema"],
+            **metadata(
+                0, None, hashlib.sha256(b"").hexdigest(),
+                f"protected://source/cell-mapping/{cell_mapping['evidence_id']}",
+            ),
         })
 
     for absence in api_result.get("expected_absences", []):
@@ -1106,6 +1213,9 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             "status_code": absence.get("status_code"),
             "returncode": 1,
             "failure_class": absence.get("failure_class"),
+            "observed_at": absence.get("observed_at"),
+            "stderr_sha256": absence.get("stderr_sha256"),
+            "raw_artifact_ref": absence.get("raw_artifact_ref"),
         })
 
     for summary in api_result.get("cinder_connection_summaries", []):
@@ -1118,6 +1228,10 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             "attachment_id": summary["attachment_id"], "backend_kind": summary["backend_kind"],
             "backend_id": summary["backend_id"], "resource_identity": summary["resource_identity"],
             "resource_fingerprint": summary["resource_fingerprint"],
+            **metadata(
+                0, None, hashlib.sha256(b"").hexdigest(),
+                f"protected://{side}/cinder-connection/{summary['evidence_id']}",
+            ),
         })
 
     cached = {}
@@ -1136,16 +1250,6 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
     glance = {item.get("evidence_id"): item for item in api_result.get("glance_data_probe_results", []) if isinstance(item, dict)}
     references = {}
     for collector in collectors:
-        for entry in collector.get("evidence", []):
-            if (
-                isinstance(entry, dict)
-                and set(entry) == {"evidence_id", "kind", "side", "service", "command"}
-                and entry.get("kind") in {"openstack-json", "runtime-command"}
-                and entry.get("side") == side
-                and entry.get("service") == collector.get("service")
-                and isinstance(entry.get("command"), list) and entry["command"]
-            ):
-                add(deepcopy(entry))
         provenance = (collector["side"], collector["service"])
         for item in [*collector["nodes"], *collector["checks"]]:
             for identity in item["evidence_ids"]:
@@ -1161,23 +1265,27 @@ def _build_evidence_index(side, collectors, api_result, db_evidence):
             item = storage[identity]
             add({"evidence_id":identity,"kind":"storage-probe","side":side,"service":service,
                  "resource_id":item["volume_id"],"backend_kind":item["kind"],"backend_identity":item["backend_identity"],"resource_identity":item["resource_identity"],
-                 "resource_fingerprint":item["resource_fingerprint"],"scope":item["scope"],"expected_size":item["expected_size"],"observed_size":item["observed_size"],"status":item["status"]})
+                 "resource_fingerprint":item["resource_fingerprint"],"scope":item["scope"],"expected_size":item["expected_size"],"observed_size":item["observed_size"],"status":item["status"],
+                 **metadata(item.get("returncode"), item.get("failure_class"), item.get("stderr_sha256"), item.get("raw_artifact_ref"), item.get("observed_at")),
+                 "delegate_provenance": deepcopy(item.get("delegate_provenance", []))})
         elif identity in glance:
             item = glance[identity]
             add({"evidence_id":identity,"kind":"glance-range","side":side,"service":service,
                  "resource_id":item["image_id"],"endpoint_origin":item["endpoint_origin"],"expected_size":item["expected_size"],
-                 "observed_size":item["observed_size"],"required":item["required"],"store_ids":deepcopy(item["store_ids"]),"status":item["status"]})
+                 "observed_size":item["observed_size"],"required":item["required"],"store_ids":deepcopy(item["store_ids"]),"status":item["status"],
+                 **metadata(item.get("returncode"), item.get("failure_class"), item.get("stderr_sha256"), item.get("raw_artifact_ref"), item.get("observed_at")),
+                 "delegate_provenance": deepcopy(item.get("delegate_provenance", []))})
         elif identity in cached:
             acquired = cached[identity]
-            metadata = acquired.get("evidence", {})
+            acquisition_metadata = acquired.get("evidence", {})
             add({
                 "evidence_id":identity,"kind":"openstack-json","side":side,
                 "service":service,"command":acquired["command"],
-                "returncode": metadata.get("returncode", 0),
-                "failure_class": metadata.get("failure_class"),
-                "stderr_sha256": metadata.get(
-                    "stderr_sha256", hashlib.sha256(b"").hexdigest()
-                ),
+                "returncode": acquisition_metadata.get("returncode"),
+                "failure_class": acquisition_metadata.get("failure_class"),
+                "stderr_sha256": acquisition_metadata.get("stderr_sha256"),
+                "observed_at": acquisition_metadata.get("observed_at"),
+                "raw_artifact_ref": acquisition_metadata.get("raw_artifact_ref"),
             })
         else:
             raise ValueError(f"collector evidence is absent from acquired closure: {identity}")
@@ -1658,6 +1766,7 @@ def _api_phase(args):
         if not all(required):
             raise ValueError("live API arguments are incomplete")
         from live_discovery.openstack import OpenStackClient
+        phase_observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         client = OpenStackClient(ReadOnlyRunner(), args.cloud, args.container, str(args.clouds_file))
         cached = []
         acquired = {}
@@ -1686,9 +1795,31 @@ def _api_phase(args):
                     "resource_id": resource_id,
                     "status_code": 404,
                     "failure_class": "not-found",
+                    "observed_at": phase_observed_at,
+                    "stderr_sha256": getattr(error, "stderr_sha256", None),
+                    "raw_artifact_ref": f"protected://{args.side}/api-failure/{evidence_id}",
                 })
                 acquired[key] = None
                 return None
+            if not isinstance(evidence, dict):
+                raise ValueError("OpenStack acquisition evidence is invalid")
+            identity = evidence.get("evidence_id") or evidence.get("id")
+            if (
+                identity != evidence_id
+                or not isinstance(evidence.get("returncode"), int)
+                or isinstance(evidence.get("returncode"), bool)
+                or evidence.get("returncode") != 0
+                or evidence.get("failure_class") is not None
+                or not isinstance(evidence.get("stderr_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", evidence["stderr_sha256"])
+                is None
+            ):
+                raise ValueError("OpenStack acquisition evidence is invalid")
+            evidence = {
+                **deepcopy(evidence),
+                "observed_at": phase_observed_at,
+                "raw_artifact_ref": f"protected://{args.side}/openstack/{evidence_id}",
+            }
             cached.append({"command": list(command), "payload": value, "evidence": evidence})
             acquired[key] = deepcopy(value)
             return value
@@ -1734,7 +1865,7 @@ def _api_phase(args):
             "roots": roots, "available_tables": sorted(snapshot.tables),
             "openstack": cached,
             "image_store_ids": image_store_ids,
-            "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "observed_at": phase_observed_at,
         }
         cell_mapping_path = getattr(args, "source_cell_mapping", None)
         if args.side == "source" and cell_mapping_path is not None:
@@ -1790,6 +1921,8 @@ def _api_phase(args):
             _read_protected_json(args.probe_config), ReadOnlyRunner(),
             catalog_origin=payload["api_result"].get("glance_catalog_origin"),
             image_store_ids=payload["api_result"].get("image_store_ids"),
+            side=args.side,
+            observed_at=payload["api_result"].get("observed_at"),
         )
         for key, value in probe_results.items():
             if key in payload["api_result"]:
@@ -1798,7 +1931,10 @@ def _api_phase(args):
     if args.capability_config is not None:
         capability = _read_protected_json(args.capability_config)
         if args.side == "source":
-            required = {"schema_version", "schema_capabilities", "capability_evidence"}
+            required = {
+                "schema_version", "schema_capabilities", "capability_evidence",
+                "probe_statuses",
+            }
             allowed = required
             valid_version = "openstack-rehome-source-capability-input/v1alpha1"
             error_message = "source capability input is invalid"
@@ -1862,6 +1998,40 @@ def _read_jsonl(path, query):
                 raise ValueError("DB JSONL row is outside query scope")
             records.append(record)
     return records
+
+
+def _read_db_evidence(path, query, side):
+    payload = _read_json(path)
+    expected = {
+        "schema_version", "query_id", "evidence_id", "observed_at",
+        "returncode", "failure_class", "stderr_sha256", "raw_artifact_ref",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("schema_version") != DB_EVIDENCE_VERSION
+        or payload.get("query_id") != query["query_id"]
+        or payload.get("evidence_id") != f"{side}-db:{query['query_id']}"
+        or not isinstance(payload.get("returncode"), int)
+        or isinstance(payload.get("returncode"), bool)
+        or payload.get("failure_class") != (
+            None if payload.get("returncode") == 0 else "command-failed"
+        )
+        or not isinstance(payload.get("stderr_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["stderr_sha256"]) is None
+        or payload.get("raw_artifact_ref")
+        != f"protected://{side}/db-stderr/{query['query_id']}.stderr"
+    ):
+        raise ValueError("DB evidence sidecar is invalid")
+    try:
+        observed = datetime.fromisoformat(
+            payload["observed_at"].replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError):
+        raise ValueError("DB evidence sidecar is invalid") from None
+    if observed.tzinfo is None:
+        raise ValueError("DB evidence sidecar is invalid")
+    return payload
 
 
 def _verified_query_plan(args):
@@ -2000,8 +2170,15 @@ def _target_absence_checks(side, api_result):
     for index, item in enumerate(values, start=1):
         expected = {
             "evidence_id", "command", "resource_id", "status_code",
-            "failure_class",
+            "failure_class", "observed_at", "stderr_sha256",
+            "raw_artifact_ref",
         }
+        try:
+            observed = datetime.fromisoformat(
+                item.get("observed_at", "").replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError):
+            observed = None
         if (
             not isinstance(item, dict)
             or set(item) != expected
@@ -2014,6 +2191,12 @@ def _target_absence_checks(side, api_result):
             or not item["resource_id"]
             or item["status_code"] != 404
             or item["failure_class"] != "not-found"
+            or observed is None
+            or observed.tzinfo is None
+            or not isinstance(item["stderr_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["stderr_sha256"]) is None
+            or not isinstance(item["raw_artifact_ref"], str)
+            or not item["raw_artifact_ref"].startswith("protected://target/")
         ):
             raise ValueError("expected target absence evidence is invalid")
         checks.append(CheckResult(
@@ -2062,12 +2245,15 @@ def _combine_phase(args):
         raise ValueError("UUID filters differ from query plan")
     _validate_query_coverage(args.side, api["api_result"], plan["queries"])
     db_dir = Path(args.db_jsonl_dir)
-    if _has_symlink_component(db_dir) or not db_dir.is_dir() or len(list(db_dir.iterdir())) > _MAX_QUERIES * 2:
+    if _has_symlink_component(db_dir) or not db_dir.is_dir() or len(list(db_dir.iterdir())) > _MAX_QUERIES * 3:
         raise ValueError("DB output directory is unsafe")
     expected_outputs = {
         name
         for query in plan["queries"] if isinstance(query, dict)
-        for name in (query.get("jsonl_file"), query.get("rc_file"))
+        for name in (
+            query.get("jsonl_file"), query.get("rc_file"),
+            f"{query.get('query_id')}.evidence.json",
+        )
         if isinstance(name, str)
     }
     actual_outputs = {entry.name for entry in db_dir.iterdir()}
@@ -2075,6 +2261,7 @@ def _combine_phase(args):
         raise ValueError("DB output set does not match query plan")
     records = []
     evidence = []
+    db_failures = []
     for query_index, query in enumerate(plan["queries"], start=1):
         expected = {"query_id", "schema", "table", "columns", "filters", "sql", "jsonl_file", "rc_file"}
         if not isinstance(query, dict) or set(query) != expected or not query["filters"]:
@@ -2108,17 +2295,52 @@ def _combine_phase(args):
             raise ValueError("DB query filenames are invalid")
         rc_path = db_dir / query["rc_file"]
         output_path = db_dir / query["jsonl_file"]
-        if rc_path.parent != db_dir or output_path.parent != db_dir or rc_path.is_symlink() or output_path.is_symlink() or not rc_path.is_file():
+        evidence_path = db_dir / f"{query['query_id']}.evidence.json"
+        if (
+            rc_path.parent != db_dir
+            or output_path.parent != db_dir
+            or evidence_path.parent != db_dir
+            or rc_path.is_symlink()
+            or output_path.is_symlink()
+            or evidence_path.is_symlink()
+            or not rc_path.is_file()
+        ):
             raise ValueError("DB query status is missing")
-        if rc_path.stat().st_size > 16 or rc_path.read_text(encoding="ascii").strip() != "0":
-            raise ValueError("DB query failed")
-        rows = _read_jsonl(output_path, query)
-        key = f"{query['schema']}.{query['table']}"
+        if rc_path.stat().st_size > 16:
+            raise ValueError("DB query status is invalid")
+        try:
+            returncode = int(rc_path.read_text(encoding="ascii").strip())
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("DB query status is invalid") from None
+        if returncode < 0 or returncode > 255:
+            raise ValueError("DB query status is invalid")
+        acquisition = _read_db_evidence(evidence_path, query, args.side)
+        if acquisition["returncode"] != returncode:
+            raise ValueError("DB query status differs from its evidence sidecar")
+        rows = _read_jsonl(output_path, query) if returncode == 0 else []
         record_identity = (query["schema"], query["table"], _canonical(query["filters"]))
         if any((item["schema"], item["table"], _canonical(item["filters"])) == record_identity for item in records):
             raise ValueError("DB query output is duplicated")
         records.append({"schema": query["schema"], "table": query["table"], "filters": deepcopy(query["filters"]), "rows": rows})
-        evidence.append({"evidence_id": f"{args.side}-db:{key}", "kind": "db-jsonl", "schema": query["schema"], "table": query["table"], "filters": deepcopy(query["filters"])})
+        evidence.append({
+            "evidence_id": acquisition["evidence_id"],
+            "kind": "db-jsonl",
+            "schema": query["schema"],
+            "table": query["table"],
+            "filters": deepcopy(query["filters"]),
+            "observed_at": acquisition["observed_at"],
+            "returncode": acquisition["returncode"],
+            "failure_class": acquisition["failure_class"],
+            "stderr_sha256": acquisition["stderr_sha256"],
+            "raw_artifact_ref": acquisition["raw_artifact_ref"],
+        })
+        if returncode != 0:
+            db_failures.append(CheckResult(
+                f"control.{args.side}.db-query.{query['query_id']}",
+                "BLOCKED",
+                f"reviewed DB query failed with return code {returncode}",
+                evidence_ids=[acquisition["evidence_id"]],
+            ).to_dict())
     # Parse/validate the two policy inputs now; service collectors consume these
     # exact documents in the next orchestration layer.
     if _has_symlink_component(args.information_schema) or not args.information_schema.is_file() or args.information_schema.stat().st_size > _MAX_FILE:
@@ -2169,6 +2391,7 @@ def _combine_phase(args):
         "schema_version": BUNDLE_VERSION,
         "collectors": collectors,
         "checks": [
+            *db_failures,
             *_closure_checks(args.side, cache_misses, db_cache_misses),
             *_target_absence_checks(args.side, api["api_result"]),
         ],

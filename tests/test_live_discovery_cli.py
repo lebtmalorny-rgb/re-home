@@ -19,9 +19,42 @@ import collect_live_control as control
 from live_discovery.contract import CheckResult, CollectorResult, DependencyEdge, ResourceNode
 from collect_live_control import _CombinedClient, _TABLE_ROOT_FILTERS, _api_phase, _collector_table_catalog, _execute_probe_config, _expected_plan_tables, _integrate_storage_readiness, _phase_binding, _read_protected_json, _root_filter_values
 from live_discovery.cinder import CORE_TABLES as CINDER_CORE, OPTIONAL_TABLES as CINDER_OPTIONAL
+from live_discovery.db_evidence import build_db_evidence
 from live_discovery.neutron import CORE_TABLES as NEUTRON_CORE, OPTIONAL_TABLE_FAMILIES as NEUTRON_OPTIONAL
 from live_discovery.nova import DB_SCHEMAS, DB_TABLES
 from live_discovery.schema import SchemaSnapshot
+
+
+def _write_db_evidence(directory, query, side="source", returncode=0, stderr=""):
+    payload = build_db_evidence({
+        "side": side,
+        "query_id": query["query_id"],
+        "returncode": returncode,
+        "observed_at": "2026-07-12T09:00:00Z",
+        "stderr": stderr,
+    })
+    (directory / f"{query['query_id']}.evidence.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def _api_evidence(evidence_id):
+    return {
+        "evidence_id": evidence_id,
+        "returncode": 0,
+        "failure_class": None,
+        "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+    }
+
+
+def _probe_metadata(side, category, evidence_id):
+    return {
+        "observed_at": "2026-07-12T09:00:00Z",
+        "returncode": 0,
+        "failure_class": None,
+        "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+        "raw_artifact_ref": f"protected://{side}/{category}/{evidence_id}",
+    }
 
 
 class LiveDiscoveryCliTests(unittest.TestCase):
@@ -37,12 +70,12 @@ class LiveDiscoveryCliTests(unittest.TestCase):
 
             def json(self, command, evidence_id):
                 if command[:2] == ["server", "list"]:
-                    return [], {"id": evidence_id}
+                    return [], _api_evidence(evidence_id)
                 if command[:3] in (
                     ["compute", "service", "list"],
                     ["resource", "provider", "list"],
                 ):
-                    return [], {"id": evidence_id}
+                    return [], _api_evidence(evidence_id)
                 evidence = control.CommandEvidence(
                     evidence_id,
                     [str(value) for value in command],
@@ -118,6 +151,12 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 "resource_id": resource_id,
                 "status_code": 404,
                 "failure_class": "not-found",
+                "observed_at": "2026-07-12T09:00:00Z",
+                "stderr_sha256": hashlib.sha256(b"not found").hexdigest(),
+                "raw_artifact_ref": (
+                    f"protected://target/api-failure/"
+                    f"nova-target-server-show-{resource_id}"
+                ),
             }],
         }
 
@@ -237,6 +276,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             for query in plan["queries"]:
                 (db/query["rc_file"]).write_text("0\n",encoding="ascii")
                 (db/query["jsonl_file"]).write_text("",encoding="utf-8")
+                _write_db_evidence(db, query)
             rejected = subprocess.run([sys.executable,"scripts/collect_live_control.py","--phase","combine","--side","source","--api-result",str(api/"api-result.json"),"--db-jsonl-dir",str(db),"--information-schema",str(FIXTURES/"control-information-schema.tsv"),"--schema-policy",str(FIXTURES/"schema-policy.json"),"--out",str(root/"out")],cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
             self.assertEqual(3, rejected.returncode)
             with mock.patch.dict("os.environ",{"LIVE_PHASE_KEY":"fixture-only-phase-integrity-anchor-v1"}):
@@ -265,7 +305,10 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 "evidence": {
                     "evidence_id": evidence_id,
                     "returncode": 0,
+                    "failure_class": None,
                     "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                    "observed_at": "2026-07-12T09:00:00Z",
+                    "raw_artifact_ref": f"protected://source/{evidence_id}",
                 },
             }],
         }
@@ -282,10 +325,49 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             f"protected://source/{evidence_id}", entry["raw_artifact_ref"]
         )
 
+    def test_db_evidence_preserves_failed_sidecar_metadata_and_rejects_missing(self):
+        stderr_digest = hashlib.sha256(b"database unavailable").hexdigest()
+        failed = {
+            "evidence_id": "source-db:0001-nova-instances",
+            "kind": "db-jsonl",
+            "schema": "nova",
+            "table": "instances",
+            "filters": {"uuid": ["11111111-1111-1111-1111-111111111111"]},
+            "observed_at": "2026-07-12T09:00:07Z",
+            "returncode": 7,
+            "failure_class": "command-failed",
+            "stderr_sha256": stderr_digest,
+            "raw_artifact_ref": (
+                "protected://source/db-stderr/0001-nova-instances.stderr"
+            ),
+        }
+
+        entry = control._build_evidence_index(
+            "source",
+            [],
+            {"observed_at": "2026-07-12T09:00:00Z", "openstack": []},
+            [failed],
+        )[0]
+
+        self.assertEqual(7, entry["returncode"])
+        self.assertEqual("command-failed", entry["failure_class"])
+        self.assertEqual(stderr_digest, entry["stderr_sha256"])
+        self.assertEqual(failed["raw_artifact_ref"], entry["raw_artifact_ref"])
+
+        missing = dict(failed)
+        del missing["stderr_sha256"]
+        with self.assertRaisesRegex(ValueError, "metadata"):
+            control._build_evidence_index(
+                "source",
+                [],
+                {"observed_at": "2026-07-12T09:00:00Z", "openstack": []},
+                [missing],
+            )
+
     def test_storage_pass_cannot_cross_backend_kind_or_resource(self):
         volume_id = "22222222-2222-2222-2222-222222222222"
         result = CollectorResult(service="cinder", side="source", nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/volume-2","resource_fingerprint":hashlib.sha256(b"rbd:volumes/volume-2").hexdigest(),"connection_evidence_ids":["connection-1"]})])
-        api = {"storage_probe_results":[{"volume_id":volume_id,"scope":"source-compute","kind":"nfs","backend_identity":"rbd-backend","resource_identity":"/srv/nfs/volume-2","resource_fingerprint":hashlib.sha256(b"nfs:/srv/nfs/volume-2").hexdigest(),"expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage-cross-kind","status":"PASS","reason":"ok"}]}
+        api = {"storage_probe_results":[{"volume_id":volume_id,"scope":"source-compute","kind":"nfs","backend_identity":"rbd-backend","resource_identity":"/srv/nfs/volume-2","resource_fingerprint":hashlib.sha256(b"nfs:/srv/nfs/volume-2").hexdigest(),"expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage-cross-kind","status":"PASS","reason":"ok",**_probe_metadata("source","storage","storage-cross-kind")}]}
         _integrate_storage_readiness(result,[volume_id],api)
         self.assertEqual("BLOCKED", result.checks[0].status)
         result2=CollectorResult(service="cinder",side="source",nodes=[ResourceNode("volume",volume_id,"source",{"size":1,"storage_backend_id":"rbd-backend","backend_kind":"rbd","resource_identity":"volumes/expected","resource_fingerprint":hashlib.sha256(b"rbd:volumes/expected").hexdigest(),"connection_evidence_ids":["connection-1"]})])
@@ -477,7 +559,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     payload = {"id":ids["trunk"],"sub_ports":[{"port_id":ids["child_port"]}]}
                 else:
                     payload = {"id": command[-4] if len(command) > 4 else ids["instance"]}
-                return payload, {"id":evidence_id}
+                return payload, _api_evidence(evidence_id)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "roots.json"
@@ -615,7 +697,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     payload = {"id":"44444444-4444-4444-4444-444444444444"}
                 else:
                     raise AssertionError(command)
-                return payload, {"id": evidence_id}
+                return payload, _api_evidence(evidence_id)
         with tempfile.TemporaryDirectory() as temporary:
             args = type("Args", (), {
                 "fixture": None, "rehome_host": "compute-023", "cloud": "cloud",
@@ -648,7 +730,25 @@ class LiveDiscoveryCliTests(unittest.TestCase):
 
     def test_target_live_like_all_collectors_have_zero_cache_misses_and_real_evidence(self):
         manage=json.loads((ROOT/"tests/fixtures/live_discovery/openstack-command-results.json").read_text())["manage_outputs"]
-        api={"openstack":[],"roots":{"ports":[],"volumes":[],"images":[],"projects":[]},"target_manage_outputs":manage,"target_image_inspects":{},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}]}
+        capability_ids = ("nova-online-data-migrations", "cinder-online-data-migrations")
+        api={"observed_at":"2026-07-12T09:00:00Z","openstack":[],"roots":{"ports":[],"volumes":[],"images":[],"projects":[]},"target_manage_outputs":manage,"target_image_inspects":{},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}],"probe_statuses":{identity:{"returncode":0,"failure_class":None,"stderr_sha256":hashlib.sha256(b"").hexdigest()} for identity in capability_ids}}
+        for identity in (
+            "runtime-target-virsh-version",
+            "runtime-target-domcapabilities",
+            "runtime-target-qemu-machine-help",
+        ):
+            api["capability_evidence"].append({
+                "evidence_id": identity,
+                "kind": "runtime-command",
+                "side": "target",
+                "service": "runtime-capabilities",
+                "command": [identity],
+            })
+            api["probe_statuses"][identity] = {
+                "returncode": 0,
+                "failure_class": None,
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+            }
         collectors,misses,db_misses=control._compose_collectors("target",api,[],[],SchemaSnapshot(tables={}))
         self.assertEqual([],misses)
         self.assertEqual([],db_misses)
@@ -754,7 +854,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 del required
                 key=tuple(command)
                 if key not in responses: raise AssertionError(f"unexpected OpenStack command: {command}")
-                return deepcopy(responses[key]),{"id":evidence_id}
+                return deepcopy(responses[key]),_api_evidence(evidence_id)
         class Runner:
             side="target"
             def run(self,argv,evidence_id,*args,**kwargs):
@@ -769,7 +869,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 for ordinal,column in enumerate(sorted(columns),start=1): lines.append(f"{schema}\t{table}\t{ordinal}\t{column}\tvarchar(255)\tYES\tNULL\t\\N")
             lines.extend(["SECTION:STATISTICS", "SECTION:FOREIGN_KEYS"])
             path.write_text("\n".join(lines)+"\n",encoding="utf-8")
-        def write_db(plan,path,missing_service_schema=None):
+        def write_db(plan,path,side_name,missing_service_schema=None):
             path.mkdir()
             for query in plan:
                 rows=[]
@@ -778,6 +878,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                     if any(candidate.get(column) in values for column,values in query["filters"].items()): rows.append({column:candidate.get(column) for column in query["columns"]})
                 (path/query["rc_file"]).write_text("0\n",encoding="ascii")
                 (path/query["jsonl_file"]).write_text("".join(json.dumps({"_schema":query["schema"],"_table":query["table"],"row":row})+"\n" for row in rows),encoding="utf-8")
+                _write_db_evidence(path, query, side=side_name)
         with tempfile.TemporaryDirectory() as temporary, mock.patch("live_discovery.openstack.OpenStackClient",ApiClient), mock.patch.object(control,"ReadOnlyRunner",Runner), mock.patch.object(control,"probe_image_data",return_value=CheckResult("glance.data","PASS","image byte is readable")), mock.patch.dict(os.environ,{"LIVE_DISCOVERY_PHASE_KEY":"phase-anchor-at-least-sixteen","LIVE_DISCOVERY_GLANCE_TOKEN":"ephemeral-token"}):
             root=Path(temporary); schema=root/"information-schema.tsv"; write_schema(schema)
             policy=FIXTURES/"schema-policy.json"
@@ -791,7 +892,24 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 capability_path=None
                 if side=="target":
                     manage=json.loads((ROOT/"tests/fixtures/live_discovery/openstack-command-results.json").read_text())["manage_outputs"]
-                    capability={"schema_version":"openstack-rehome-target-capability-input/v1alpha1","target_manage_outputs":manage,"target_image_inspects":{"nova_api":{"Config":{"Image":"quay.io/openstack.kolla/nova-api:2025.1-ubuntu-noble"},"Image":"sha256:nova-api"}},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"schema_capabilities":{"nova":{"release":"2025.1","distribution":"vanilla"}},"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}]}
+                    capability={"schema_version":"openstack-rehome-target-capability-input/v1alpha1","target_manage_outputs":manage,"target_image_inspects":{"nova_api":{"Config":{"Image":"quay.io/openstack.kolla/nova-api:2025.1-ubuntu-noble"},"Image":"sha256:nova-api"}},"target_runtime_outputs":{"runtime-target-virsh-version":"9.0.0","runtime-target-domcapabilities":"<domainCapabilities><devices><disk><enum name='bus'><value>virtio</value></enum></disk></devices></domainCapabilities>","runtime-target-qemu-machine-help":"Supported machines are:\npc-q35-8.2 fixture\n"},"target_virsh_argv":["virsh"],"target_qemu_argv":["qemu-system-x86_64"],"schema_capabilities":{"nova":{"release":"2025.1","distribution":"vanilla"}},"capability_evidence":[{"evidence_id":"nova-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["nova-manage","db","online_data_migrations"]},{"evidence_id":"cinder-online-data-migrations","kind":"runtime-command","side":"target","service":"target-profile","command":["cinder-manage","db","online_data_migrations"]}],"probe_statuses":{identity:{"returncode":0,"failure_class":None,"stderr_sha256":hashlib.sha256(b"").hexdigest()} for identity in ("nova-online-data-migrations","cinder-online-data-migrations")}}
+                    for identity in (
+                        "runtime-target-virsh-version",
+                        "runtime-target-domcapabilities",
+                        "runtime-target-qemu-machine-help",
+                    ):
+                        capability["capability_evidence"].append({
+                            "evidence_id": identity,
+                            "kind": "runtime-command",
+                            "side": "target",
+                            "service": "runtime-capabilities",
+                            "command": [identity],
+                        })
+                        capability["probe_statuses"][identity] = {
+                            "returncode": 0,
+                            "failure_class": None,
+                            "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                        }
                     capability_path=side_root/"capability.json"; capability_path.write_text(json.dumps(capability),encoding="utf-8"); capability_path.chmod(0o600)
                 api_dir=side_root/"api"
                 args=type("Args",(),{"fixture":None,"rehome_host":host,"cloud":"cloud","clouds_file":Path("/clouds.yaml"),"container":"toolbox","side":side,"information_schema":schema,"root_manifest":root_path,"probe_config":probe_path,"capability_config":capability_path,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_PHASE_KEY","out":api_dir})()
@@ -802,7 +920,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                         self.assertTrue(all(control._canonical_uuid(value) is not None for value in values),(side,category,values))
                 plan=json.loads((api_dir/"db-query-plan.json").read_text())["queries"]
                 if side=="source": self.assertTrue({("nova","services"),("cinder","services")}.issubset({(item["schema"],item["table"]) for item in plan}))
-                db_dir=side_root/"db"; write_db(plan,db_dir)
+                db_dir=side_root/"db"; write_db(plan,db_dir,side)
                 protected_entries=[{"evidence_id":f"cinder-{side}-connection-{attachment_id}","volume_id":ids["volume"],"attachment_id":attachment_id,"backend_kind":"rbd","backend_id":"rbd-backend","resource_identity":f"volumes/volume-{ids['volume']}","connector":{"host":host,"attachment_id":attachment_id,"volume_id":ids["volume"]},"connection_info":{"driver_volume_type":"rbd","data":{"name":f"volumes/volume-{ids['volume']}","pool":"volumes","image":f"volume-{ids['volume']}","hosts":["10.0.0.10"]}}} for attachment_id in (ids["attachment"],ids["attachment2"])]
                 sensitive={"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":side,"entries":protected_entries}
                 sensitive_path=side_root/"cinder-sensitive.json"; sensitive_path.write_text(json.dumps(sensitive),encoding="utf-8"); sensitive_path.chmod(0o600)
@@ -837,7 +955,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 self.assertTrue(referenced.issubset(evidence_ids))
                 if side=="source":
                     for missing_schema in ("nova","cinder"):
-                        missing_db=side_root/f"db-missing-{missing_schema}"; write_db(plan,missing_db,missing_schema)
+                        missing_db=side_root/f"db-missing-{missing_schema}"; write_db(plan,missing_db,side,missing_schema)
                         missing_out=side_root/f"combined-missing-{missing_schema}"
                         missing_args=type("Args",(),{**combine_values,"db_jsonl_dir":missing_db,"out":missing_out})()
                         control._combine_phase(missing_args)
@@ -880,7 +998,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             file_api_args=type("Args",(),{"fixture":None,"rehome_host":host,"cloud":"cloud","clouds_file":Path("/clouds.yaml"),"container":"toolbox","side":"source","information_schema":schema,"root_manifest":file_roots,"probe_config":file_probe_path,"capability_config":None,"phase_key_file":None,"phase_key_env":"LIVE_DISCOVERY_PHASE_KEY","out":file_api})()
             _api_phase(file_api_args)
             file_plan=json.loads((file_api/"db-query-plan.json").read_text())["queries"]
-            file_db=file_root/"db"; write_db(file_plan,file_db)
+            file_db=file_root/"db"; write_db(file_plan,file_db,"source")
             file_entries=[{"evidence_id":f"cinder-source-file-{attachment_id}","volume_id":ids["volume"],"attachment_id":attachment_id,"backend_kind":"file","backend_id":"rbd-backend","resource_identity":file_path,"connector":{"host":host,"attachment_id":attachment_id,"volume_id":ids["volume"]},"connection_info":{"driver_volume_type":"file","data":{"path":file_path}}} for attachment_id in (ids["attachment"],ids["attachment2"])]
             file_sensitive=file_root/"cinder-sensitive.json"; file_sensitive.write_text(json.dumps({"schema_version":"openstack-rehome-cinder-sensitive-evidence/v1alpha1","side":"source","entries":file_entries}),encoding="utf-8"); file_sensitive.chmod(0o600)
             file_out=file_root/"combined"
@@ -900,7 +1018,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             "glance_store_capabilities": [{"store_id": "store-1", "backend_type": "rbd"}],
             "glance_catalog_origin":"https://glance.example",
             "image_store_ids":{image_id:["store-1"]},
-            "glance_data_probe_results": [{"image_id": image_id, "endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status": "PASS", "reason": "Glance image data byte is readable"}],
+            "glance_data_probe_results": [{"image_id": image_id, "endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status": "PASS", "reason": "Glance image data byte is readable",**_probe_metadata("source","glance",f"glance-range:{image_id}")}],
             "storage_probe_results": [
                 {"volume_id": volume_id, "scope": "source-compute", "kind": "nfs", "backend_identity":"rbd-backend","resource_identity":"/srv/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:nfs", "status": "PASS", "reason": "backing object is readable with expected size"},
                 {"volume_id": volume_id, "scope": "target-storage", "kind": "rbd", "backend_identity":"rbd-backend","resource_identity":"volumes/volume","expected_size":1073741824,"observed_size":1073741824,"evidence_id":"storage:rbd", "status": "PASS", "reason": "backing object is readable with expected size"},
@@ -910,6 +1028,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         }
         for item in api_result["storage_probe_results"]:
             item["resource_fingerprint"] = hashlib.sha256(f"{item['kind']}:{item['resource_identity']}".encode()).hexdigest()
+            item.update(_probe_metadata("source", "storage", item["evidence_id"]))
         client = _CombinedClient("source", api_result, [], [])
         capabilities, evidence = client.glance_store_capabilities("glance-source-store-capabilities")
         self.assertEqual("rbd", capabilities[0]["backend_type"])
@@ -922,7 +1041,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
 
     def test_image_pass_cannot_be_reused_for_different_size_or_requirement(self):
         image_id = "44444444-4444-4444-4444-444444444444"
-        result = {"image_id":image_id,"endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status":"PASS","reason":"ok"}
+        result = {"image_id":image_id,"endpoint_origin":"https://glance.example","expected_size":1,"observed_size":1,"required":True,"store_ids":["store-1"],"evidence_id":f"glance-range:{image_id}","status":"PASS","reason":"ok",**_probe_metadata("source","glance",f"glance-range:{image_id}")}
         client = _CombinedClient("source", {"openstack":[],"glance_catalog_origin":"https://glance.example","image_store_ids":{image_id:["store-1"]},"glance_store_capabilities":[{"store_id":"store-1","backend_type":"rbd"}],"glance_data_probe_results":[result]}, [], [])
         self.assertEqual("PASS", client.probe_image_data(image_id, 1, True).status)
         self.assertEqual("UNKNOWN", client.probe_image_data(image_id, 2, True).status)
@@ -1106,6 +1225,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             db.mkdir()
             (db / query["rc_file"]).write_text("0\n", encoding="ascii")
             (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}) + "\n", encoding="utf-8")
+            _write_db_evidence(db, query)
             combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(FIXTURES / "control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, combine.returncode)
 
@@ -1135,6 +1255,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 for query in plan["queries"]:
                     (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                     (db / query["jsonl_file"]).write_text("", encoding="utf-8")
+                    _write_db_evidence(db, query)
                 combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api_dir / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertNotEqual(0, combine.returncode)
 
@@ -1156,6 +1277,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 db.mkdir()
                 (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                 (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": row}) + "\n", encoding="utf-8")
+                _write_db_evidence(db, query)
                 combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertNotEqual(0, combine.returncode)
 
@@ -1180,6 +1302,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             db.mkdir()
             (db / query["rc_file"]).write_text("0\n", encoding="ascii")
             (db / query["jsonl_file"]).write_text(json.dumps({"_schema": "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}) + "\n", encoding="utf-8")
+            _write_db_evidence(db, query)
             (db / "unplanned.jsonl").write_text("{}\n", encoding="utf-8")
             combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertNotEqual(0, combine.returncode)
@@ -1199,6 +1322,7 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 row[filter_column] = values[0]
                 (db / query["rc_file"]).write_text("0\n", encoding="ascii")
                 (db / query["jsonl_file"]).write_text(json.dumps({"_schema": query["schema"], "_table": query["table"], "row": row}) + "\n", encoding="utf-8")
+                _write_db_evidence(db, query)
             out = root / "combined"
             combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(out)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             self.assertEqual(0, combine.returncode, combine.stderr)
@@ -1221,21 +1345,66 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             self.assertEqual("UNKNOWN",missing_bundle["checks"][0]["status"])
             self.assertEqual({"source", "target"}, set(bundle["uuid_filters"]))
 
-    def test_combine_rejects_nonzero_malformed_and_provenance_mismatch(self):
+    def test_combine_preserves_failed_query_and_rejects_malformed_or_mismatched_output(self):
         for mode in ("nonzero", "malformed", "provenance"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 api = root / "api"
                 create = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "api", "--side", "source", "--fixture", str(FIXTURES / "api-input.json"), "--out", str(api)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 self.assertEqual(0, create.returncode, create.stderr)
-                query = json.loads((api / "db-query-plan.json").read_text())["queries"][0]
+                queries = json.loads((api / "db-query-plan.json").read_text())["queries"]
+                query = queries[0]
                 db = root / "db"
                 db.mkdir()
-                (db / query["rc_file"]).write_text("9\n" if mode == "nonzero" else "0\n", encoding="ascii")
-                record = {"_schema": "wrong" if mode == "provenance" else "nova", "_table": "instances", "row": {"uuid": "11111111-1111-1111-1111-111111111111"}}
-                (db / query["jsonl_file"]).write_text("not-json\n" if mode == "malformed" else json.dumps(record) + "\n", encoding="utf-8")
-                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(root / "combined")], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                self.assertNotEqual(0, combine.returncode)
+                for index, current in enumerate(queries):
+                    returncode = 7 if mode == "nonzero" and index == 0 else 0
+                    (db / current["rc_file"]).write_text(
+                        f"{returncode}\n", encoding="ascii"
+                    )
+                    row = {column: None for column in current["columns"]}
+                    filter_column, values = next(iter(current["filters"].items()))
+                    row[filter_column] = values[0]
+                    record = {
+                        "_schema": (
+                            "wrong" if mode == "provenance" and index == 0
+                            else current["schema"]
+                        ),
+                        "_table": current["table"],
+                        "row": row,
+                    }
+                    output = (
+                        "not-json\n" if mode == "malformed" and index == 0
+                        else json.dumps(record) + "\n"
+                    )
+                    (db / current["jsonl_file"]).write_text(
+                        output, encoding="utf-8"
+                    )
+                    _write_db_evidence(
+                        db, current, returncode=returncode,
+                        stderr="database unavailable" if returncode else "",
+                    )
+                out = root / "combined"
+                combine = subprocess.run([sys.executable, "scripts/collect_live_control.py", "--phase", "combine", "--fixture-phase", "--side", "source", "--api-result", str(api / "api-result.json"), "--db-jsonl-dir", str(db), "--information-schema", str(ROOT / "tests/fixtures/live_discovery/full-run/control-information-schema.tsv"), "--schema-policy", str(FIXTURES / "schema-policy.json"), "--out", str(out)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                if mode == "nonzero":
+                    self.assertEqual(0, combine.returncode, combine.stderr)
+                    bundle = json.loads((out / "control-result.json").read_text())
+                    failed = next(
+                        item for item in bundle["evidence_index"]
+                        if item["evidence_id"] == f"source-db:{query['query_id']}"
+                    )
+                    self.assertEqual(7, failed["returncode"])
+                    self.assertEqual("command-failed", failed["failure_class"])
+                    self.assertEqual(
+                        hashlib.sha256(b"database unavailable").hexdigest(),
+                        failed["stderr_sha256"],
+                    )
+                    self.assertTrue(any(
+                        check["status"] == "BLOCKED"
+                        and failed["evidence_id"] in check["evidence_ids"]
+                        for check in bundle["checks"]
+                    ))
+                else:
+                    self.assertNotEqual(0, combine.returncode)
                 self.assertNotIn("Traceback", combine.stderr)
 
     def test_all_normal_outputs_are_resanitized_and_sensitive_is_separate(self):
@@ -1287,6 +1456,38 @@ class LiveDiscoveryCliTests(unittest.TestCase):
                 metadata["indexes"],
                 rendered_capabilities["services"]["source-information-schema"]["indexes"],
             )
+
+    def test_live_assembler_rejects_prebuilt_directional_mapping_bypass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = FIXTURES / "ready/source-control.json"
+            target = FIXTURES / "ready/target-control.json"
+            runtime = FIXTURES / "ready/runtime.json"
+            prebuilt = FIXTURES / "schema-policy.json"
+            self.assertEqual(
+                "openstack-rehome-directional-schema-mapping/v1alpha1",
+                json.loads(prebuilt.read_text())["schema_version"],
+            )
+
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/assemble_live_discovery.py",
+                    "--source-control", str(source),
+                    "--target-control", str(target),
+                    "--runtime", str(runtime),
+                    "--schema-policy", str(prebuilt),
+                    "--out-dir", str(root / "out"),
+                ],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(3, process.returncode)
+            self.assertFalse((root / "out" / "schema-mapping.json").exists())
 
     def test_live_assembler_rejects_malformed_directional_constraint_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:

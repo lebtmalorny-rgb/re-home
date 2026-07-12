@@ -162,11 +162,25 @@ class LiveDiscoveryProbePlanTests(unittest.TestCase):
             phase_id = hashlib.sha256(f"{side}\0{delegate}".encode()).hexdigest()
             directory = root / phase_id
             directory.mkdir()
+            phase_observed_at = {
+                "lvm": "2026-07-12T09:00:03Z",
+                "nfs": "2026-07-12T09:00:01Z",
+                "rbd": "2026-07-12T09:00:02Z",
+            }[backend]
+            phase_glance = [{
+                **glance[0],
+                "observed_at": phase_observed_at,
+                "returncode": 0,
+                "failure_class": None,
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                "raw_artifact_ref": f"protected://source/glance/{delegate}",
+            }]
             api = {
                 "schema_version": "openstack-rehome-control-api-result/v1alpha1",
                 "side": side,
                 "api_result": {
                     **api_common,
+                    "observed_at": phase_observed_at,
                     "storage_probe_results": [{
                         "volume_id": f"{len(backend):08d}-1111-4111-8111-111111111111",
                         "scope": "source-compute", "kind": backend,
@@ -174,8 +188,13 @@ class LiveDiscoveryProbePlanTests(unittest.TestCase):
                         "resource_fingerprint": hashlib.sha256(f"{backend}:{backend}".encode()).hexdigest(),
                         "expected_size": 1, "observed_size": 1,
                         "evidence_id": f"storage:{backend}", "status": "PASS", "reason": "ok",
+                        "observed_at": phase_observed_at,
+                        "returncode": 0,
+                        "failure_class": None,
+                        "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                        "raw_artifact_ref": f"protected://source/storage/{delegate}",
                     }],
-                    "glance_data_probe_results": glance,
+                    "glance_data_probe_results": phase_glance,
                     "glance_store_capabilities": [{"store_id": "store-a", "backend_type": "rbd"}],
                 },
             }
@@ -231,7 +250,25 @@ class LiveDiscoveryProbePlanTests(unittest.TestCase):
         provenance = merged["api_result"]["probe_delegate_provenance"]
         self.assertEqual(["source-lvm", "source-nfs", "source-rbd"], [item["delegate"] for item in provenance])
         self.assertTrue(all(len(item["phase_binding_sha256"]) == 64 for item in provenance))
-        self.assertEqual(glance, merged["api_result"]["glance_data_probe_results"])
+        self.assertEqual(
+            [
+                "2026-07-12T09:00:03Z",
+                "2026-07-12T09:00:01Z",
+                "2026-07-12T09:00:02Z",
+            ],
+            [item["observed_at"] for item in provenance],
+        )
+        self.assertEqual("2026-07-12T09:00:03Z", merged["api_result"]["observed_at"])
+        merged_glance = merged["api_result"]["glance_data_probe_results"][0]
+        self.assertEqual(glance[0]["evidence_id"], merged_glance["evidence_id"])
+        self.assertEqual("2026-07-12T09:00:03Z", merged_glance["observed_at"])
+        self.assertEqual(3, len(merged_glance["delegate_provenance"]))
+        self.assertTrue(all(
+            item["phase_binding_sha256"]
+            for item in merged_glance["delegate_provenance"]
+        ))
+        for storage_item in merged["api_result"]["storage_probe_results"]:
+            self.assertEqual(1, len(storage_item["delegate_provenance"]))
 
     def test_merge_rejects_tampered_delegate_binding(self):
         with self.assertRaises(ValueError):

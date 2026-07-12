@@ -69,7 +69,7 @@ _TRUSTED_PYTHON_PATHS = {
 }
 _TRUSTED_WHOLE_SOURCE_SHA256 = {
     "e3d702108207f5c6217e3d4f89338f733f5856b4467c39dc85dd0396a9d54a04",  # orchestrator
-    "e841188b95cfd71b9a58d15b157726b84f91b92685408d3da1da728259be1194",  # DB JSONL
+    "cfe5a7f96b08695735c3fd25b82351260bcd52a3db2a783021386cb28364ae77",  # DB JSONL
     "32e7bdfcc23377182771a0b7928003773749410d8283e686d6bf26cc28c69305",  # runtime
     "a3e93469ff29e1fa95cf0a805d7519d6afb1a804351e327094eaf5f036212021",  # schema
     "5214db099f4f003b5215ea3d75843e7558fa5579d94770c4b3c851e3cd8e5528",  # capability
@@ -567,9 +567,16 @@ def _audit_python_argv(argv):
                 "--host", "{{ rehome_host }}", "--out",
                 "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json",
             ],
+            [
+                "python3", "-m", "live_discovery.db_evidence",
+                "--record-stdin", "--out",
+                "{{ live_discovery_side_remote_dir }}/db-jsonl/"
+                "{{ item.item.query_id }}.evidence.json",
+            ],
         )
         if len(argv) >= 3 and argv[2] in {
             "live_discovery.source_profile", "live_discovery.cell_mapping",
+            "live_discovery.db_evidence",
         }:
             return argv in exact_source_helpers
         return len(argv) >= 3 and argv[2] in {
@@ -827,6 +834,12 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
                 "--host", "{{ rehome_host }}", "--out",
                 "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json",
             ],
+            [
+                "python3", "-m", "live_discovery.db_evidence",
+                "--record-stdin", "--out",
+                "{{ live_discovery_side_remote_dir }}/db-jsonl/"
+                "{{ item.item.query_id }}.evidence.json",
+            ],
         )
         for argv in exact:
             self.assertTrue(_audit_python_argv(argv), argv)
@@ -834,7 +847,10 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             [*exact[0][:-1], "/etc/nova/nova.conf"],
             [*exact[1], "--execute", "DROP TABLE nova.instances"],
             [*exact[2][:-1], "{{ arbitrary_path }}"],
+            [*exact[3][:-1], "/etc/nova/nova.conf"],
+            [*exact[3], "--execute", "DROP TABLE nova.instances"],
             ["python3", "-m", "live_discovery.cell_mapping", "delete"],
+            ["python3", "-m", "live_discovery.db_evidence", "--out", "x"],
         ):
             self.assertFalse(_audit_python_argv(argv), argv)
 

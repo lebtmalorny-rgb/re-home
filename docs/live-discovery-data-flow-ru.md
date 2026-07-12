@@ -66,7 +66,9 @@ Playbook содержит ровно семь plays; этот порядок о�
 Таким образом, это подписанный двухфазный API/DB acquisition: API определяет
 живые roots и scope, DB phase выполняется только после `--phase verify`.
 `verified-plan.json` привязан к canonical plan SHA-256 непосредственно перед
-SQL. SQL разрешён только как SELECT; API/SQL mutations отсутствуют.
+SQL. Каждый SELECT создаёт query-specific evidence sidecar из фактических
+rc/timestamp/stderr; rc != 0 доходит до итогового отчёта как `BLOCKED`.
+SQL разрешён только как SELECT; API/SQL mutations отсутствуют.
 
 Схемный artifact включает не только колонки, но и `STATISTICS`, unique indexes,
 `KEY_COLUMN_USAGE`/`REFERENTIAL_CONSTRAINTS`, направления foreign keys и
@@ -85,7 +87,13 @@ endpoint и некорректный JSON по-прежнему отклоняю
 каждый delegate должен иметь сетевой доступ к соответствующему Glance
 endpoint/token и локальный read-only доступ к заявленным NFS/file, RBD или LVM
 resources. Несколько delegate на одной стороне поддерживаются одновременно;
-неидентичный Glance/API scope или неверный binding блокирует merge.
+их timestamps могут различаться, но неидентичный Glance/API scope или неверный
+binding блокирует merge. Каждая storage/Glance запись сохраняет список
+подписанных delegate provenance, а не только общий merged scope.
+
+Готовый directional mapping разрешён только для fixture mode. Live assembler
+всегда строит его заново из собранных schema capabilities и reviewed policy;
+подмена live acquisition заранее собранным mapping отклоняется.
 
 ## Доверие и границы
 

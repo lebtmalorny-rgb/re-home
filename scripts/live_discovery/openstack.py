@@ -42,16 +42,17 @@ def _sanitized_probe_failure(
         if status_match is not None:
             failure_status = int(status_match.group(1))
         lowered = raw_stderr.lower()
-        mentions_key_service = "key-manager" in lowered or "barbican" in lowered
-        mentions_endpoint = "endpoint" in lowered or "public url" in lowered
+        mentions_endpoint = (
+            "endpoint" in lowered
+            or "public url" in lowered
+            or "service catalog" in lowered
+        )
         mentions_absence = (
             "not found" in lowered
             or "missing" in lowered
             or "no public" in lowered
         )
-        endpoint_missing = (
-            mentions_key_service and mentions_endpoint and mentions_absence
-        )
+        endpoint_missing = mentions_endpoint and mentions_absence
     sanitized = CommandEvidence(
         evidence_id=str(getattr(evidence, "evidence_id", "unknown")),
         argv=["[REDACTED]"],
@@ -60,6 +61,9 @@ def _sanitized_probe_failure(
         stderr="[REDACTED]",
     )
     failure = ProbeFailed(sanitized)
+    failure.stderr_sha256 = hashlib.sha256(
+        raw_stderr.encode("utf-8") if isinstance(raw_stderr, str) else b""
+    ).hexdigest()
     if failure_status is not None and not endpoint_missing:
         failure.status_code = failure_status
     if endpoint_missing:
@@ -79,6 +83,7 @@ def _sanitized_json_evidence(evidence: object) -> Dict[str, Any]:
         for key in ("evidence_id", "id", "argv", "returncode")
         if key in raw
     }
+    sanitized["failure_class"] = None
     if "stdout" in raw:
         sanitized["stdout"] = "[REDACTED]"
     if "stderr" in raw:

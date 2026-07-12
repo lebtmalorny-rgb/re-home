@@ -311,8 +311,8 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             "openstack-json": common | {"command"},
             "runtime-command": common | {"command"},
             "db-jsonl": common | {"schema", "table", "filters"},
-            "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status"},
-            "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status"},
+            "storage-probe": common | {"resource_id", "backend_kind", "backend_identity", "resource_identity", "resource_fingerprint", "scope", "expected_size", "observed_size", "status", "delegate_provenance"},
+            "glance-range": common | {"resource_id", "endpoint_origin", "expected_size", "observed_size", "required", "store_ids", "status", "delegate_provenance"},
             "cinder-connection": common | {"volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint"},
             "source-cell-mapping": common | {"host", "cell_uuid", "database_schema"},
             "api-absence": common | {"command", "resource_id", "status_code"},
@@ -340,10 +340,20 @@ def _validate_inputs(graph, verdict, capabilities, mapping, evidence):
             raise ValueError("evidence command is invalid")
         if entry["kind"] == "db-jsonl" and (not isinstance(entry["schema"], str) or not isinstance(entry["table"], str) or not isinstance(entry["filters"], Mapping) or not entry["filters"]):
             raise ValueError("DB evidence is invalid")
-        if entry["kind"] == "storage-probe" and (entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"])):
+        if entry["kind"] == "storage-probe" and (entry["scope"] not in {"source-compute", "target-storage"} or entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["delegate_provenance"], list)):
             raise ValueError("storage evidence is invalid")
-        if entry["kind"] == "glance-range" and (entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"]):
+        if entry["kind"] == "glance-range" and (entry["status"] not in {"PASS", "WARN", "UNKNOWN", "BLOCKED"} or not isinstance(entry["required"], bool) or not isinstance(entry["expected_size"], int) or (entry["observed_size"] is not None and not isinstance(entry["observed_size"], int)) or (entry["status"] == "PASS" and entry["observed_size"] != entry["expected_size"]) or not isinstance(entry["store_ids"], list) or not entry["store_ids"] or not isinstance(entry["delegate_provenance"], list)):
             raise ValueError("Glance evidence is invalid")
+        if entry["kind"] in {"storage-probe", "glance-range"}:
+            for item in entry["delegate_provenance"]:
+                if not isinstance(item, Mapping) or set(item) != {"delegate", "phase_id", "phase_binding_sha256", "observed_at"} or not all(isinstance(item[key], str) and item[key] for key in ("delegate", "phase_id")) or re.fullmatch(r"[0-9a-f]{64}", item.get("phase_binding_sha256", "")) is None:
+                    raise ValueError("delegate provenance is invalid")
+                try:
+                    acquired = datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
+                except (AttributeError, ValueError):
+                    raise ValueError("delegate provenance is invalid") from None
+                if acquired.tzinfo is None:
+                    raise ValueError("delegate provenance is invalid")
         if entry["kind"] == "cinder-connection" and not all(isinstance(entry[key], str) and entry[key] for key in ("volume_id", "attachment_id", "backend_kind", "backend_id", "resource_identity", "resource_fingerprint")):
             raise ValueError("Cinder connection evidence is invalid")
         if entry["kind"] == "source-cell-mapping" and not all(isinstance(entry[key], str) and entry[key] for key in ("host", "cell_uuid", "database_schema")):

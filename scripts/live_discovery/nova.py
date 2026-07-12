@@ -389,7 +389,7 @@ class NovaCollector:
             return
         result.evidence.append(
             {
-                "evidence_id": f"{self.side}-db:{DB_SCHEMAS[table]}.{table}",
+                "evidence_id": evidence["evidence_id"],
                 "kind": "db-jsonl",
                 "schema": DB_SCHEMAS[table],
                 "table": table,

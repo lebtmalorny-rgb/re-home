@@ -56,7 +56,9 @@ class OpenStackClientTests(unittest.TestCase):
         )
 
         self.assertEqual("server-1", payload["id"])
-        self.assertEqual({"id": "server-show"}, evidence)
+        self.assertEqual(
+            {"id": "server-show", "failure_class": None}, evidence
+        )
         self.assertEqual(
             [
                 "docker",
@@ -209,6 +211,46 @@ class OpenStackClientTests(unittest.TestCase):
         self.assertEqual("endpoint-missing", raised.exception.reason)
         self.assertFalse(hasattr(raised.exception, "status_code"))
         self.assertNotIn("must-not-leak", str(raised.exception.__dict__))
+
+    def test_compute_endpoint_404_is_not_downgraded_to_object_absence(self):
+        failure_evidence = CommandEvidence(
+            "nova-endpoint-404",
+            ["openstack", "server", "show", "server-uuid"],
+            1,
+            "",
+            "404: public endpoint for compute service in RegionOne not found",
+        )
+
+        class FailingRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                raise ProbeFailed(failure_evidence)
+
+        client = OpenStackClient(FailingRunner(), "cloud", "toolbox", "/clouds.yaml")
+        with self.assertRaises(ProbeFailed) as raised:
+            client.json(["server", "show", "server-uuid"], "nova-endpoint-404")
+
+        self.assertEqual("endpoint-missing", raised.exception.reason)
+        self.assertFalse(hasattr(raised.exception, "status_code"))
+
+    def test_actual_resource_404_remains_typed_object_absence(self):
+        failure_evidence = CommandEvidence(
+            "nova-object-404",
+            ["openstack", "server", "show", "server-uuid"],
+            1,
+            "",
+            "HTTP 404: No Server found for server-uuid",
+        )
+
+        class FailingRunner:
+            def run(self, argv, evidence_id, sensitive_stdout=False):
+                raise ProbeFailed(failure_evidence)
+
+        client = OpenStackClient(FailingRunner(), "cloud", "toolbox", "/clouds.yaml")
+        with self.assertRaises(ProbeFailed) as raised:
+            client.json(["server", "show", "server-uuid"], "nova-object-404")
+
+        self.assertEqual(404, raised.exception.status_code)
+        self.assertFalse(hasattr(raised.exception, "reason"))
 
     def test_client_sanitizes_raw_stdout_and_stderr_from_evidence(self):
         class SecretEvidenceRunner:
