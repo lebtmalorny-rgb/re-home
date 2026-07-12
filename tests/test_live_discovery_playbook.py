@@ -305,6 +305,20 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("item.rc", DB_TASKS.read_text(encoding="utf-8"))
         self.assertIn("item.stderr", DB_TASKS.read_text(encoding="utf-8"))
 
+    def test_schema_queries_are_rendered_by_strict_helper_and_all_sections_execute(self):
+        text = SCHEMA_TASKS.read_text(encoding="utf-8")
+        self.assertIn("live_discovery.schema_query", text)
+        self.assertIn("--databases-json", text)
+        self.assertIn("live_discovery_schema_query_pack.stdout | from_json", text)
+        self.assertIn("live_discovery_schema_query_item.sql", text)
+        self.assertIn(
+            "SECTION:{{ item.live_discovery_schema_query_item.section }}",
+            text,
+        )
+        self.assertNotIn("map('quote')", text)
+        for section in ("COLUMNS", "STATISTICS", "FOREIGN_KEYS"):
+            self.assertIn(section, text)
+
     def test_db_tasks_validate_generated_sql_before_mysql(self):
         text = DB_TASKS.read_text(encoding="utf-8")
         self.assertLess(text.index("--validate-sql"), text.index("live_discovery_mysql_json_argv"))

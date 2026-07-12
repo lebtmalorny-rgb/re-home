@@ -71,7 +71,7 @@ _TRUSTED_WHOLE_SOURCE_SHA256 = {
     "b7da6b76c40492ded069621f517f33d6ba9ba084cdbea79259b154d2c5ffb7eb",  # orchestrator
     "e841188b95cfd71b9a58d15b157726b84f91b92685408d3da1da728259be1194",  # DB JSONL
     "32e7bdfcc23377182771a0b7928003773749410d8283e686d6bf26cc28c69305",  # runtime
-    "3d032ab80dc4bb26b15b86b9524670d25fc93f839e11ba77769e1cb3103b5f34",  # schema
+    "a3e93469ff29e1fa95cf0a805d7519d6afb1a804351e327094eaf5f036212021",  # schema
     "5214db099f4f003b5215ea3d75843e7558fa5579d94770c4b3c851e3cd8e5528",  # capability
     "539e533982194e23407dcdf5b663336c9e0f1c4a56bb2839792735d056fd1a74",  # initialization
 }
@@ -79,7 +79,7 @@ _TRUSTED_FILE_TASK_SET_SHA256 = {
     "a0df54d35b5fa3a04ce5e1e02bc38c3f576cf13823555e15d62a06416b03d83a",
     "db63529b32fee1260c32030104243969d7b7c7108fa704ffb9e71ef6f249f7cc",
     "aa120867c81335fb45d3b291f0b8ca2a2e766d3cb885ce4246c0aadc2487a3df",
-    "acf6f4b7623e6ca9544ec366e408692de83b68385175f89bd6cee5ef47cca6f1",
+    "476b1831cf8c9f5b5ba10af09552845fe1abfbe1bbf7ade7571649ed4aa5320c",
     "3da83260df7c9bccb1cf9086b88175b07e8f35f4faf28aebc92113010c47c0dd",
     "0125ee4396c60b7bdb886bcaacdcdfa4e5a64069ac51e645b4722b0f72570bc7",
 }
@@ -554,6 +554,7 @@ def _audit_python_argv(argv):
     if argv[1] == "-m":
         return len(argv) >= 3 and argv[2] in {
             "live_discovery.argv_policy", "live_discovery.mysql_json",
+            "live_discovery.schema_query",
         }
     return argv[1] in _TRUSTED_PYTHON_PATHS
 
@@ -960,6 +961,16 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             with self.subTest(source=source):
                 with self.assertRaises(AssertionError):
                     _audit_command_text(source, "synthetic")
+
+    def test_schema_query_helper_module_is_exact_reviewed(self):
+        self.assertTrue(_audit_python_argv([
+            "python3", "-m", "live_discovery.schema_query",
+            "--databases-json", '["nova"]',
+        ]))
+        self.assertFalse(_audit_python_argv([
+            "python3", "-m", "live_discovery.schema_query_unreviewed",
+            "--databases-json", '["nova"]',
+        ]))
 
     def test_python_ast_audit_rejects_alias_getattr_spawn_exec_and_dynamic_import(self):
         unsafe = (

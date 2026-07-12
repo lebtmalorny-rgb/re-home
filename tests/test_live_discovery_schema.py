@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
@@ -12,6 +13,7 @@ from live_discovery.schema import (
     CLASSIFICATIONS,
     build_directional_mapping,
     parse_information_schema,
+    schema_capability,
 )
 
 
@@ -140,6 +142,114 @@ class DirectionalSchemaMappingTests(unittest.TestCase):
         )
 
         self.assertEqual(self.policy, inventory_policy)
+
+    def test_parser_preserves_indexes_unique_constraints_and_foreign_key_actions(self):
+        artifact = """SERVICE:source-control
+SECTION:COLUMNS
+nova\tinstances\t1\tid\tvarchar(36)\tNO\t\\N\t\\N
+nova\tinstances\t2\thost_id\tint(11)\tNO\t\\N\t\\N
+nova\thosts\t1\tid\tint(11)\tNO\t\\N\tauto_increment
+SECTION:STATISTICS
+nova\tinstances\tPRIMARY\t0\t1\tid\tBTREE
+nova\tinstances\tuniq_host\t0\t1\thost_id\tBTREE
+nova\thosts\tPRIMARY\t0\t1\tid\tBTREE
+SECTION:FOREIGN_KEYS
+nova\tinstances\tfk_instances_host\t1\thost_id\tnova\thosts\tid\tCASCADE\tRESTRICT
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "information-schema.tsv"
+            path.write_text(artifact, encoding="utf-8")
+
+            snapshot = parse_information_schema(path)
+
+        primary = snapshot.indexes["nova.instances"]["PRIMARY"]
+        unique = snapshot.indexes["nova.instances"]["uniq_host"]
+        foreign_key = snapshot.foreign_keys["nova.instances"]["fk_instances_host"]
+        self.assertTrue(primary.unique)
+        self.assertEqual(("id",), primary.columns)
+        self.assertTrue(unique.unique)
+        self.assertEqual(("host_id",), unique.columns)
+        self.assertEqual(("host_id",), foreign_key.columns)
+        self.assertEqual("nova.hosts", foreign_key.referenced_table)
+        self.assertEqual(("id",), foreign_key.referenced_columns)
+        self.assertEqual("CASCADE", foreign_key.update_rule)
+        self.assertEqual("RESTRICT", foreign_key.delete_rule)
+
+    def test_parser_rejects_invalid_constraint_metadata(self):
+        base = """SERVICE:source-control
+SECTION:COLUMNS
+nova\tinstances\t1\tid\tvarchar(36)\tNO\t\\N\t\\N
+SECTION:STATISTICS
+{statistics}
+SECTION:FOREIGN_KEYS
+{foreign_keys}
+"""
+        cases = {
+            "index gap": (
+                "nova\tinstances\tPRIMARY\t0\t2\tid\tBTREE",
+                "",
+            ),
+            "unknown index column": (
+                "nova\tinstances\tPRIMARY\t0\t1\tmissing\tBTREE",
+                "",
+            ),
+            "invalid uniqueness": (
+                "nova\tinstances\tPRIMARY\t2\t1\tid\tBTREE",
+                "",
+            ),
+            "unknown action": (
+                "nova\tinstances\tPRIMARY\t0\t1\tid\tBTREE",
+                "nova\tinstances\tfk_bad\t1\tid\tnova\tinstances\tid\tEXPLODE\tRESTRICT",
+            ),
+        }
+        for name, (statistics, foreign_keys) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "information-schema.tsv"
+                path.write_text(
+                    base.format(statistics=statistics, foreign_keys=foreign_keys),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    parse_information_schema(path)
+
+    def test_directional_capability_requires_complete_metadata_sections(self):
+        with self.assertRaisesRegex(ValueError, "constraint metadata"):
+            schema_capability(self.source_snapshot, {"nova.instances": ["progress"]})
+
+        artifact = """SERVICE:target-control
+SECTION:COLUMNS
+nova\tinstances\t1\tid\tvarchar(36)\tNO\t\\N\t\\N
+SECTION:STATISTICS
+nova\tinstances\tPRIMARY\t0\t1\tid\tBTREE
+SECTION:FOREIGN_KEYS
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "information-schema.tsv"
+            path.write_text(artifact, encoding="utf-8")
+            complete_snapshot = parse_information_schema(path)
+            capability = schema_capability(
+                complete_snapshot,
+                {"nova.instances": ["id"]},
+            )
+
+        self.assertEqual(
+            {"tables", "indexes", "foreign_keys", "used_columns"},
+            set(capability),
+        )
+        self.assertEqual(
+            {
+                "name": "PRIMARY",
+                "unique": True,
+                "columns": ["id"],
+                "index_type": "BTREE",
+            },
+            capability["indexes"]["nova.instances"]["PRIMARY"],
+        )
+        with self.assertRaisesRegex(ValueError, "used schema columns"):
+            schema_capability(
+                complete_snapshot,
+                {"nova.instances": ["missing"]},
+            )
 
 
 if __name__ == "__main__":

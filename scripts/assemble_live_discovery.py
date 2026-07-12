@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from live_discovery.contract import CheckResult, CollectorResult, DependencyEdge, ResourceNode
 from live_discovery.graph import assemble_graph
 from live_discovery.render import write_artifacts
-from live_discovery.schema import SchemaColumn, SchemaSnapshot, build_directional_mapping
+from live_discovery.schema import build_directional_mapping, parse_schema_capability
 from live_discovery.verdict import compute_verdict
 
 
@@ -205,21 +205,10 @@ def _directional_mapping(policy, capabilities):
     used_columns = {}
     for side in ("source", "target"):
         payload = capabilities.get("services", {}).get(f"{side}-information-schema")
-        if not isinstance(payload, dict) or set(payload) != {"tables", "used_columns"} or not isinstance(payload["tables"], dict) or not isinstance(payload["used_columns"], dict):
+        if not isinstance(payload, dict):
             raise ValueError("live information_schema capability is missing")
-        tables = {}
-        for table, columns in payload["tables"].items():
-            if not isinstance(table, str) or not isinstance(columns, dict):
-                raise ValueError("live information_schema capability is invalid")
-            tables[table] = {}
-            for name, definition in columns.items():
-                if not isinstance(definition, dict) or set(definition) != {"name", "ordinal", "column_type", "nullable", "default", "extra"} or definition.get("name") != name:
-                    raise ValueError("live SchemaColumn is invalid")
-                tables[table][name] = SchemaColumn(**definition)
-        snapshots[side] = SchemaSnapshot(tables=tables)
-        for table, columns in payload["used_columns"].items():
-            if not isinstance(table, str) or not isinstance(columns, list) or not columns or not all(isinstance(column, str) for column in columns):
-                raise ValueError("used schema columns are invalid")
+        snapshots[side], side_used_columns = parse_schema_capability(payload)
+        for table, columns in side_used_columns.items():
             used_columns.setdefault(table, set()).update(columns)
     if not used_columns:
         raise ValueError("used schema columns are missing")

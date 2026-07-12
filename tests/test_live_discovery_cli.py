@@ -1027,8 +1027,14 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             source = json.loads((FIXTURES / "ready/source-control.json").read_text())
             target = json.loads((FIXTURES / "ready/target-control.json").read_text())
             column = {"name": "id", "ordinal": 1, "column_type": "varchar(36)", "nullable": False, "default": None, "extra": ""}
-            source["schema_capabilities"]["source-information-schema"] = {"tables": {"nova.instances": {"id": column}}, "used_columns": {"nova.instances": ["id"]}}
-            target["schema_capabilities"]["target-information-schema"] = {"tables": {"nova.instances": {"id": column}}, "used_columns": {"nova.instances": ["id"]}}
+            metadata = {
+                "tables": {"nova.instances": {"id": column}},
+                "indexes": {"nova.instances": {"PRIMARY": {"name": "PRIMARY", "unique": True, "columns": ["id"], "index_type": "BTREE"}}},
+                "foreign_keys": {},
+                "used_columns": {"nova.instances": ["id"]},
+            }
+            source["schema_capabilities"]["source-information-schema"] = metadata
+            target["schema_capabilities"]["target-information-schema"] = metadata
             (root / "source.json").write_text(json.dumps(source), encoding="utf-8")
             (root / "target.json").write_text(json.dumps(target), encoding="utf-8")
             (root / "runtime.json").write_text((FIXTURES / "ready/runtime.json").read_text(), encoding="utf-8")
@@ -1038,6 +1044,41 @@ class LiveDiscoveryCliTests(unittest.TestCase):
             mapping = json.loads((out / "schema-mapping.json").read_text())
             self.assertEqual("openstack-rehome-directional-schema-mapping/v1alpha1", mapping["schema_version"])
             self.assertEqual("COMMON_COMPATIBLE", mapping["tables"]["nova.instances"][0]["classification"])
+            rendered_capabilities = json.loads((out / "schema-capabilities.json").read_text())
+            self.assertEqual(
+                metadata["indexes"],
+                rendered_capabilities["services"]["source-information-schema"]["indexes"],
+            )
+
+    def test_live_assembler_rejects_malformed_directional_constraint_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = json.loads((FIXTURES / "ready/source-control.json").read_text())
+            target = json.loads((FIXTURES / "ready/target-control.json").read_text())
+            column = {"name": "id", "ordinal": 1, "column_type": "varchar(36)", "nullable": False, "default": None, "extra": ""}
+            metadata = {
+                "tables": {"nova.instances": {"id": column}},
+                "indexes": {"nova.instances": {"PRIMARY": {"name": "PRIMARY", "unique": True, "columns": ["missing"], "index_type": "BTREE"}}},
+                "foreign_keys": {},
+                "used_columns": {"nova.instances": ["id"]},
+            }
+            source["schema_capabilities"]["source-information-schema"] = metadata
+            target["schema_capabilities"]["target-information-schema"] = metadata
+            (root / "source.json").write_text(json.dumps(source), encoding="utf-8")
+            (root / "target.json").write_text(json.dumps(target), encoding="utf-8")
+            (root / "runtime.json").write_text((FIXTURES / "ready/runtime.json").read_text(), encoding="utf-8")
+
+            proc = subprocess.run(
+                [sys.executable, "scripts/assemble_live_discovery.py", "--source-control", str(root / "source.json"), "--target-control", str(root / "target.json"), "--runtime", str(root / "runtime.json"), "--schema-policy", str(ROOT / "inventory/live-discovery-schema-policy.json"), "--out-dir", str(root / "out")],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(3, proc.returncode)
+            self.assertFalse((root / "out").exists())
 
     def test_live_assembler_rejects_raw_runtime_without_real_typed_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
