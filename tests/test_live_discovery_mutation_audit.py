@@ -23,6 +23,7 @@ from live_discovery.argv_policy import (  # noqa: E402
     validate_inventory_commands,
     validate_mysql_argv,
 )
+from live_discovery.db_evidence import build_db_evidence  # noqa: E402
 from live_discovery.runner import (  # noqa: E402
     MutationRejected,
     ReadOnlyRunner,
@@ -69,7 +70,7 @@ _TRUSTED_PYTHON_PATHS = {
 }
 _TRUSTED_WHOLE_SOURCE_SHA256 = {
     "e3d702108207f5c6217e3d4f89338f733f5856b4467c39dc85dd0396a9d54a04",  # orchestrator
-    "cfe5a7f96b08695735c3fd25b82351260bcd52a3db2a783021386cb28364ae77",  # DB JSONL
+    "4704212263880cc0d52624be85df01d9f64941c10b327c6478131fe01a0a7b70",  # DB JSONL
     "32e7bdfcc23377182771a0b7928003773749410d8283e686d6bf26cc28c69305",  # runtime
     "a3e93469ff29e1fa95cf0a805d7519d6afb1a804351e327094eaf5f036212021",  # schema
     "5214db099f4f003b5215ea3d75843e7558fa5579d94770c4b3c851e3cd8e5528",  # capability
@@ -77,7 +78,7 @@ _TRUSTED_WHOLE_SOURCE_SHA256 = {
 }
 _TRUSTED_FILE_TASK_SET_SHA256 = {
     "5d283b6b3bfe167cd712ecc43d8fbaad36ac6795d48e10b71206c5899e264865",
-    "db63529b32fee1260c32030104243969d7b7c7108fa704ffb9e71ef6f249f7cc",
+    "6d4f989b188764fe947363a4fcd70462503d5e1cdff4c0471e743fc657220345",
     "aa120867c81335fb45d3b291f0b8ca2a2e766d3cb885ce4246c0aadc2487a3df",
     "476b1831cf8c9f5b5ba10af09552845fe1abfbe1bbf7ade7571649ed4aa5320c",
     "3da83260df7c9bccb1cf9086b88175b07e8f35f4faf28aebc92113010c47c0dd",
@@ -818,6 +819,39 @@ def _concrete_mysql_argv(argv):
 
 
 class LiveDiscoveryMutationAuditTests(unittest.TestCase):
+    def test_db_stderr_copy_preserves_exact_bytes_referenced_by_sidecar(self):
+        path = ROOT / "playbooks/tasks/collect-live-db-jsonl-service.yml"
+        payload = _yaml_load(path.read_text(encoding="utf-8"), path)
+        task = next(
+            item for item in _iter_task_mappings(payload, task_file=True)
+            if item.get("name")
+            == "Live DB JSONL | persist sanitized stderr separately"
+        )
+        template = task["ansible.builtin.copy"]["content"]
+        self.assertEqual("{{ item.stderr }}", template)
+
+        for stderr in ("boom", "", "first line\nsecond line\n"):
+            with self.subTest(stderr=repr(stderr)), tempfile.TemporaryDirectory() as temporary:
+                query_id = "0001-nova-instances"
+                rendered = template.replace("{{ item.stderr }}", stderr)
+                sidecar = build_db_evidence({
+                    "side": "source",
+                    "query_id": query_id,
+                    "returncode": 7,
+                    "observed_at": "2026-07-12T09:00:07Z",
+                    "stderr": stderr,
+                })
+                raw_path = Path(temporary) / f"{query_id}.stderr"
+                raw_path.write_bytes(rendered.encode("utf-8"))
+                self.assertEqual(
+                    f"protected://source/db-stderr/{raw_path.name}",
+                    sidecar["raw_artifact_ref"],
+                )
+                self.assertEqual(
+                    sidecar["stderr_sha256"],
+                    hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+                )
+
     def test_source_profile_and_cell_mapping_argv_shapes_are_exact_bound(self):
         exact = (
             [

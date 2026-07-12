@@ -149,7 +149,7 @@
   ansible.builtin.copy:
     dest: "{{ live_discovery_side_remote_dir }}/db-stderr/{{ item.item.query_id }}.stderr"
     mode: "0600"
-    content: "{{ item.stderr }}\n"
+    content: "{{ item.stderr }}"
   loop: "{{ live_discovery_db_query_results.results }}"
   loop_control:
     label: "{{ item.item.query_id }}"
