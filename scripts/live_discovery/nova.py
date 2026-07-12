@@ -387,11 +387,20 @@ class NovaCollector:
         ):
             result.blockers.append(f"DB evidence invalid: {table}")
             return
+        schema = self._db_schema(table)
+        canonical_id = f"{self.side}-db:{schema}.{table}"
+        query_specific = re.fullmatch(
+            rf"{re.escape(self.side)}-db:[0-9]{{4}}-"
+            rf"{re.escape(schema)}-{re.escape(table)}",
+            evidence["evidence_id"],
+        )
         result.evidence.append(
             {
-                "evidence_id": evidence["evidence_id"],
+                "evidence_id": (
+                    evidence["evidence_id"] if query_specific else canonical_id
+                ),
                 "kind": "db-jsonl",
-                "schema": DB_SCHEMAS[table],
+                "schema": schema,
                 "table": table,
             }
         )

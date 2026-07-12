@@ -1541,10 +1541,25 @@ class CinderCollector:
         expected = {
             "schema": "cinder", "table": table, "filters": deepcopy(safe_filters),
         }
+        evidence_id = (
+            evidence.get("evidence_id")
+            if isinstance(evidence, Mapping) else None
+        )
+        valid_evidence_id = (
+            evidence_id == f"{self.side}-db:cinder.{table}"
+            or (
+                isinstance(evidence_id, str)
+                and re.fullmatch(
+                    rf"{re.escape(self.side)}-db:[0-9]{{4}}-cinder-"
+                    rf"{re.escape(table)}",
+                    evidence_id,
+                ) is not None
+            )
+        )
         if (
             not isinstance(evidence, Mapping)
-            or not isinstance(evidence.get("evidence_id"), str)
-            or not evidence["evidence_id"]
+            or not valid_evidence_id
+            or set(evidence) != {"evidence_id", "schema", "table", "filters"}
             or {
                 key: deepcopy(evidence.get(key))
                 for key in ("schema", "table", "filters")
@@ -1553,7 +1568,7 @@ class CinderCollector:
             result.blockers.append(f"DB evidence invalid: {table}")
         else:
             result.evidence.append({
-                "evidence_id": evidence["evidence_id"], "kind": "db-jsonl",
+                "evidence_id": evidence_id, "kind": "db-jsonl",
                 "schema": "cinder", "table": table, "filters": deepcopy(safe_filters),
             })
         if not isinstance(records, list):
