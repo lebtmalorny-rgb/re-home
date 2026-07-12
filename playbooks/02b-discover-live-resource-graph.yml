@@ -117,15 +117,6 @@
       loop_control:
         label: "{{ item.key }}"
 
-    - name: Live discovery | require one explicit probe delegate per side
-      ansible.builtin.assert:
-        that:
-          - live_discovery_frozen_source.storage_backends.values() | map(attribute='source_delegate') | unique | list | length <= 1
-          - live_discovery_frozen_target.storage_backends.values() | map(attribute='target_delegate') | unique | list | length <= 1
-        fail_msg: >-
-          Task 10 executes one protected probe phase per side; every declared
-          backend on that side must therefore use the same explicit delegate.
-
     - name: Live discovery | freeze caller run ID or collision-resistant generated ID
       ansible.builtin.set_fact:
         live_discovery_frozen_run_id: >-
@@ -162,16 +153,16 @@
         live_discovery_target_controller: "{{ live_discovery_frozen_target.controller }}"
         live_discovery_target_reference_host: "{{ live_discovery_frozen_target.reference }}"
         live_discovery_rehome_compute_host: "{{ live_discovery_frozen_target.compute }}"
-        live_discovery_source_storage_probe_host: >-
+        live_discovery_source_storage_probe_hosts: >-
           {{ (live_discovery_frozen_source.storage_backends.values() |
-              map(attribute='source_delegate') | unique | list | first)
+              map(attribute='source_delegate') | unique | sort | list)
              if live_discovery_frozen_source.storage_backends | length > 0
-             else live_discovery_frozen_source.controller }}
-        live_discovery_target_storage_probe_host: >-
+             else [live_discovery_frozen_source.controller] }}
+        live_discovery_target_storage_probe_hosts: >-
           {{ (live_discovery_frozen_target.storage_backends.values() |
-              map(attribute='target_delegate') | unique | list | first)
+              map(attribute='target_delegate') | unique | sort | list)
              if live_discovery_frozen_target.storage_backends | length > 0
-             else live_discovery_frozen_target.controller }}
+             else [live_discovery_frozen_target.controller] }}
       no_log: true
 
     - name: Live discovery | validate run ID before constructing paths
@@ -320,8 +311,127 @@
                  [live_discovery_schema_mysql_password_key] }}
           no_log: true
 
+        - name: Source live discovery | inspect service images for profile evidence
+          ansible.builtin.command:
+            argv: "{{ live_discovery_container_inspect_argv_prefix + [item] }}"
+          loop:
+            - nova_api
+            - neutron_server
+            - cinder_api
+            - glance_api
+          register: live_discovery_source_image_inspects_raw
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Source live discovery | bind rc-bearing image evidence
+          ansible.builtin.set_fact:
+            live_discovery_source_profile_records: >-
+              {{ live_discovery_source_profile_records | default({}) | combine({
+                 item.item: {
+                   'evidence_id': 'source-image-' ~ item.item,
+                   'command': item.cmd,
+                   'returncode': item.rc,
+                   'stdout': item.stdout,
+                   'stderr': item.stderr
+                 }
+              }) }}
+          loop: "{{ live_discovery_source_image_inspects_raw.results }}"
+          no_log: true
+
+        - name: Source live discovery | derive profile from live image evidence
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -m
+              - live_discovery.source_profile
+              - --records-stdin
+              - --out
+              - "{{ live_discovery_side_remote_dir }}/protected/source-capability-input.json"
+            chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+            stdin: "{{ live_discovery_source_profile_records | to_json }}"
+            stdin_add_newline: false
+          register: live_discovery_source_profile_build
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Source live discovery | require valid live profile evidence envelope
+          ansible.builtin.assert:
+            that:
+              - live_discovery_source_profile_build.rc == 0
+          no_log: true
+
+        - name: Source live discovery | load sanitized source capability document
+          ansible.builtin.slurp:
+            src: "{{ live_discovery_side_remote_dir }}/protected/source-capability-input.json"
+          register: live_discovery_source_capability_raw
+          no_log: true
+
+        - name: Source live discovery | publish sanitized source capability document
+          ansible.builtin.set_fact:
+            live_discovery_source_capability_document: >-
+              {{ live_discovery_source_capability_raw.content | b64decode | from_json }}
+          delegate_to: localhost
+          delegate_facts: true
+          no_log: true
+
         - name: Source live discovery | collect information_schema
           ansible.builtin.include_tasks: tasks/collect-live-schema-service.yml
+
+        - name: Source live discovery | build host-scoped Nova cell query
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -m
+              - live_discovery.cell_mapping
+              - query
+              - --host
+              - "{{ rehome_host }}"
+            chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+          register: live_discovery_source_cell_query
+          changed_when: false
+
+        - name: Source live discovery | collect selected nova_api cell mapping
+          ansible.builtin.command:
+            argv: >-
+              {{ live_discovery_mysql_json_argv +
+                 ['--execute', live_discovery_source_cell_query.stdout] }}
+          environment: "{{ live_discovery_mysql_environment }}"
+          register: live_discovery_source_cell_mapping_raw
+          changed_when: false
+          no_log: true
+
+        - name: Source live discovery | sanitize selected Nova cell mapping
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -m
+              - live_discovery.cell_mapping
+              - normalize
+              - --host
+              - "{{ rehome_host }}"
+              - --out
+              - "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json"
+            chdir: "{{ live_discovery_side_remote_dir }}/scripts"
+            stdin: "{{ live_discovery_source_cell_mapping_raw.stdout }}"
+            stdin_add_newline: false
+          changed_when: false
+          no_log: true
+
+        - name: Source live discovery | load sanitized Nova cell mapping
+          ansible.builtin.slurp:
+            src: "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json"
+          register: live_discovery_source_cell_mapping_sanitized_raw
+          no_log: true
+
+        - name: Source live discovery | publish sanitized Nova cell mapping
+          ansible.builtin.set_fact:
+            live_discovery_source_cell_mapping_document: >-
+              {{ live_discovery_source_cell_mapping_sanitized_raw.content | b64decode | from_json }}
+          delegate_to: localhost
+          delegate_facts: true
+          no_log: true
 
         - name: Source live discovery | run initial signed API phase
           ansible.builtin.command:
@@ -342,6 +452,10 @@
               - "{{ openstack_cli_container }}"
               - --information-schema
               - "{{ live_discovery_side_remote_dir }}/information-schema.tsv"
+              - --source-cell-mapping
+              - "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json"
+              - --capability-config
+              - "{{ live_discovery_side_remote_dir }}/protected/source-capability-input.json"
               - --phase-key-file
               - "{{ live_discovery_side_remote_dir }}/protected/phase-hmac.key"
               - --out
@@ -705,75 +819,147 @@
         - ansible.builtin.fail:
             msg: Probe owner preflight failed after ownership-checked cleanup.
   tasks:
-    - name: Probe live discovery | validate explicit delegates and backend profile
+    - name: Probe live discovery | validate explicit delegate sets and backend profile
       ansible.builtin.assert:
         that:
-          - live_discovery_source_storage_probe_host | length > 0
-          - live_discovery_target_storage_probe_host | length > 0
-          - live_discovery_source_storage_probe_host in groups['all']
-          - live_discovery_target_storage_probe_host in groups['all']
+          - live_discovery_source_storage_probe_hosts | length > 0
+          - live_discovery_target_storage_probe_hosts | length > 0
+          - live_discovery_source_storage_probe_hosts | difference(groups['all']) | length == 0
+          - live_discovery_target_storage_probe_hosts | difference(groups['all']) | length == 0
+          - live_discovery_probe_contract.source_groups | length == live_discovery_source_storage_probe_hosts | length
+          - live_discovery_probe_contract.target_groups | length == live_discovery_target_storage_probe_hosts | length
         fail_msg: >-
-          Probe delegates must be explicit inventory hosts. Empty backend maps
-          deliberately fall back to the matching controller and render UNKNOWN.
+          Every storage probe delegate must be an explicit inventory host.
+          Empty backend maps deliberately fall back to the matching controller
+          and render storage UNKNOWN.
 
     - name: Probe live discovery | refresh source signed phase and combine
       block:
-        - name: Source probe | reset run directory on delegate
+        - name: Source probe | reset run directory on every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_source_probe_dir }}"
             state: absent
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Source probe | create run-local protected directory on delegate
+        - name: Source probe | create run-local protected directory on every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_source_probe_dir }}/protected"
             state: directory
             mode: "0700"
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Source probe | create normal phase directories on delegate
+        - name: Source probe | create normal phase directory on every delegate
           ansible.builtin.file:
-            path: "{{ item }}"
+            path: "{{ live_discovery_source_probe_dir }}/scripts"
             state: directory
             mode: "0750"
-          loop:
-            - "{{ live_discovery_source_probe_dir }}/scripts"
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Source probe | install collector package on explicit delegate
+        - name: Source probe | install collector package on every explicit delegate
           ansible.builtin.copy:
             src: "{{ playbook_dir }}/../scripts/"
             dest: "{{ live_discovery_source_probe_dir }}/scripts/"
             mode: preserve
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Source probe | stage credentials HMAC root plan and ephemeral token
+        - name: Source probe | stage source clouds on every delegate
           ansible.builtin.copy:
-            src: "{{ item.src }}"
-            dest: "{{ live_discovery_source_probe_dir }}/protected/{{ item.dest }}"
+            src: "{{ source_clouds_file_local }}"
+            dest: "{{ live_discovery_source_probe_dir }}/protected/clouds.yaml"
             mode: "0600"
-          loop:
-            - {src: "{{ source_clouds_file_local }}", dest: clouds.yaml}
-            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
-            - {src: "{{ live_discovery_source_probe_config_file_local }}", dest: source-probe-config.json}
-            - {src: "{{ live_discovery_source_glance_token_file_local }}", dest: glance-token}
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
-        - name: Source probe | write roots derived from live source API
+        - name: Source probe | stage phase HMAC on every delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_phase_hmac_key_file_local }}"
+            dest: "{{ live_discovery_source_probe_dir }}/protected/phase-hmac.key"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Source probe | stage delegate-filtered protected probe plan
+          ansible.builtin.copy:
+            content: "{{ item.probe_plan | to_nice_json }}\n"
+            dest: "{{ live_discovery_source_probe_dir }}/protected/source-probe-config.json"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Source probe | stage ephemeral Glance token on every delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_source_glance_token_file_local }}"
+            dest: "{{ live_discovery_source_probe_dir }}/protected/glance-token"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Source probe | write roots derived from live source API on every delegate
           ansible.builtin.copy:
             dest: "{{ live_discovery_source_probe_dir }}/protected/root-manifest.json"
             mode: "0600"
             content: "{{ live_discovery_source_root_document | to_nice_json }}\n"
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
-        - name: Source probe | copy live schema evidence to delegate
+        - name: Source probe | write live source capability config on every delegate
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_source_probe_dir }}/protected/source-capability-input.json"
+            mode: "0600"
+            content: "{{ live_discovery_source_capability_document | to_nice_json }}\n"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Source probe | write scoped Nova cell mapping on every delegate
+          ansible.builtin.copy:
+            dest: "{{ live_discovery_source_probe_dir }}/protected/source-cell-mapping.json"
+            mode: "0600"
+            content: "{{ live_discovery_source_cell_mapping_document | to_nice_json }}\n"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Source probe | copy live schema evidence to every delegate
           ansible.builtin.copy:
             src: "{{ live_discovery_local_run_dir }}/source-information-schema.tsv"
             dest: "{{ live_discovery_source_probe_dir }}/information-schema.tsv"
             mode: "0640"
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
         - name: Source probe | run Task 10 API phase with live storage and Glance probes
           ansible.builtin.command:
@@ -796,29 +982,57 @@
               - "{{ live_discovery_source_probe_dir }}/information-schema.tsv"
               - --root-manifest
               - "{{ live_discovery_source_probe_dir }}/protected/root-manifest.json"
+              - --source-cell-mapping
+              - "{{ live_discovery_source_probe_dir }}/protected/source-cell-mapping.json"
               - --probe-config
               - "{{ live_discovery_source_probe_dir }}/protected/source-probe-config.json"
+              - --capability-config
+              - "{{ live_discovery_source_probe_dir }}/protected/source-capability-input.json"
               - --phase-key-file
               - "{{ live_discovery_source_probe_dir }}/protected/phase-hmac.key"
               - --out
               - "{{ live_discovery_source_probe_dir }}/api"
           environment:
             LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_source_glance_token_file_local) }}"
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           register: live_discovery_source_probe_phase
           changed_when: false
           no_log: true
 
-        - name: Source probe | fetch refreshed signed phase triplet
+        - name: Source probe | fetch every refreshed signed phase triplet
           ansible.builtin.fetch:
-            src: "{{ live_discovery_source_probe_dir }}/api/{{ item }}"
-            dest: "{{ live_discovery_local_run_dir }}/source-phase/{{ item }}"
+            src: "{{ live_discovery_source_probe_dir }}/api/{{ item.1 }}"
+            dest: "{{ live_discovery_local_run_dir }}/source-phases/{{ item.0.phase_id }}/{{ item.1 }}"
             flat: true
-          loop:
-            - api-result.json
-            - uuid-filters.json
-            - db-query-plan.json
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: >-
+            {{ live_discovery_probe_contract.source_groups |
+               product(['api-result.json', 'uuid-filters.json', 'db-query-plan.json']) | list }}
+          loop_control:
+            label: "{{ item.0.delegate }}:{{ item.1 }}"
+          delegate_to: "{{ item.0.delegate }}"
+
+        - name: Source probe | merge HMAC phases and bind probe_delegate_provenance
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py"
+              - merge-phases
+              - --side
+              - source
+              - --phase-key-file
+              - "{{ live_discovery_phase_hmac_key_file_local }}"
+              - --phases-json
+              - "{{ live_discovery_probe_contract.source_phase_manifest | to_json }}"
+              - --phase-root
+              - "{{ live_discovery_local_run_dir }}/source-phases"
+              - --out
+              - "{{ live_discovery_local_run_dir }}/source-phase"
+          register: live_discovery_source_probe_merge
+          changed_when: true
+          no_log: true
 
         - name: Source combine | replace controller phase triplet exactly
           ansible.builtin.copy:
@@ -881,10 +1095,13 @@
             flat: true
           delegate_to: "{{ live_discovery_source_controller }}"
 
-        - name: Source probe | confirm delegates remain reachable
+        - name: Source probe | confirm every delegate remains reachable
           ansible.builtin.command:
             argv: [/usr/bin/true]
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           register: live_discovery_source_probe_reachability
           changed_when: false
 
@@ -897,11 +1114,14 @@
             msg: Source probe failed; its incomplete owner lock was removed.
 
       always:
-        - name: Source probe | delete delegate credentials HMAC token and configs
+        - name: Source probe | delete credentials HMAC token and configs from every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_source_probe_dir }}/protected"
             state: absent
-          delegate_to: "{{ live_discovery_source_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.source_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
         - name: Source combine | delete controller HMAC and raw Cinder evidence
@@ -913,79 +1133,133 @@
 
         - name: Source probe | release owner after unreachable delegate
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
-          when: live_discovery_source_probe_reachability.unreachable | default(false)
+          when: >-
+            live_discovery_source_probe_reachability.results | default([]) |
+            selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length > 0
 
         - name: Source probe | stop after unreachable cleanup
           ansible.builtin.fail:
             msg: Source probe delegate became unreachable; its incomplete owner lock was removed.
-          when: live_discovery_source_probe_reachability.unreachable | default(false)
+          when: >-
+            live_discovery_source_probe_reachability.results | default([]) |
+            selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length > 0
 
     - name: Probe live discovery | refresh target signed phase and combine
       block:
-        - name: Target probe | reset run directory on delegate
+        - name: Target probe | reset run directory on every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_target_probe_dir }}"
             state: absent
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Target probe | create run-local protected directory on delegate
+        - name: Target probe | create run-local protected directory on every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_target_probe_dir }}/protected"
             state: directory
             mode: "0700"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Target probe | create normal phase directories on delegate
+        - name: Target probe | create normal phase directory on every delegate
           ansible.builtin.file:
-            path: "{{ item }}"
+            path: "{{ live_discovery_target_probe_dir }}/scripts"
             state: directory
             mode: "0750"
-          loop:
-            - "{{ live_discovery_target_probe_dir }}/scripts"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Target probe | install collector package on explicit delegate
+        - name: Target probe | install collector package on every explicit delegate
           ansible.builtin.copy:
             src: "{{ playbook_dir }}/../scripts/"
             dest: "{{ live_discovery_target_probe_dir }}/scripts/"
             mode: preserve
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
-        - name: Target probe | stage credentials HMAC root plan and ephemeral token
+        - name: Target probe | stage target clouds on every delegate
           ansible.builtin.copy:
-            src: "{{ item.src }}"
-            dest: "{{ live_discovery_target_probe_dir }}/protected/{{ item.dest }}"
+            src: "{{ target_clouds_file_local }}"
+            dest: "{{ live_discovery_target_probe_dir }}/protected/clouds.yaml"
             mode: "0600"
-          loop:
-            - {src: "{{ target_clouds_file_local }}", dest: clouds.yaml}
-            - {src: "{{ live_discovery_phase_hmac_key_file_local }}", dest: phase-hmac.key}
-            - {src: "{{ live_discovery_target_probe_config_file_local }}", dest: target-probe-config.json}
-            - {src: "{{ live_discovery_target_glance_token_file_local }}", dest: glance-token}
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
-        - name: Target probe | write roots derived from live source API
+        - name: Target probe | stage phase HMAC on every delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_phase_hmac_key_file_local }}"
+            dest: "{{ live_discovery_target_probe_dir }}/protected/phase-hmac.key"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Target probe | stage delegate-filtered protected probe plan
+          ansible.builtin.copy:
+            content: "{{ item.probe_plan | to_nice_json }}\n"
+            dest: "{{ live_discovery_target_probe_dir }}/protected/target-probe-config.json"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Target probe | stage ephemeral Glance token on every delegate
+          ansible.builtin.copy:
+            src: "{{ live_discovery_target_glance_token_file_local }}"
+            dest: "{{ live_discovery_target_probe_dir }}/protected/glance-token"
+            mode: "0600"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
+          no_log: true
+
+        - name: Target probe | write roots derived from live source API on every delegate
           ansible.builtin.copy:
             dest: "{{ live_discovery_target_probe_dir }}/protected/root-manifest.json"
             mode: "0600"
             content: "{{ live_discovery_target_root_document | to_nice_json }}\n"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
-        - name: Target probe | write live target capability config as protected JSON
+        - name: Target probe | write live target capability config on every delegate
           ansible.builtin.copy:
             dest: "{{ live_discovery_target_probe_dir }}/protected/target-capability-input.json"
             mode: "0600"
             content: "{{ live_discovery_target_capability_document | to_nice_json }}\n"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
-        - name: Target probe | copy live schema evidence to delegate
+        - name: Target probe | copy live schema evidence to every delegate
           ansible.builtin.copy:
             src: "{{ live_discovery_local_run_dir }}/target-information-schema.tsv"
             dest: "{{ live_discovery_target_probe_dir }}/information-schema.tsv"
             mode: "0640"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
 
         - name: Target probe | run Task 10 API phase with capabilities storage and Glance
           ansible.builtin.command:
@@ -1018,21 +1292,45 @@
               - "{{ live_discovery_target_probe_dir }}/api"
           environment:
             LIVE_DISCOVERY_GLANCE_TOKEN: "{{ lookup('file', live_discovery_target_glance_token_file_local) }}"
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           register: live_discovery_target_probe_phase
           changed_when: false
           no_log: true
 
-        - name: Target probe | fetch refreshed signed phase triplet
+        - name: Target probe | fetch every refreshed signed phase triplet
           ansible.builtin.fetch:
-            src: "{{ live_discovery_target_probe_dir }}/api/{{ item }}"
-            dest: "{{ live_discovery_local_run_dir }}/target-phase/{{ item }}"
+            src: "{{ live_discovery_target_probe_dir }}/api/{{ item.1 }}"
+            dest: "{{ live_discovery_local_run_dir }}/target-phases/{{ item.0.phase_id }}/{{ item.1 }}"
             flat: true
-          loop:
-            - api-result.json
-            - uuid-filters.json
-            - db-query-plan.json
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: >-
+            {{ live_discovery_probe_contract.target_groups |
+               product(['api-result.json', 'uuid-filters.json', 'db-query-plan.json']) | list }}
+          loop_control:
+            label: "{{ item.0.delegate }}:{{ item.1 }}"
+          delegate_to: "{{ item.0.delegate }}"
+
+        - name: Target probe | merge HMAC phases and bind probe_delegate_provenance
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/../scripts/live_discovery/probe_plan.py"
+              - merge-phases
+              - --side
+              - target
+              - --phase-key-file
+              - "{{ live_discovery_phase_hmac_key_file_local }}"
+              - --phases-json
+              - "{{ live_discovery_probe_contract.target_phase_manifest | to_json }}"
+              - --phase-root
+              - "{{ live_discovery_local_run_dir }}/target-phases"
+              - --out
+              - "{{ live_discovery_local_run_dir }}/target-phase"
+          register: live_discovery_target_probe_merge
+          changed_when: true
+          no_log: true
 
         - name: Target combine | replace controller phase triplet exactly
           ansible.builtin.copy:
@@ -1095,10 +1393,13 @@
             flat: true
           delegate_to: "{{ live_discovery_target_controller }}"
 
-        - name: Target probe | confirm delegates remain reachable
+        - name: Target probe | confirm every delegate remains reachable
           ansible.builtin.command:
             argv: [/usr/bin/true]
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           register: live_discovery_target_probe_reachability
           changed_when: false
 
@@ -1111,11 +1412,14 @@
             msg: Target probe failed; its incomplete owner lock was removed.
 
       always:
-        - name: Target probe | delete delegate credentials HMAC token and configs
+        - name: Target probe | delete credentials HMAC token and configs from every delegate
           ansible.builtin.file:
             path: "{{ live_discovery_target_probe_dir }}/protected"
             state: absent
-          delegate_to: "{{ live_discovery_target_storage_probe_host }}"
+          loop: "{{ live_discovery_probe_contract.target_groups }}"
+          loop_control:
+            label: "{{ item.delegate }}"
+          delegate_to: "{{ item.delegate }}"
           no_log: true
 
         - name: Target combine | delete controller HMAC and raw Cinder evidence
@@ -1127,12 +1431,16 @@
 
         - name: Target probe | release owner after unreachable delegate
           ansible.builtin.include_tasks: tasks/cleanup-live-run-owner.yml
-          when: live_discovery_target_probe_reachability.unreachable | default(false)
+          when: >-
+            live_discovery_target_probe_reachability.results | default([]) |
+            selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length > 0
 
         - name: Target probe | stop after unreachable cleanup
           ansible.builtin.fail:
             msg: Target probe delegate became unreachable; its incomplete owner lock was removed.
-          when: live_discovery_target_probe_reachability.unreachable | default(false)
+          when: >-
+            live_discovery_target_probe_reachability.results | default([]) |
+            selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length > 0
 
 - name: 02B | Assemble live discovery artifacts locally
   hosts: localhost

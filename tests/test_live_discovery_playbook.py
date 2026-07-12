@@ -354,6 +354,27 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
         self.assertIn("target_delegate", lab)
         self.assertIn("live_discovery_glance_range_probe_enabled", _task11_text())
 
+    def test_storage_probe_play_groups_and_merges_multiple_delegates_per_side(self):
+        text = _task11_text()
+        self.assertNotIn("length <= 1", text)
+        self.assertNotRegex(text, r"live_discovery_source_storage_probe_host(?!s)")
+        self.assertNotRegex(text, r"live_discovery_target_storage_probe_host(?!s)")
+        for required in (
+            "live_discovery_probe_contract.source_groups",
+            "live_discovery_probe_contract.target_groups",
+            "live_discovery_source_storage_probe_hosts",
+            "live_discovery_target_storage_probe_hosts",
+            "merge-phases",
+            "probe_delegate_provenance",
+            "item.0.phase_id",
+            "item.probe_plan",
+        ):
+            self.assertIn(required, text)
+        self.assertIn("kind: rbd", LAB_INVENTORY.read_text(encoding="utf-8"))
+        self.assertIn("kind: lvm", LAB_INVENTORY.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(text.count("--source-cell-mapping"), 2)
+        self.assertGreaterEqual(text.count("source-capability-input.json"), 4)
+
     def test_run_id_is_validated_before_use_in_paths(self):
         text = _task11_text()
         self.assertIn("live_discovery_frozen_run_id is match", text)
@@ -400,15 +421,24 @@ class LiveDiscoveryPlaybookTests(unittest.TestCase):
             "source_probe", "target_probe",
         ):
             self.assertIn(f"live_discovery_{prefix}_reachability", text)
-            self.assertIn(
-                f"live_discovery_{prefix}_reachability.unreachable | default(false)",
-                text,
-            )
+            if prefix in {"source_probe", "target_probe"}:
+                self.assertIn(
+                    f"live_discovery_{prefix}_reachability.results | default([])",
+                    text,
+                )
+            else:
+                self.assertIn(
+                    f"live_discovery_{prefix}_reachability.unreachable | default(false)",
+                    text,
+                )
 
     def test_source_profile_probes_are_not_silently_discarded(self):
         text = _task11_text()
         self.assertNotIn("live_discovery_source_profile_probes", text)
-        self.assertNotIn("live_discovery_source_image_inspects", text)
+        self.assertIn("live_discovery_source_image_inspects_raw.results", text)
+        self.assertIn("live_discovery_source_profile_records", text)
+        self.assertIn("live_discovery_source_capability_document", text)
+        self.assertGreaterEqual(text.count("source-capability-input.json"), 4)
 
     def test_target_profile_is_derived_from_live_rc_bearing_records(self):
         text = _task11_text()

@@ -14,8 +14,8 @@ flowchart LR
   T["target_control\nAPI + information_schema + UUID SELECT"]
   C["rehome_compute\nlibvirt + OVS/OVN runtime"]
   R["target_reference_compute\nlibvirt/QEMU capabilities"]
-  PS["source storage/image delegate\nCinder backing + Glance Range"]
-  PT["target storage/image delegate\nCinder backing + Glance Range"]
+  PS["source storage/image delegates\nNFS/RBD/LVM groups + Glance Range"]
+  PT["target storage/image delegates\nNFS/RBD/LVM groups + Glance Range"]
   G["local assembler\nresource graph + verdict"]
 
   A -->|"signed --phase api"| S
@@ -29,8 +29,8 @@ flowchart LR
   A --> R
   A --> PS
   A --> PT
-  PS -->|"HMAC-bound phase triplet"| S
-  PT -->|"HMAC-bound phase triplet"| T
+  PS -->|"HMAC-bound triplet per delegate\ndeterministic provenance merge"| S
+  PT -->|"HMAC-bound triplet per delegate\ndeterministic provenance merge"| T
   S -->|"--phase combine"| G
   T -->|"--phase combine"| G
   C --> G
@@ -45,17 +45,21 @@ Playbook содержит ровно семь plays; этот порядок о�
 
 1. `localhost` фиксирует singleton roles, переменные, `run-id`, случайный owner
    token и защищённые inputs; затем атомарно захватывает owner lock.
-2. `source_control` выполняет первую `--phase api`, live
-   `information_schema`, `--phase verify`, после чего — только с проверенным
-   plan digest — UUID-scoped SELECT и JSONL.
+2. `source_control` доказывает профиль `keystack-2025.1` по live labels/digests
+   образов Nova, Neutron, Cinder и Glance, через host-scoped join читает
+   `nova_api.host_mappings`/`cell_mappings`, безопасно выделяет фактическую
+   cell schema без credentials, затем выполняет первую `--phase api`, live
+   `information_schema`, `--phase verify` и — только с проверенным plan digest
+   — UUID-scoped SELECT/JSONL по выбранной cell.
 3. `target_control` повторяет API/schema/verify/SQL на canonical target и
    собирает live DB revisions/container evidence.
 4. `rehome_compute` собирает libvirt domains/disks/interfaces и OVS/OVN runtime.
 5. `target_reference_compute` собирает target virsh/QEMU capabilities.
-6. `localhost` делегирует Cinder backing и Glance one-byte probes на явно
-   заданные source/target hosts, повторно подписывает API phase, возвращает
-   точные phase triplets контроллерам и вызывает `--phase combine` для каждой
-   стороны.
+6. `localhost` группирует Cinder backing probes по явно заданным source/target
+   delegate, выполняет отдельную защищённую API phase на каждом из них,
+   проверяет HMAC и общий API/query scope, детерминированно объединяет evidence
+   с provenance, возвращает итоговый подписанный triplet контроллерам и
+   вызывает `--phase combine` для каждой стороны.
 7. `localhost` запускает assembler, принимает только exit `0`, публикует
    artifacts и завершает owner marker с удалением frozen secrets.
 
@@ -64,10 +68,24 @@ Playbook содержит ровно семь plays; этот порядок о�
 `verified-plan.json` привязан к canonical plan SHA-256 непосредственно перед
 SQL. SQL разрешён только как SELECT; API/SQL mutations отсутствуют.
 
+Схемный artifact включает не только колонки, но и `STATISTICS`, unique indexes,
+`KEY_COLUMN_USAGE`/`REFERENTIAL_CONSTRAINTS`, направления foreign keys и
+действия update/delete. Имена схем проходят строгую проверку, SQL literals
+строит отдельный Python helper. Policy только разрешает профиль source:
+отсутствующее или несовпадающее live evidence оставляет mapping в
+`UNKNOWN`/`BLOCKED`, а не присваивает Keystack по имени файла.
+
+На пустом pre-import target отсутствие source-derived UUID, compute service,
+hypervisor или placement provider с ответом 404 становится типизированным
+evidence/check и не мешает assembler выпустить отчёт. Ответ 403, отсутствие
+endpoint и некорректный JSON по-прежнему отклоняются fail-closed.
+
 Каждый configured source/target storage delegate выполняет обе семьи:
-Cinder backing probes и Glance Range probes. Поэтому delegate должен иметь
-сетевой доступ к соответствующему Glance endpoint/token и локальный read-only
-доступ к заявленным NFS/file, RBD или LVM resources.
+назначенную ему группу Cinder backing probes и Glance Range probes. Поэтому
+каждый delegate должен иметь сетевой доступ к соответствующему Glance
+endpoint/token и локальный read-only доступ к заявленным NFS/file, RBD или LVM
+resources. Несколько delegate на одной стороне поддерживаются одновременно;
+неидентичный Glance/API scope или неверный binding блокирует merge.
 
 ## Доверие и границы
 

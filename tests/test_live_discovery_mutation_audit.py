@@ -68,15 +68,15 @@ _TRUSTED_PYTHON_PATHS = {
     "{{ live_discovery_target_probe_dir }}/scripts/collect_live_control.py",
 }
 _TRUSTED_WHOLE_SOURCE_SHA256 = {
-    "b7da6b76c40492ded069621f517f33d6ba9ba084cdbea79259b154d2c5ffb7eb",  # orchestrator
+    "e3d702108207f5c6217e3d4f89338f733f5856b4467c39dc85dd0396a9d54a04",  # orchestrator
     "e841188b95cfd71b9a58d15b157726b84f91b92685408d3da1da728259be1194",  # DB JSONL
     "32e7bdfcc23377182771a0b7928003773749410d8283e686d6bf26cc28c69305",  # runtime
     "a3e93469ff29e1fa95cf0a805d7519d6afb1a804351e327094eaf5f036212021",  # schema
     "5214db099f4f003b5215ea3d75843e7558fa5579d94770c4b3c851e3cd8e5528",  # capability
-    "539e533982194e23407dcdf5b663336c9e0f1c4a56bb2839792735d056fd1a74",  # initialization
+    "57e80b3a8b9879555a86c5416d3dc2837e47cbfddf8fef3f28c808b1db0935b3",  # initialization
 }
 _TRUSTED_FILE_TASK_SET_SHA256 = {
-    "a0df54d35b5fa3a04ce5e1e02bc38c3f576cf13823555e15d62a06416b03d83a",
+    "5d283b6b3bfe167cd712ecc43d8fbaad36ac6795d48e10b71206c5899e264865",
     "db63529b32fee1260c32030104243969d7b7c7108fa704ffb9e71ef6f249f7cc",
     "aa120867c81335fb45d3b291f0b8ca2a2e766d3cb885ce4246c0aadc2487a3df",
     "476b1831cf8c9f5b5ba10af09552845fe1abfbe1bbf7ade7571649ed4aa5320c",
@@ -552,6 +552,26 @@ def _audit_python_argv(argv):
     if len(argv) < 2 or argv[0] != "python3":
         return False
     if argv[1] == "-m":
+        exact_source_helpers = (
+            [
+                "python3", "-m", "live_discovery.source_profile",
+                "--records-stdin", "--out",
+                "{{ live_discovery_side_remote_dir }}/protected/source-capability-input.json",
+            ],
+            [
+                "python3", "-m", "live_discovery.cell_mapping", "query",
+                "--host", "{{ rehome_host }}",
+            ],
+            [
+                "python3", "-m", "live_discovery.cell_mapping", "normalize",
+                "--host", "{{ rehome_host }}", "--out",
+                "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json",
+            ],
+        )
+        if len(argv) >= 3 and argv[2] in {
+            "live_discovery.source_profile", "live_discovery.cell_mapping",
+        }:
+            return argv in exact_source_helpers
         return len(argv) >= 3 and argv[2] in {
             "live_discovery.argv_policy", "live_discovery.mysql_json",
             "live_discovery.schema_query",
@@ -791,6 +811,33 @@ def _concrete_mysql_argv(argv):
 
 
 class LiveDiscoveryMutationAuditTests(unittest.TestCase):
+    def test_source_profile_and_cell_mapping_argv_shapes_are_exact_bound(self):
+        exact = (
+            [
+                "python3", "-m", "live_discovery.source_profile",
+                "--records-stdin", "--out",
+                "{{ live_discovery_side_remote_dir }}/protected/source-capability-input.json",
+            ],
+            [
+                "python3", "-m", "live_discovery.cell_mapping", "query",
+                "--host", "{{ rehome_host }}",
+            ],
+            [
+                "python3", "-m", "live_discovery.cell_mapping", "normalize",
+                "--host", "{{ rehome_host }}", "--out",
+                "{{ live_discovery_side_remote_dir }}/protected/source-cell-mapping.json",
+            ],
+        )
+        for argv in exact:
+            self.assertTrue(_audit_python_argv(argv), argv)
+        for argv in (
+            [*exact[0][:-1], "/etc/nova/nova.conf"],
+            [*exact[1], "--execute", "DROP TABLE nova.instances"],
+            [*exact[2][:-1], "{{ arbitrary_path }}"],
+            ["python3", "-m", "live_discovery.cell_mapping", "delete"],
+        ):
+            self.assertFalse(_audit_python_argv(argv), argv)
+
     def test_structural_task_audit_rejects_unknown_modules_unsafe_paths_and_lookups(self):
         unsafe = (
             "---\n- name: system mutation\n  ansible.builtin.systemd:\n    name: nova-compute\n    state: restarted\n",

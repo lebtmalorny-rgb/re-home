@@ -52,6 +52,20 @@ all:
         target_delegate: os2-ctrl-01
         allowed_scopes: [source-compute, target-storage]
         probe_template: nfs
+      # Для смешанного storage добавьте отдельные backend IDs и назначьте
+      # delegate, который реально видит backing resource с этой стороны:
+      # ceph-volumes:
+      #   kind: rbd
+      #   source_delegate: os1-compute-02
+      #   target_delegate: os2-storage-rbd-01
+      #   allowed_scopes: [source-compute, target-storage]
+      #   probe_template: rbd
+      # local-lvm:
+      #   kind: lvm
+      #   source_delegate: os1-storage-lvm-01
+      #   target_delegate: os2-storage-lvm-01
+      #   allowed_scopes: [source-compute, target-storage]
+      #   probe_template: lvm
     live_discovery_mysql_json_argv:
       - docker
       - exec

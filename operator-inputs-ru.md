@@ -25,6 +25,13 @@ dump не является входом playbook-а: её можно испол�
 `keystack-2025.1`; target должен быть доказан live evidence как
 `vanilla-openstack-2025.1-epoxy`.
 
+Имя профиля в `live-discovery-schema-policy.json` является только разрешением,
+а не доказательством. Source collector проверяет четыре live service images
+(`nova_api`, `neutron_server`, `cinder_api`, `glance_api`): обязательны label
+vendor `Keystack`, `openstack_release=2025.1` и digest `sha256`. Если точный
+vendor/release не доказан, итог остаётся `UNKNOWN`/`BLOCKED`; подставлять
+`keystack-2025.1` вручную нельзя.
+
 ## Обязательные входы live discovery
 
 Точный entrypoint выполняется до любого DB import или cutover:
@@ -119,6 +126,12 @@ live_discovery_target_qemu_argv: [docker, exec, nova_libvirt, /usr/bin/qemu-syst
 ожидаемый container. SQL строится самим collector, проходит `--phase verify`,
 привязывается к digest плана и выполняется только как UUID-scoped SELECT.
 
+Nova cell schema не задаётся константой `nova`: playbook выполняет защищённый
+host-scoped SELECT по `nova_api.host_mappings` и `cell_mappings`, извлекает из
+connection URI только проверенное имя schema (`nova_cell1`, `nova` и т. п.) и
+не сериализует user/password/host URI. Эта schema должна присутствовать в
+`source_db_names` и соответствующем `schema_compat_mysql_service_queries`.
+
 В `group_vars/all.yml` пока также присутствуют строковые compatibility defaults
 `live_discovery_mysql_json_command`, `live_discovery_target_virsh_command` и
 `live_discovery_target_qemu_command`. Семиплейный orchestration использует
@@ -185,8 +198,10 @@ iSCSI, Fibre Channel и vendor backend указывать фактический
 `probe_template: unsupported`: они остаются типизированным evidence, но дают
 `UNKNOWN`, пока не реализован и не reviewed отдельный read-only probe. Empty
 map `{}` разрешён generic inventory, но не доказывает storage readiness и
-поэтому также даёт `UNKNOWN`. В одной side phase все backend entries должны
-использовать одного explicit delegate.
+поэтому также даёт `UNKNOWN`. Backend entries одной стороны могут указывать
+разные explicit delegate: например, NFS на compute, RBD на Ceph client host и
+LVM на storage node. Все такие hosts должны присутствовать в inventory и иметь
+локальный read-only доступ только к назначенным backing resources.
 
 Probe configs имеют contract `openstack-rehome-probe-config/v1alpha1` и
 содержат `storage` плюс `glance`. Storage item обязан согласоваться с inventory
@@ -319,9 +334,15 @@ pool/VG names, sizes, endpoints и store IDs реальными live значе�
 }
 ```
 
-Один configured delegate на стороне выполняет обе семьи: Cinder backing probes
-и Glance Range probes. Поэтому endpoint/token также должны быть доступны с
-`source_delegate`/`target_delegate`, а не только с controller.
+Каждый configured delegate на стороне получает отдельный отфильтрованный
+protected plan и выполняет обе семьи: назначенные ему Cinder backing probes и
+те же Glance Range probes. Поэтому endpoint/token должны быть доступны со всех
+`source_delegate`/`target_delegate`, а не только с controller. Каждый delegate
+возвращает собственный HMAC-bound phase triplet. Runner проверяет подпись и
+одинаковый API/query scope всех triplets, детерминированно объединяет storage
+evidence, дедуплицирует только идентичный Glance evidence и повторно подписывает
+итог вместе с provenance (`delegate`, phase ID и исходный binding). Любое
+расхождение scope, подписи или дублирование storage evidence останавливает run.
 
 ### Inventory, Vault и extra-vars для protected paths
 

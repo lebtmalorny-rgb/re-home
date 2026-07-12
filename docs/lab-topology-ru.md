@@ -135,7 +135,9 @@ NFS — только профиль текущего lab, а не огранич
 vendor backend остаются явными `UNKNOWN` без отдельного reviewed read-only
 probe. При переносе в другую инфраструктуру нужно заменить не только path, но
 и `kind`, оба delegate, scopes и probe template в
-`live_discovery_storage_backends`.
+`live_discovery_storage_backends`. Разные backend одной стороны могут иметь
+разные delegate; orchestration создаст отдельную HMAC-bound phase на каждом и
+объединит их только при одинаковом API/query scope.
 
 ## Что менять при переносе в другую инфраструктуру
 

@@ -104,11 +104,13 @@
     live_discovery_probe_contract: "{{ live_discovery_probe_contract_result.stdout | from_json }}"
   no_log: true
 
-- name: Live discovery | require derived delegates to match validated contract
+- name: Live discovery | require derived delegate sets to match validated contract
   ansible.builtin.assert:
     that:
-      - live_discovery_probe_contract.source_delegate == live_discovery_source_storage_probe_host
-      - live_discovery_probe_contract.target_delegate == live_discovery_target_storage_probe_host
+      - live_discovery_probe_contract.source_delegates == live_discovery_source_storage_probe_hosts
+      - live_discovery_probe_contract.target_delegates == live_discovery_target_storage_probe_hosts
+      - live_discovery_probe_contract.source_groups | map(attribute='delegate') | list == live_discovery_source_storage_probe_hosts
+      - live_discovery_probe_contract.target_groups | map(attribute='delegate') | list == live_discovery_target_storage_probe_hosts
 
 - name: Live discovery | validate probe plan envelopes and range policy
   ansible.builtin.assert:
@@ -131,7 +133,7 @@
       - item.kind == live_discovery_storage_backends[item.backend_id].kind
       - item.scope == 'source-compute'
       - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
-      - live_discovery_storage_backends[item.backend_id].source_delegate == live_discovery_source_storage_probe_host
+      - live_discovery_storage_backends[item.backend_id].source_delegate in live_discovery_source_storage_probe_hosts
   loop: "{{ live_discovery_source_probe_plan.storage }}"
   no_log: true
 
@@ -142,7 +144,7 @@
       - item.kind == live_discovery_storage_backends[item.backend_id].kind
       - item.scope == 'target-storage'
       - item.scope in live_discovery_storage_backends[item.backend_id].allowed_scopes
-      - live_discovery_storage_backends[item.backend_id].target_delegate == live_discovery_target_storage_probe_host
+      - live_discovery_storage_backends[item.backend_id].target_delegate in live_discovery_target_storage_probe_hosts
   loop: "{{ live_discovery_target_probe_plan.storage }}"
   no_log: true
 
@@ -176,8 +178,8 @@
   delegate_to: "{{ item }}"
   delegate_facts: true
   loop: >-
-    {{ [live_discovery_source_controller, live_discovery_target_controller,
-        live_discovery_rehome_compute_host, live_discovery_target_reference_host,
-        live_discovery_source_storage_probe_host, live_discovery_target_storage_probe_host]
+    {{ ([live_discovery_source_controller, live_discovery_target_controller,
+         live_discovery_rehome_compute_host, live_discovery_target_reference_host] +
+        live_discovery_source_storage_probe_hosts + live_discovery_target_storage_probe_hosts)
        | unique | list }}
   no_log: true
