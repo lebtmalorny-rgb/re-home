@@ -154,6 +154,14 @@ def _read_only_shape_rejection(values: Sequence[str]) -> Optional[str]:
     lowered = [value.lower() for value in args]
     if executable == "openstack":
         command = _openstack_command(values)
+        if command is not None and command[:2] == ["secret", "get"]:
+            valid_secret_metadata = (
+                len(command) == 5
+                and bool(command[2])
+                and not command[2].startswith("-")
+                and command[3:] == ["-f", "json"]
+            )
+            return None if valid_secret_metadata else "secret get"
         if command is not None and any(
             _matches_prefix(command, prefix) for prefix in _OPENSTACK_READ_ONLY_PREFIXES
         ):

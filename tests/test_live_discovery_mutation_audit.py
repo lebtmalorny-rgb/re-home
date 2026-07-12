@@ -179,16 +179,38 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
     )
     dynamic_execution = {"eval", "exec", "compile", "__import__"}
     subprocess_calls = []
+    def dangerous_reference(name):
+        return (
+            name in {
+                "os.system", "os.popen", "subprocess.run", "subprocess.Popen",
+                "subprocess.call", "subprocess.check_call", "subprocess.check_output",
+                "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
+                "asyncio.subprocess.create_subprocess_exec",
+                "asyncio.subprocess.create_subprocess_shell", "posix.system", "pty.spawn",
+            }
+            or name.startswith(("os.exec", "os.spawn", "os.posix_spawn", "os.fork"))
+        )
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute):
-            continue
-        name = _expression_name(node, aliases)
-        if name == "subprocess.run":
-            parent = parents.get(node)
-            if not isinstance(parent, ast.Call) or parent.func is not node:
-                raise AssertionError(f"indirect subprocess.run in {label}:{node.lineno}")
-        if name.startswith(("os.exec", "os.spawn", "os.posix_spawn", "os.fork")):
-            raise AssertionError(f"indirect process API in {label}:{node.lineno}: {name}")
+        if isinstance(node, ast.Attribute):
+            name = _expression_name(node, aliases)
+            if dangerous_reference(name):
+                parent = parents.get(node)
+                direct_runner_call = (
+                    allow_subprocess
+                    and name == "subprocess.run"
+                    and isinstance(parent, ast.Call)
+                    and parent.func is node
+                )
+                if not direct_runner_call:
+                    raise AssertionError(f"process API reference in {label}:{node.lineno}: {name}")
+        elif isinstance(node, ast.Subscript):
+            owner = _expression_name(node.value, aliases)
+            if owner in {"asyncio.__dict__", "os.__dict__", "posix.__dict__", "subprocess.__dict__"}:
+                raise AssertionError(f"dynamic process namespace in {label}:{node.lineno}")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            target = aliases.get(node.id, "")
+            if dangerous_reference(target):
+                raise AssertionError(f"process API alias reference in {label}:{node.lineno}")
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -208,7 +230,9 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
                 attribute in {"run", "Popen", "call", "check_call", "check_output", "system", "popen"}
                 or attribute.startswith(("exec", "spawn", "posix_spawn", "create_subprocess"))
             )
-            if owner.split(".", 1)[0] in {"asyncio", "os", "posix", "subprocess"} and dangerous_attribute:
+            if owner.split(".", 1)[0] in {"asyncio", "os", "posix", "subprocess"} and (
+                dangerous_attribute or not attribute
+            ):
                 raise AssertionError(f"dynamic process API in {label}:{node.lineno}")
         if name == "vars" and node.args:
             owner = _expression_name(node.args[0], aliases)
@@ -259,7 +283,7 @@ def _module_blocks_from_text(text):
         task_indent = None
         for candidate_index in range(index, -1, -1):
             candidate = lines[candidate_index]
-            task = re.match(r"^(\s*)-\s+(?:name:|(?:(?:[A-Za-z_][A-Za-z0-9_-]*\.)+)?(?:command|shell|raw):)", candidate)
+            task = re.match(r"^(\s*)-\s+\S", candidate)
             if task is not None and len(task.group(1)) < indent:
                 task_start = candidate_index
                 task_indent = len(task.group(1))
@@ -308,12 +332,77 @@ def _static_argv(block):
     return tokens or None
 
 
+def _without_yaml_comments(text):
+    cleaned = []
+    for line in text.splitlines():
+        quote = None
+        escaped = False
+        end = len(line)
+        for index, character in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote is not None:
+                escaped = True
+                continue
+            if quote is not None:
+                if character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+            elif character == "#" and (index == 0 or line[index - 1].isspace()):
+                end = index
+                break
+        cleaned.append(line[:end].rstrip())
+    return "\n".join(cleaned)
+
+
+def _argv_items(block):
+    match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
+    if match is None:
+        return []
+    value = match.group(1).strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [item.strip().strip("'\"") for item in value[1:-1].split(",")]
+    if value:
+        return []
+    items = []
+    for line in block[match.end():].splitlines():
+        item = re.match(r"^[ \t]+-\s+(.+?)\s*$", line)
+        if item is not None:
+            items.append(item.group(1).strip().strip("'\""))
+        elif items and line.strip():
+            break
+    return items
+
+
+def _python_argv_is_reviewed(block):
+    items = _argv_items(block)
+    if not items or items[0] != "python3" or len(items) < 2:
+        return False
+    if items[1] == "-c":
+        return False
+    if items[1] == "-m":
+        return len(items) >= 3 and items[2] in {
+            "live_discovery.argv_policy", "live_discovery.mysql_json",
+        }
+    allowed_scripts = {
+        "argv_policy.py", "assemble_live_discovery.py", "capability_input.py",
+        "collect_live_control.py", "collect_live_runtime.py", "probe_plan.py",
+        "protected_input.py", "run_owner.py", "validate_live_runtime.py",
+    }
+    return any(items[1].endswith(script) for script in allowed_scripts)
+
+
 def _argv_shape_is_reviewed(block):
+    block = _without_yaml_comments(block)
     match = re.search(r"(?m)^[ \t]+argv:[ \t]*(.*)$", block)
     if match is None:
         return False
     value = match.group(1).strip().strip("'\"")
-    if _static_argv(block):
+    static = _static_argv(block)
+    if static:
         return True
     if "{{" not in block[match.start():]:
         return True
@@ -341,10 +430,15 @@ def _argv_shape_is_reviewed(block):
     if first_item is None:
         return False
     executable = first_item.group(1).strip().strip("'\"")
-    return "{{" not in executable and executable in {"python3", "mkdir", "/usr/bin/true"}
+    if executable == "python3":
+        return _python_argv_is_reviewed(block)
+    return "{{" not in executable and executable in {"mkdir", "/usr/bin/true"}
 
 
 def _audit_command_text(text, label):
+    text = _without_yaml_comments(text)
+    if re.search(r"(?m)^\s*(?:-\s+)?(?:action|local_action):", text):
+        raise AssertionError(f"{label}: action/local_action execution is forbidden")
     command_count = 0
     dynamic_argv = set()
     for module, inline, block in _module_blocks_from_text(text):
@@ -355,11 +449,7 @@ def _audit_command_text(text, label):
         if not _argv_shape_is_reviewed(block):
             raise AssertionError(f"{label}: argv shape is not reviewed")
         static = _static_argv(block)
-        if static and static[0] in {
-            "openstack", "nova-manage", "neutron-db-manage", "cinder-manage",
-            "virsh", "ovs-vsctl", "ovs-ofctl", "ovn-nbctl", "ovn-sbctl",
-            "rbd", "lvs", "stat", "docker", "qemu-system-x86_64",
-        }:
+        if static and static != ["/usr/bin/true"]:
             rejection = classify_mutation(static)
             if rejection is not None:
                 raise AssertionError(f"{label}: mutating argv: {rejection}")
@@ -413,6 +503,13 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             "---\n- name: fqcn\n  ansible.builtin.command:\n    argv: [openstack, server, lock, server-1]\n",
             "---\n- name: raw\n  ansible.builtin.raw: docker stop nova_compute\n",
             "---\n- name: template\n  ansible.builtin.command:\n    argv: \"{{ arbitrary_inventory_argv }}\"\n",
+            "---\n- when: true\n  command:\n    argv: [rm, -rf, /srv/data]\n",
+            "---\n- name: unknown static\n  ansible.builtin.command:\n    argv: [rm, -rf, /srv/data]\n",
+            "---\n- name: dynamic code\n  ansible.builtin.command:\n    argv:\n      - python3\n      - -c\n      - \"{{ arbitrary_python }}\"\n",
+            "---\n- name: comment spoof\n  ansible.builtin.command:\n    argv: \"{{ arbitrary_inventory_argv }}\"\n    # ['python3'] live_discovery_mysql_json_argv ['version']\n",
+            "---\n- name: inline comment spoof\n  ansible.builtin.command:\n    argv: \"{{ arbitrary_inventory_argv }}\" # ['python3'] live_discovery_mysql_json_argv ['version']\n",
+            "---\n- name: action bypass\n  action: command openstack server lock server-1\n",
+            "---\n- name: local action bypass\n  local_action: shell docker stop nova_compute\n",
         )
         for source in unsafe:
             with self.subTest(source=source):
@@ -431,6 +528,11 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             ("import multiprocessing\nmultiprocessing.Process(target=lambda: None).start()\n", False),
             ("import subprocess\nvars(subprocess)['run'](['id'])\n", True),
             ("import subprocess\nlaunch = subprocess.run\nlaunch(['id'])\n", True),
+            ("import os\nlaunch = os.system\n", False),
+            ("import os\nname = 'system'\nlaunch = getattr(os, name)\n", False),
+            ("import os\nlaunch = os.__dict__['system']\n", False),
+            ("import subprocess\nlaunch = subprocess.__dict__['run']\n", True),
+            ("from subprocess import run as launch\nreference = launch\n", True),
         )
         for source, allow_subprocess in unsafe:
             with self.subTest(source=source):
@@ -636,6 +738,34 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
                 with self.subTest(command=command):
                     ReadOnlyRunner().run(command, "read-only-probe")
         self.assertEqual(len(commands), execute.call_count)
+
+    def test_runner_allows_barbican_metadata_get_but_never_secret_payload(self):
+        secret_id = "11111111-1111-4111-8111-111111111111"
+        allowed = (
+            ["openstack", "secret", "get", secret_id, "-f", "json"],
+            [
+                "docker", "exec", "kolla_toolbox", "openstack",
+                "--os-cloud", "source", "--os-client-config", "/run/clouds.yaml",
+                "secret", "get", secret_id, "-f", "json",
+            ],
+        )
+        rejected = (
+            ["openstack", "secret", "get", secret_id],
+            ["openstack", "secret", "get", secret_id, "--payload"],
+            ["openstack", "secret", "get", secret_id, "-f", "json", "--payload"],
+        )
+        completed = mock.Mock(returncode=0, stdout='{"status":"ACTIVE"}', stderr="")
+        with mock.patch(
+            "live_discovery.runner.subprocess.run", return_value=completed
+        ) as execute:
+            for command in allowed:
+                with self.subTest(allowed=command):
+                    ReadOnlyRunner().run(command, "barbican-metadata")
+            for command in rejected:
+                with self.subTest(rejected=command):
+                    with self.assertRaises(MutationRejected):
+                        ReadOnlyRunner().run(command, "barbican-payload")
+        self.assertEqual(len(allowed), execute.call_count)
 
     def test_runner_rejects_sql_dml_ddl_and_exfiltration(self):
         statements = (
