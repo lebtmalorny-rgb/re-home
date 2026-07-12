@@ -208,6 +208,23 @@ class LiveDiscoveryCliTests(unittest.TestCase):
         self.assertIn("nova_cell1.instances", catalog)
         self.assertNotIn("nova.instances", catalog)
 
+        available.update({
+            f"nova_cell2.{table}"
+            for table, schema in DB_SCHEMAS.items()
+            if schema == "nova"
+        })
+        roots = {
+            "hosts": ["compute-023"],
+            "instances": ["11111111-1111-1111-1111-111111111111"],
+            "services": ["22222222-2222-2222-2222-222222222222"],
+            "compute_nodes": ["33333333-3333-3333-3333-333333333333"],
+        }
+        selected = _expected_plan_tables(
+            "source", roots, available, cell_schema="nova_cell1"
+        )
+        self.assertTrue(any(item.startswith("nova_cell1.") for item in selected))
+        self.assertFalse(any(item.startswith("nova_cell2.") for item in selected))
+
     def test_fixture_combine_requires_explicit_cli_trust_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

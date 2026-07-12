@@ -168,9 +168,20 @@ def _collector_table_catalog(available_tables=None):
     return {"nova": nova, "neutron": neutron, "cinder": cinder}
 
 
-def _expected_plan_tables(side, roots, available_tables):
+def _expected_plan_tables(side, roots, available_tables, cell_schema=None):
     available = set(available_tables)
     catalog = _collector_table_catalog(available)
+    if cell_schema is not None:
+        selected_schema = validate_identifier(cell_schema)
+        selected_cell_tables = {
+            f"{selected_schema}.{table}" for table in _NOVA_CELL_TABLES
+        }
+        if not selected_cell_tables.issubset(available):
+            raise ValueError("selected Nova cell schema is incomplete")
+        catalog["nova"] = {
+            identity for identity in catalog["nova"]
+            if identity.split(".", 1)[1] not in _NOVA_CELL_TABLES
+        } | selected_cell_tables
     expected = set()
     if side == "source":
         if not catalog["nova"].issubset(available):
@@ -247,7 +258,12 @@ def _validate_query_coverage(side, api_result, queries):
     available = api_result.get("available_tables")
     if not isinstance(available, list) or not all(isinstance(item, str) for item in available):
         raise ValueError("live schema table inventory is missing")
-    required = _expected_plan_tables(side, roots, available)
+    cell_mapping = api_result.get("source_cell_mapping")
+    cell_schema = (
+        cell_mapping.get("database_schema")
+        if isinstance(cell_mapping, dict) else None
+    )
+    required = _expected_plan_tables(side, roots, available, cell_schema)
     if present != required:
         raise ValueError("service DB query coverage differs from live schema scope")
     allowed_values = _root_filter_values(api_result)
@@ -1373,8 +1389,10 @@ def _request(item, index):
     }
 
 
-def _auto_requests(side, snapshot, roots):
-    expected = _expected_plan_tables(side, roots, snapshot.tables.keys())
+def _auto_requests(side, snapshot, roots, cell_schema=None):
+    expected = _expected_plan_tables(
+        side, roots, snapshot.tables.keys(), cell_schema
+    )
     requests = []
     for identity in sorted(expected):
         schema, table = identity.split(".", 1)
@@ -1733,7 +1751,14 @@ def _api_phase(args):
         payload = {
             "schema_version": API_INPUT_VERSION, "side": args.side,
             "api_result": api_result,
-            "requests": _auto_requests(args.side, snapshot, roots),
+            "requests": _auto_requests(
+                args.side,
+                snapshot,
+                roots,
+                api_result.get("source_cell_mapping", {}).get("database_schema")
+                if isinstance(api_result.get("source_cell_mapping"), dict)
+                else None,
+            ),
         }
     else:
         payload = _read_json(args.fixture)
@@ -1907,7 +1932,12 @@ def _verified_query_plan(args):
     if not snapshot.tables:
         raise ValueError("information_schema evidence is empty")
     expected_tables = _expected_plan_tables(
-        args.side, api["api_result"]["roots"], snapshot.tables.keys()
+        args.side,
+        api["api_result"]["roots"],
+        snapshot.tables.keys(),
+        api["api_result"].get("source_cell_mapping", {}).get("database_schema")
+        if isinstance(api["api_result"].get("source_cell_mapping"), dict)
+        else None,
     )
     if {f"{query['schema']}.{query['table']}" for query in plan["queries"]} != expected_tables:
         raise ValueError("DB query plan differs from live schema scope")
@@ -2097,7 +2127,12 @@ def _combine_phase(args):
     if not snapshot.tables:
         raise ValueError("information_schema evidence is empty")
     live_expected_tables = _expected_plan_tables(
-        args.side, api["api_result"]["roots"], snapshot.tables.keys()
+        args.side,
+        api["api_result"]["roots"],
+        snapshot.tables.keys(),
+        api["api_result"].get("source_cell_mapping", {}).get("database_schema")
+        if isinstance(api["api_result"].get("source_cell_mapping"), dict)
+        else None,
     )
     planned_table_set = {
         f"{query['schema']}.{query['table']}" for query in plan["queries"]
