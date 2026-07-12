@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,19 +67,28 @@ _TRUSTED_PYTHON_PATHS = {
     "{{ live_discovery_source_probe_dir }}/scripts/collect_live_control.py",
     "{{ live_discovery_target_probe_dir }}/scripts/collect_live_control.py",
 }
-_TRUSTED_WHOLE_ARGV_SHA256 = {
-    "37f7a0384d00c786db39b0ea5fa32c5fe168fc60e1e111a810b2253d2d508ac1",  # item.argv
-    "11968a36427f52c82d08f0fab898b1eacd12a43767e102ca00d58fb2a16d8de8",  # Glance SELECT
-    "91a6fd7cbbb7538979abf799077f4787c3f9b91964fada37bf7832a6e677530d",  # inspect
-    "6a5237508eb53a6521d14e632cfe200911c38a411235c7d3133279044b82bc9f",  # source combine
-    "f1d611f5cb91277e5469d70e7cefa02c36bfcdb350769904da54faa821a46735",  # target combine
-    "f717d936226836ce92c3b0bd98ab7516fa9ab633a02208bed44c722bc0d66e0a",  # scoped SQL
-    "d24496c4a787468b7dd49410612510382f50660d6530e23c8f900908b66b64c7",  # runtime
-    "0b73cc09c8a5afaa2954b6bcb367073d70d18fcc7bb7ee04a8b9a8981b18e9f8",  # schema SELECT
-    "2f0ec5197177b7470869b30b24c4e1511d15d55c6e7e8514516b86b689a48983",  # virsh version
-    "552b0570cd3e13dffb6250f309cd8f89d78adebf211dbfb063de6eb3e9e6b090",  # domcapabilities
-    "10f1f4525097d0166e406e154e517bfc8c6d34b90321fa2c0cec5e2e66d013be",  # qemu
-    "1312dcdeb55a6959f0989754676fa37401f0022728646f33ae0d283066d8bf7c",  # capability input
+_TRUSTED_WHOLE_SOURCE_SHA256 = {
+    "b7da6b76c40492ded069621f517f33d6ba9ba084cdbea79259b154d2c5ffb7eb",  # orchestrator
+    "e841188b95cfd71b9a58d15b157726b84f91b92685408d3da1da728259be1194",  # DB JSONL
+    "32e7bdfcc23377182771a0b7928003773749410d8283e686d6bf26cc28c69305",  # runtime
+    "3d032ab80dc4bb26b15b86b9524670d25fc93f839e11ba77769e1cb3103b5f34",  # schema
+    "5214db099f4f003b5215ea3d75843e7558fa5579d94770c4b3c851e3cd8e5528",  # capability
+    "539e533982194e23407dcdf5b663336c9e0f1c4a56bb2839792735d056fd1a74",  # initialization
+}
+_TRUSTED_FILE_TASK_SET_SHA256 = {
+    "a0df54d35b5fa3a04ce5e1e02bc38c3f576cf13823555e15d62a06416b03d83a",
+    "db63529b32fee1260c32030104243969d7b7c7108fa704ffb9e71ef6f249f7cc",
+    "aa120867c81335fb45d3b291f0b8ca2a2e766d3cb885ce4246c0aadc2487a3df",
+    "acf6f4b7623e6ca9544ec366e408692de83b68385175f89bd6cee5ef47cca6f1",
+    "3da83260df7c9bccb1cf9086b88175b07e8f35f4faf28aebc92113010c47c0dd",
+    "0125ee4396c60b7bdb886bcaacdcdfa4e5a64069ac51e645b4722b0f72570bc7",
+}
+_SAFE_PROCESS_ATTRIBUTES = {
+    "os.O_CREAT", "os.O_EXCL", "os.O_NOFOLLOW", "os.O_RDONLY", "os.O_WRONLY",
+    "os.chmod", "os.close", "os.environ", "os.environ.get", "os.fdopen",
+    "os.fstat", "os.fsync", "os.geteuid", "os.getpid", "os.open", "os.read",
+    "os.replace", "os.urandom", "subprocess.PIPE", "subprocess.run",
+    "sys.path", "sys.path.insert", "sys.stderr", "sys.stdin", "sys.stdin.read",
 }
 
 
@@ -127,6 +137,42 @@ def _expression_name(value, aliases):
     return ".".join([aliases.get(parts[0], parts[0]), *parts[1:]])
 
 
+def _assigned_names(target):
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {
+            name
+            for child in target.elts
+            for name in _assigned_names(child)
+        }
+    return set()
+
+
+def _is_process_module_object(value, aliases, tainted_names):
+    if isinstance(value, ast.Name):
+        resolved = aliases.get(value.id, value.id)
+        return value.id in tainted_names or resolved in {
+            "asyncio", "os", "posix", "subprocess", "sys",
+        }
+    if isinstance(value, ast.IfExp):
+        return _is_process_module_object(value.body, aliases, tainted_names) or (
+            _is_process_module_object(value.orelse, aliases, tainted_names)
+        )
+    if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return any(
+            _is_process_module_object(child, aliases, tainted_names)
+            for child in value.elts
+        )
+    if isinstance(value, ast.Subscript):
+        owner = _expression_name(value.value, aliases)
+        key = value.slice.value if isinstance(value.slice, ast.Constant) else None
+        return owner == "sys.modules" and key in {
+            "asyncio", "os", "posix", "subprocess",
+        }
+    return False
+
+
 def _assert_python_source_safe(source, label, *, allow_subprocess):
     tree = ast.parse(source, filename=str(label))
     parents = {
@@ -136,11 +182,49 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
     }
     aliases = _import_aliases(tree)
     imported_modules = {target.split(".", 1)[0] for target in aliases.values()}
-    forbidden_imports = {"commands", "ctypes", "importlib", "multiprocessing", "pexpect", "pty", "runpy"}
+    forbidden_imports = {
+        "builtins", "commands", "ctypes", "importlib", "multiprocessing",
+        "pexpect", "pty", "runpy",
+    }
     if imported_modules & forbidden_imports:
         raise AssertionError(f"alternate execution module imported by {label}")
     if not allow_subprocess and "subprocess" in imported_modules:
         raise AssertionError(f"subprocess imported outside runner: {label}")
+
+    process_modules = {"asyncio", "os", "posix", "subprocess", "sys"}
+    tainted_names = {
+        name for name, target in aliases.items()
+        if target.split(".", 1)[0] in process_modules
+    }
+    assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            assignments.append((node, targets, value))
+    changed = True
+    while changed:
+        changed = False
+        for _, targets, value in assignments:
+            if not _is_process_module_object(value, aliases, tainted_names):
+                continue
+            for target in targets:
+                new_names = _assigned_names(target) - tainted_names
+                if new_names:
+                    tainted_names.update(new_names)
+                    changed = True
+    for node, _, value in assignments:
+        if _is_process_module_object(value, aliases, tainted_names):
+            raise AssertionError(f"process module alias in {label}:{node.lineno}")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+            defaults = [*node.args.defaults, *node.args.kw_defaults]
+            if any(
+                default is not None
+                and _is_process_module_object(default, aliases, tainted_names)
+                for default in defaults
+            ):
+                raise AssertionError(f"process module default in {label}:{node.lineno}")
 
     bypass_prefixes = (
         "os.exec", "os.fork", "os.popen", "os.posix_spawn", "os.spawn", "os.system",
@@ -170,6 +254,10 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
                 "asyncio.__dict__", "os.__dict__", "posix.__dict__", "subprocess.__dict__",
             }:
                 raise AssertionError(f"process namespace reference in {label}:{node.lineno}")
+            if name == "sys.modules":
+                raise AssertionError(f"dynamic module registry in {label}:{node.lineno}")
+            if name.split(".", 1)[0] in process_modules and name not in _SAFE_PROCESS_ATTRIBUTES:
+                raise AssertionError(f"unreviewed process attribute in {label}:{node.lineno}: {name}")
             if dangerous_reference(name):
                 parent = parents.get(node)
                 direct_runner_call = (
@@ -184,14 +272,47 @@ def _assert_python_source_safe(source, label, *, allow_subprocess):
             owner = _expression_name(node.value, aliases)
             if owner in {"asyncio.__dict__", "os.__dict__", "posix.__dict__", "subprocess.__dict__"}:
                 raise AssertionError(f"dynamic process namespace in {label}:{node.lineno}")
+            if owner == "sys.modules":
+                raise AssertionError(f"dynamic module registry in {label}:{node.lineno}")
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            if node.id in {"getattr", "vars"}:
+            if node.id == "__builtins__":
+                raise AssertionError(f"dynamic builtins registry in {label}:{node.lineno}")
+            if node.id in {"__import__", "compile", "eval", "exec", "getattr", "vars"}:
                 parent = parents.get(node)
                 if not isinstance(parent, ast.Call) or parent.func is not node:
                     raise AssertionError(
                         f"dynamic lookup reference in {label}:{node.lineno}: {node.id}"
                     )
+            parent = parents.get(node)
             target = aliases.get(node.id, "")
+            resolved = target or node.id
+            reviewed_optional_flag = (
+                resolved == "os"
+                and isinstance(parent, ast.Call)
+                and parent.args[0] is node
+                and (
+                    (
+                        _call_name(parent, aliases) == "getattr"
+                        and len(parent.args) == 3
+                        and isinstance(parent.args[1], ast.Constant)
+                        and parent.args[1].value == "O_NOFOLLOW"
+                        and isinstance(parent.args[2], ast.Constant)
+                        and parent.args[2].value == 0
+                    )
+                    or (
+                        _call_name(parent, aliases) == "hasattr"
+                        and len(parent.args) == 2
+                        and isinstance(parent.args[1], ast.Constant)
+                        and parent.args[1].value in {"O_NOFOLLOW", "geteuid"}
+                    )
+                )
+            )
+            if resolved in process_modules and (
+                not isinstance(parent, ast.Attribute) or parent.value is not node
+            ) and not reviewed_optional_flag:
+                raise AssertionError(f"process module object in {label}:{node.lineno}")
+            if target.split(".", 1)[0] in process_modules and target not in process_modules:
+                raise AssertionError(f"process API import alias in {label}:{node.lineno}: {target}")
             if dangerous_reference(target):
                 raise AssertionError(f"process API alias reference in {label}:{node.lineno}")
     for node in ast.walk(tree):
@@ -232,13 +353,37 @@ def _yaml_python():
     executable = shutil.which("ansible-playbook")
     if executable is None:
         raise AssertionError("ansible-playbook runtime is required for structural YAML audit")
-    first_line = Path(executable).read_text(encoding="utf-8").splitlines()[0]
+    lines = Path(executable).read_text(encoding="utf-8").splitlines()
+    first_line = lines[0] if lines else ""
     if not first_line.startswith("#!"):
         raise AssertionError("ansible-playbook shebang is invalid")
-    interpreter = Path(first_line[2:])
-    if not interpreter.is_file():
-        raise AssertionError("Ansible Python runtime is unavailable")
-    return str(interpreter)
+    try:
+        shebang = shlex.split(first_line[2:])
+    except ValueError as error:
+        raise AssertionError("ansible-playbook shebang is invalid") from error
+    if not shebang:
+        raise AssertionError("ansible-playbook shebang is invalid")
+    interpreter, *arguments = shebang
+    if Path(interpreter).name == "env":
+        if arguments[:1] in (["-S"], ["--split-string"]):
+            arguments = arguments[1:]
+        elif arguments and arguments[0].startswith("--split-string="):
+            split_value = arguments.pop(0).split("=", 1)[1]
+            arguments = [*shlex.split(split_value), *arguments]
+        elif arguments and arguments[0].startswith("-"):
+            raise AssertionError("unsupported ansible-playbook env options")
+        if not arguments or "=" in arguments[0]:
+            raise AssertionError("unsupported ansible-playbook env command")
+        command, *arguments = arguments
+        interpreter = shutil.which(command)
+        if interpreter is None:
+            raise AssertionError("Ansible Python runtime is unavailable")
+    path = Path(interpreter)
+    if "python" not in path.name.lower() or not path.is_file():
+        raise AssertionError("unsupported ansible-playbook shebang")
+    if any(argument not in {"-B", "-E", "-I", "-P", "-S", "-s", "-u"} for argument in arguments):
+        raise AssertionError("unsupported ansible-playbook Python options")
+    return [str(path), *arguments]
 
 
 def _yaml_load(text, label):
@@ -248,7 +393,7 @@ def _yaml_load(text, label):
         "json.dump(payload,sys.stdout,ensure_ascii=False)"
     )
     completed = subprocess.run(
-        [_yaml_python(), "-c", program],
+        [*_yaml_python(), "-c", program],
         input=text,
         text=True,
         stdout=subprocess.PIPE,
@@ -279,6 +424,8 @@ def _include_paths(payload, owner):
     for mapping in _walk_mappings(payload):
         for key, value in mapping.items():
             base = _key_base(key)
+            if base in {"role", "roles"}:
+                raise AssertionError(f"role execution is forbidden in {owner}: {key}")
             execution_family = (
                 base in {"action", "include", "import", "local_action"}
                 or base.startswith(("include_", "import_"))
@@ -323,9 +470,50 @@ def _reachable_playbook_paths(entry=PLAYBOOK):
 
 
 _TASK_LIST_KEYS = {"always", "block", "handlers", "post_tasks", "pre_tasks", "rescue", "tasks"}
-_EXECUTION_MODULES = {
-    "action", "command", "expect", "local_action", "raw", "script", "shell",
-    "win_command", "win_shell",
+_TASK_META_KEYS = {
+    "always", "block", "changed_when", "delegate_facts", "delegate_to",
+    "environment", "failed_when", "loop", "loop_control", "name", "no_log",
+    "register", "rescue", "run_once", "vars", "when",
+}
+_ALLOWED_MODULES = {
+    "assert", "command", "copy", "debug", "fail", "fetch", "file",
+    "include_tasks", "set_fact", "slurp", "stat",
+}
+_FILE_MODULES = {"copy", "fetch", "file", "slurp", "stat"}
+_LOOKUP_START = re.compile(r"\b(?:lookup|q|query)\s*\(")
+_LOOKUP_CALL = re.compile(
+    r"\b(?P<function>lookup|q|query)\s*\(\s*"
+    r"(?P<quote>['\"])(?P<family>[^'\"]+)(?P=quote)\s*,\s*"
+    r"(?P<argument>.*?)\s*\)",
+    re.DOTALL,
+)
+_SAFE_FILE_LOOKUP_ARGUMENTS = {
+    "live_discovery_kolla_passwords_file_local",
+    "live_discovery_frozen_protected_paths['source-probe-config.json']",
+    "live_discovery_frozen_protected_paths['target-probe-config.json']",
+    "hostvars['localhost'].live_discovery_source_kolla_passwords_file_local",
+    "hostvars['localhost'].live_discovery_target_kolla_passwords_file_local",
+    "live_discovery_source_glance_token_file_local",
+    "live_discovery_target_glance_token_file_local",
+}
+_SAFE_PASSWORD_LOOKUP_ARGUMENTS = {
+    "'/dev/null length=16 chars=ascii_lowercase,digits'",
+    "'/dev/null length=32 chars=ascii_lowercase,digits'",
+    '"/dev/null length=16 chars=ascii_lowercase,digits"',
+    '"/dev/null length=32 chars=ascii_lowercase,digits"',
+}
+_SAFE_DISCOVERY_PATH_ROOTS = {
+    "live_discovery_compute_remote_dir",
+    "live_discovery_frozen_protected_dir",
+    "live_discovery_frozen_protected_paths",
+    "live_discovery_local_dir",
+    "live_discovery_local_run_dir",
+    "live_discovery_run_control_dir",
+    "live_discovery_side_remote_dir",
+    "live_discovery_source_controller_dir",
+    "live_discovery_source_probe_dir",
+    "live_discovery_target_controller_dir",
+    "live_discovery_target_probe_dir",
 }
 
 
@@ -370,12 +558,26 @@ def _audit_python_argv(argv):
     return argv[1] in _TRUSTED_PYTHON_PATHS
 
 
-def _audit_argv(argv, task, label):
+def _source_digest(payload, label):
+    try:
+        source = Path(label).resolve(strict=False)
+        relative = source.relative_to(ROOT.resolve())
+    except (OSError, TypeError, ValueError):
+        return None
+    canonical = json.dumps(
+        [str(relative), payload],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _audit_argv(argv, task, label, source_digest):
     if isinstance(argv, str):
+        if source_digest not in _TRUSTED_WHOLE_SOURCE_SHA256:
+            raise AssertionError(f"{label}: whole-expression source is not exact-reviewed")
         normalized = " ".join(argv.split())
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        if digest not in _TRUSTED_WHOLE_ARGV_SHA256:
-            raise AssertionError(f"{label}: whole-expression argv is not exact-reviewed")
         if normalized == "{{ item.argv }}" and not _valid_item_argv(task):
             raise AssertionError(f"{label}: item.argv loop is not exact-reviewed")
         return set(_DYNAMIC_ARGV.findall(argv))
@@ -402,34 +604,153 @@ def _audit_argv(argv, task, label):
     return set(_DYNAMIC_ARGV.findall(" ".join(argv)))
 
 
+def _audit_lookups(task, label):
+    text = json.dumps(task, ensure_ascii=False)
+    starts = list(_LOOKUP_START.finditer(text))
+    calls = list(_LOOKUP_CALL.finditer(text))
+    if len(starts) != len(calls):
+        raise AssertionError(f"{label}: lookup call shape is not exact-reviewed")
+    for call in calls:
+        if call.group("function") != "lookup":
+            raise AssertionError(f"{label}: lookup function is not exact-reviewed")
+        family = call.group("family")
+        argument = call.group("argument").strip()
+        if family == "file" and argument in _SAFE_FILE_LOOKUP_ARGUMENTS:
+            continue
+        if family == "password" and argument in _SAFE_PASSWORD_LOOKUP_ARGUMENTS:
+            continue
+        raise AssertionError(f"{label}: lookup family or argument is not exact-reviewed: {family}")
+
+
+def _direct_discovery_path(value):
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = value.strip()
+    return (
+        normalized.startswith("{{")
+        and "}}" in normalized
+        and "\\" not in normalized
+        and ".." not in normalized.split("/")
+        and any(root in normalized for root in _SAFE_DISCOVERY_PATH_ROOTS)
+    )
+
+
+def _item_paths_are_discovery_scoped(task, field):
+    loop = task.get("loop")
+    if not isinstance(loop, list) or not loop:
+        return False
+    for item in loop:
+        value = item.get(field) if isinstance(item, dict) else item
+        if not _direct_discovery_path(value):
+            return False
+    return True
+
+
+def _discovery_path(value, task, *, item_field=None):
+    if not isinstance(value, str) or not value:
+        return False
+    if _direct_discovery_path(value):
+        return True
+    if value in {"{{ item }}", "{{ item.path }}"}:
+        return _item_paths_are_discovery_scoped(task, item_field or "path")
+    return False
+
+
+def _audit_safe_module(
+    module, module_args, task, label, file_task_set_digest, source_digest
+):
+    if module in {"assert", "debug", "fail", "include_tasks", "set_fact"}:
+        return
+    if module in _FILE_MODULES and (
+        file_task_set_digest not in _TRUSTED_FILE_TASK_SET_SHA256
+        or source_digest not in _TRUSTED_WHOLE_SOURCE_SHA256
+    ):
+        raise AssertionError(f"{label}: file task set is not exact-reviewed")
+    if not isinstance(module_args, dict):
+        raise AssertionError(f"{label}: {module} arguments must be a mapping")
+    if module == "file":
+        if set(module_args) - {"mode", "path", "state"}:
+            raise AssertionError(f"{label}: file arguments are not reviewed")
+        if module_args.get("state") not in {"absent", "directory"}:
+            raise AssertionError(f"{label}: file state is not reviewed")
+        if not _discovery_path(module_args.get("path"), task):
+            raise AssertionError(f"{label}: file path escapes discovery scope")
+        return
+    if module == "copy":
+        if set(module_args) - {"content", "dest", "mode", "src"}:
+            raise AssertionError(f"{label}: copy arguments are not reviewed")
+        if not _discovery_path(module_args.get("dest"), task, item_field="dest"):
+            raise AssertionError(f"{label}: copy destination escapes discovery scope")
+        if set(module_args) & {"content", "src"} == set():
+            raise AssertionError(f"{label}: copy requires one reviewed source")
+        if set(module_args) >= {"content", "src"}:
+            raise AssertionError(f"{label}: copy source shape is not reviewed")
+        return
+    if module == "fetch":
+        if set(module_args) != {"dest", "flat", "src"} or module_args["flat"] is not True:
+            raise AssertionError(f"{label}: fetch arguments are not reviewed")
+        if not _discovery_path(module_args["src"], task) or not _discovery_path(
+            module_args["dest"], task
+        ):
+            raise AssertionError(f"{label}: fetch path escapes discovery scope")
+        return
+    if module == "slurp":
+        if set(module_args) != {"src"} or not _discovery_path(module_args["src"], task):
+            raise AssertionError(f"{label}: slurp path escapes discovery scope")
+        return
+    if module == "stat":
+        if set(module_args) - {"checksum_algorithm", "path"}:
+            raise AssertionError(f"{label}: stat arguments are not reviewed")
+        if not _discovery_path(module_args.get("path"), task):
+            raise AssertionError(f"{label}: stat path escapes discovery scope")
+        return
+    raise AssertionError(f"{label}: unreviewed module: {module}")
+
+
 def _audit_command_text(text, label):
     payload = _yaml_load(text, label)
+    source_digest = _source_digest(payload, label)
     task_file = not any(
         isinstance(item, dict) and (
             "hosts" in item or any(_key_base(key) == "import_playbook" for key in item)
         )
         for item in payload if isinstance(item, dict)
     ) if isinstance(payload, list) else True
+    tasks = list(_iter_task_mappings(payload, task_file=task_file))
+    file_tasks = [
+        task for task in tasks
+        if any(_key_base(key) in _FILE_MODULES for key in task)
+    ]
+    file_task_set_digest = _source_digest(file_tasks, label)
     command_count = 0
     dynamic_argv = set()
-    for task in _iter_task_mappings(payload, task_file=task_file):
-        execution = [
+    for task in tasks:
+        _audit_lookups(task, label)
+        actions = [
             (key, value) for key, value in task.items()
-            if _key_base(key) in _EXECUTION_MODULES
+            if _key_base(key) not in _TASK_META_KEYS
         ]
-        if not execution:
+        if not actions:
             continue
-        if len(execution) != 1:
-            raise AssertionError(f"{label}: multiple execution modules in one task")
-        key, module_args = execution[0]
+        if len(actions) != 1:
+            raise AssertionError(f"{label}: multiple or unknown modules in one task")
+        key, module_args = actions[0]
         module = _key_base(key)
+        if module not in _ALLOWED_MODULES:
+            raise AssertionError(f"{label}: {module} module is not exact-reviewed")
+        prefix = key[: -(len(module) + 1)] if key != module else ""
+        if prefix not in {"", "ansible.builtin", "ansible.legacy"} and module != "include_tasks":
+            raise AssertionError(f"{label}: custom module collection is forbidden: {key}")
         if module != "command":
-            raise AssertionError(f"{label}: {module} execution path is forbidden")
+            _audit_safe_module(
+                module, module_args, task, label, file_task_set_digest, source_digest
+            )
+            continue
         if not isinstance(module_args, dict) or set(module_args) - {
             "argv", "chdir", "stdin", "stdin_add_newline",
         } or "argv" not in module_args:
             raise AssertionError(f"{label}: command must use reviewed argv mapping")
-        variables = _audit_argv(module_args["argv"], task, label)
+        variables = _audit_argv(module_args["argv"], task, label, source_digest)
         dynamic_argv.update(variables)
         command_count += 1
     return command_count, dynamic_argv
@@ -469,6 +790,110 @@ def _concrete_mysql_argv(argv):
 
 
 class LiveDiscoveryMutationAuditTests(unittest.TestCase):
+    def test_structural_task_audit_rejects_unknown_modules_unsafe_paths_and_lookups(self):
+        unsafe = (
+            "---\n- name: system mutation\n  ansible.builtin.systemd:\n    name: nova-compute\n    state: restarted\n",
+            "---\n- name: service mutation\n  service:\n    name: neutron-server\n    state: stopped\n",
+            "---\n- name: OpenStack module mutation\n  openstack.cloud.server:\n    name: server-1\n    state: absent\n",
+            "---\n- name: unsafe delete\n  ansible.builtin.file:\n    path: /etc/nova/nova.conf\n    state: absent\n",
+            "---\n- name: pipe lookup\n  ansible.builtin.set_fact:\n    value: \"{{ lookup('pipe', 'id') }}\"\n",
+            "---\n- name: unknown lookup\n  ansible.builtin.debug:\n    msg: \"{{ lookup('community.general.random_string') }}\"\n",
+            "---\n- name: traversal delete\n  ansible.builtin.file:\n    path: '{{ live_discovery_local_run_dir }}/../../etc/nova/nova.conf'\n    state: absent\n",
+            "---\n- name: prefixed delete\n  ansible.builtin.file:\n    path: '/etc/nova/{{ live_discovery_run_id }}'\n    state: absent\n",
+            "---\n- name: traversal copy\n  ansible.builtin.copy:\n    content: unsafe\n    dest: '{{ live_discovery_local_run_dir }}/../../etc/nova/nova.conf'\n",
+            "---\n- name: traversal loop\n  ansible.builtin.file:\n    path: '{{ item }}'\n    state: absent\n  loop:\n    - '{{ live_discovery_local_run_dir }}/../../etc/nova/nova.conf'\n",
+            "---\n- name: templated traversal\n  ansible.builtin.file:\n    path: \"{{ live_discovery_local_run_dir }}/{{ '..' }}/etc/nova/nova.conf\"\n    state: absent\n",
+            "---\n- name: dirname escape\n  ansible.builtin.file:\n    path: '{{ live_discovery_local_run_dir | dirname }}/etc/nova/nova.conf'\n    state: absent\n",
+            "---\n- name: lookalike root\n  ansible.builtin.file:\n    path: '{{ arbitrary_live_discovery_local_run_dir }}/etc/nova/nova.conf'\n    state: absent\n",
+            "---\n- name: conditional root\n  ansible.builtin.file:\n    path: \"{{ '/etc/nova' if true else live_discovery_local_run_dir }}/nova.conf\"\n    state: absent\n",
+        )
+        for source in unsafe:
+            with self.subTest(source=source):
+                with self.assertRaises(AssertionError):
+                    _audit_command_text(source, "synthetic")
+
+    def test_dynamic_sql_argv_signature_binds_exact_loop_vars_and_source_path(self):
+        path = ROOT / "playbooks/tasks/collect-live-db-jsonl-service.yml"
+        payload = _yaml_load(path.read_text(encoding="utf-8"), path)
+        target = next(
+            task for task in _iter_task_mappings(payload, task_file=True)
+            if task.get("name") == "Live DB JSONL | execute reviewed SELECT through argv transport"
+        )
+        target["loop"] = [{"sql": "DROP TABLE nova.instances;"}]
+        with self.assertRaises(AssertionError):
+            _audit_command_text(json.dumps(payload), path)
+        pristine = path.read_text(encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            _audit_command_text(pristine, ROOT / "playbooks/tasks/unreviewed-copy.yml")
+
+        pristine_payload = _yaml_load(pristine, path)
+        exact_task = next(
+            task for task in _iter_task_mappings(pristine_payload, task_file=True)
+            if task.get("name") == "Live DB JSONL | execute reviewed SELECT through argv transport"
+        )
+        compromised_source = [
+            {
+                "name": "replace reviewed query plan",
+                "ansible.builtin.set_fact": {
+                    "live_discovery_db_query_plan": {
+                        "queries": [{"sql": "DROP TABLE nova.instances;"}],
+                    },
+                },
+            },
+            exact_task,
+        ]
+        with self.assertRaises(AssertionError):
+            _audit_command_text(json.dumps(compromised_source), path)
+
+        initialization = ROOT / "playbooks/tasks/initialize-live-run.yml"
+        initialization_payload = _yaml_load(
+            initialization.read_text(encoding="utf-8"), initialization
+        )
+        redirected_roots = [
+            {
+                "name": "redirect trusted discovery roots",
+                "ansible.builtin.set_fact": {
+                    "live_discovery_local_dir": "/etc/nova",
+                    "live_discovery_local_run_dir": "/etc/nova/run",
+                    "live_discovery_frozen_protected_dir": "/etc/nova/protected",
+                },
+            },
+            *initialization_payload,
+        ]
+        with self.assertRaises(AssertionError):
+            _audit_command_text(json.dumps(redirected_roots), initialization)
+        initialization_payload.append(
+            {
+                "name": "conditional path injection",
+                "ansible.builtin.file": {
+                    "path": "{{ '/etc/nova' if true else live_discovery_local_dir }}",
+                    "state": "absent",
+                },
+            }
+        )
+        with self.assertRaises(AssertionError):
+            _audit_command_text(json.dumps(initialization_payload), initialization)
+
+    def test_ansible_yaml_runtime_supports_env_shebang_and_rejects_wrappers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "ansible-playbook"
+            executable.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+            def which(name):
+                return str(executable) if name == "ansible-playbook" else sys.executable
+
+            with mock.patch("shutil.which", side_effect=which):
+                self.assertEqual([sys.executable], _yaml_python())
+
+            executable.write_text("#!/usr/bin/env -S python3 -I\n", encoding="utf-8")
+            with mock.patch("shutil.which", side_effect=which):
+                self.assertEqual([sys.executable, "-I"], _yaml_python())
+
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            with mock.patch("shutil.which", side_effect=which):
+                with self.assertRaisesRegex(AssertionError, "unsupported"):
+                    _yaml_python()
+
     def test_structural_include_graph_audits_fqcn_quoted_and_mapping_forms(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -500,6 +925,7 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
 
     def test_structural_include_graph_rejects_unknown_include_and_role_forms(self):
         unsafe = (
+            "---\n- name: play\n  hosts: localhost\n  roles:\n    - unsafe\n",
             "---\n- name: play\n  hosts: localhost\n  tasks:\n    - include: child.yml\n",
             "---\n- name: play\n  hosts: localhost\n  tasks:\n    - ansible.legacy.include_role:\n        name: unsafe\n",
             "---\n- name: play\n  hosts: localhost\n  tasks:\n    - 'vendor.collection.import_role':\n        name: unsafe\n",
@@ -554,6 +980,21 @@ class LiveDiscoveryMutationAuditTests(unittest.TestCase):
             ("from subprocess import run as launch\nreference = launch\n", True),
             ("import os\nnamespace = os.__dict__\nlaunch = namespace['system']\n", False),
             ("import os\nlookup = getattr\nlaunch = lookup(os, 'system')\n", False),
+            ("import os\nmodule = os\nlaunch = module.system\n", False),
+            ("import os\na = os\nb = a\nlaunch = b.system\n", False),
+            ("import subprocess\nmodule = subprocess\nlaunch = module.run\n", True),
+            ("import os\ndef launch(module=os):\n    module.system('id')\n", False),
+            ("import os\nmodule = os if True else None\nmodule.system('id')\n", False),
+            ("import os\nmodule, other = os, None\nmodule.system('id')\n", False),
+            ("import sys\nsys.modules['os'].system('id')\n", False),
+            ("import os\nmodule = os or None\nmodule.system('id')\n", False),
+            ("import os\nmodule = {'x': os}['x']\nmodule.system('id')\n", False),
+            ("import sys\nmodule = sys.modules.get('os')\nmodule.system('id')\n", False),
+            ("loader = __import__\nloader('os').system('id')\n", False),
+            ("import builtins\nbuiltins.__import__('os').system('id')\n", False),
+            ("__builtins__['__import__']('os').system('id')\n", False),
+            ("import sys\ngetattr(sys, 'modules')['os'].system('id')\n", False),
+            ("import sys\nvars(sys)['modules']['os'].system('id')\n", False),
         )
         for source, allow_subprocess in unsafe:
             with self.subTest(source=source):
